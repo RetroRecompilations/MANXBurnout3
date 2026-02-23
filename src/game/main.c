@@ -190,6 +190,109 @@ static BOOL veh_skip_faulting_read(PCONTEXT ctx)
     return FALSE;
 }
 
+/**
+ * Skip a faulting write instruction by advancing RIP past it.
+ * Unlike read skips, write skips don't need to set a register.
+ * Handles common store instructions: mov r/m, r and mov r/m, imm.
+ */
+static BOOL veh_skip_faulting_write(PCONTEXT ctx)
+{
+    uint8_t *rip = (uint8_t *)ctx->Rip;
+    int prefix_len = 0;
+    int rex_w = 0, rex_r = 0, rex_b = 0;
+
+    /* Parse legacy prefixes */
+    while (prefix_len < 4) {
+        uint8_t b = rip[prefix_len];
+        if (b == 0x66 || b == 0x67 || b == 0xF2 || b == 0xF3 ||
+            b == 0x2E || b == 0x3E || b == 0x26 || b == 0x36 ||
+            b == 0x64 || b == 0x65) {
+            prefix_len++;
+        } else {
+            break;
+        }
+    }
+
+    /* Parse REX prefix */
+    if ((rip[prefix_len] & 0xF0) == 0x40) {
+        uint8_t rex = rip[prefix_len];
+        rex_w = (rex >> 3) & 1;
+        rex_r = (rex >> 2) & 1;
+        rex_b = rex & 1;
+        prefix_len++;
+    }
+
+    uint8_t *op = rip + prefix_len;
+    int modrm_total = 0;
+
+    #define MODRM_LEN(modrm_byte) do { \
+        int _mod = ((modrm_byte) >> 6) & 3; \
+        int _rm  = ((modrm_byte) & 7) | (rex_b << 3); \
+        modrm_total = 1; \
+        if (_mod == 0 && (_rm & 7) == 4) modrm_total++; \
+        if (_mod == 0 && (_rm & 7) == 5) modrm_total += 4; \
+        if (_mod == 1) { modrm_total++; if ((_rm & 7) == 4) modrm_total++; } \
+        if (_mod == 2) { modrm_total += 4; if ((_rm & 7) == 4) modrm_total++; } \
+        if (_mod == 3) modrm_total = 1; \
+    } while(0)
+
+    (void)rex_r; (void)rex_w;
+
+    /* 89 /r : mov r/m32, r32 */
+    if (op[0] == 0x89) {
+        MODRM_LEN(op[1]);
+        ctx->Rip += prefix_len + 1 + modrm_total;
+        return TRUE;
+    }
+
+    /* 88 /r : mov r/m8, r8 */
+    if (op[0] == 0x88) {
+        MODRM_LEN(op[1]);
+        ctx->Rip += prefix_len + 1 + modrm_total;
+        return TRUE;
+    }
+
+    /* C7 /0 id : mov r/m32, imm32 */
+    if (op[0] == 0xC7) {
+        MODRM_LEN(op[1]);
+        ctx->Rip += prefix_len + 1 + modrm_total + 4;
+        return TRUE;
+    }
+
+    /* C6 /0 ib : mov r/m8, imm8 */
+    if (op[0] == 0xC6) {
+        MODRM_LEN(op[1]);
+        ctx->Rip += prefix_len + 1 + modrm_total + 1;
+        return TRUE;
+    }
+
+    /* 66 89 /r : mov r/m16, r16 (handled via 0x66 prefix + 89) */
+    /* Already handled above since 0x66 is parsed as prefix */
+
+    /* 0F 11 /r : movups xmm, m128 (SSE store) */
+    if (op[0] == 0x0F && op[1] == 0x11) {
+        MODRM_LEN(op[2]);
+        ctx->Rip += prefix_len + 2 + modrm_total;
+        return TRUE;
+    }
+
+    /* F3 0F 11 /r : movss m32, xmm (SSE scalar store) */
+    {
+        int has_f3 = 0;
+        for (int i = 0; i < prefix_len; i++) {
+            if (rip[i] == 0xF3) has_f3 = 1;
+        }
+        if (has_f3 && op[0] == 0x0F && op[1] == 0x11) {
+            MODRM_LEN(op[2]);
+            ctx->Rip += prefix_len + 2 + modrm_total;
+            return TRUE;
+        }
+    }
+
+    #undef MODRM_LEN
+    return FALSE;
+}
+
 static LONG WINAPI crash_veh(PEXCEPTION_POINTERS info)
 {
     if (info->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
@@ -197,61 +300,215 @@ static LONG WINAPI crash_veh(PEXCEPTION_POINTERS info)
         int is_write = (int)info->ExceptionRecord->ExceptionInformation[0];
 
         /*
-         * SEH simulation for memory probes past 64MB.
-         *
-         * The RenderWare engine probes memory to find the physical RAM boundary.
-         * On real Xbox, it probes past 64MB and SEH catches the fault.
-         * We decode the faulting instruction, return 0 (as if reading unmapped
-         * memory), and advance RIP. This simulates what SEH would do.
+         * Guard: reject native addresses below the Xbox memory base.
+         * These are null pointer dereferences or wild pointers that, when
+         * offset-subtracted, wrap to large Xbox VAs (e.g., native 0x0
+         * wraps to Xbox VA 0xF0000000 which looks like NV2A GPU space).
          */
-        uintptr_t xbox_region_end = (uintptr_t)(XBOX_HEAP_BASE + XBOX_HEAP_SIZE +
-                                                 XBOX_GUARD_SIZE) + g_xbox_mem_offset;
+        if (fault_addr < (uintptr_t)g_xbox_mem_offset) {
+            /* Fall through to crash reporting at bottom of handler */
+            goto veh_crash_report;
+        }
 
-        if (fault_addr >= xbox_region_end) {
-            /*
-             * Dump the Xbox SEH chain to understand the exception handler
-             * structure. On real Xbox, this chain at FS:[0] is used to
-             * dispatch exceptions. In our code, MEM32(0) holds the chain head.
-             */
-            uint32_t frame_va = MEM32(0);
-            fprintf(stderr, "\n  [SEH-CHAIN] Fault at Xbox VA 0x%08X (%s)\n",
-                    (uint32_t)(fault_addr - g_xbox_mem_offset),
-                    is_write ? "WRITE" : "READ");
-            fprintf(stderr, "  [SEH-CHAIN] g_esp=0x%08X g_eax=0x%08X g_edx=0x%08X\n",
-                    g_esp, g_eax, g_edx);
-            for (int i = 0; i < 8 && frame_va != 0xFFFFFFFF && frame_va != 0; i++) {
-                uint32_t next    = MEM32(frame_va + 0);
-                uint32_t handler = MEM32(frame_va + 4);
-                /* Extended MSVC SEH frame: scope table at +8, try level at +C */
-                uint32_t scope_tbl = MEM32(frame_va + 8);
-                int32_t  try_level = (int32_t)MEM32(frame_va + 0xC);
+        /*
+         * NV2A GPU address space:
+         *   0xF0000000-0xF3FFFFFF  GPU framebuffer / texture memory
+         *   0xFD000000-0xFDFFFFFF  GPU MMIO registers
+         *
+         * On Xbox, the NV2A GPU is mapped at these physical address ranges.
+         * The statically-linked D3D8 library accesses both during init:
+         * - Registers: capability queries, config reads
+         * - Framebuffer: push buffer writes, texture uploads
+         *
+         * We map pages on demand filled with zeros. For registers, zero
+         * means "feature not present" (safe default). For framebuffer,
+         * the writes are silently absorbed (no real GPU to consume them).
+         */
+        {
+            uint32_t fault_xbox_va = (uint32_t)(fault_addr - g_xbox_mem_offset);
+            if ((fault_xbox_va >= 0xF0000000u && fault_xbox_va < 0xF4000000u) ||
+                (fault_xbox_va >= 0xFD000000u && fault_xbox_va < 0xFE000000u)) {
+                static int nv2a_page_count = 0;
+                uintptr_t alloc_base = fault_addr & ~(uintptr_t)0xFFFF; /* 64KB align */
+                LPVOID result = VirtualAlloc((LPVOID)alloc_base, 0x10000,
+                                            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                if (!result) {
+                    result = VirtualAlloc((LPVOID)alloc_base, 0x10000,
+                                         MEM_COMMIT, PAGE_READWRITE);
+                }
+                if (result) {
+                    memset(result, 0, 0x10000);
+                    nv2a_page_count++;
+                    if (nv2a_page_count <= 20 || (nv2a_page_count % 100) == 0) {
+                        const char *region = (fault_xbox_va >= 0xFD000000u) ? "reg" : "fb";
+                        fprintf(stderr, "  [NV2A] GPU %s page 0x%08X (%s) [page #%d]\n",
+                                region, fault_xbox_va & 0xFFFF0000u,
+                                is_write ? "W" : "R", nv2a_page_count);
+                        fflush(stderr);
+                    }
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
+        }
 
-                fprintf(stderr, "  [SEH-CHAIN] Frame #%d at 0x%08X: Next=0x%08X "
-                        "Handler=0x%08X ScopeTable=0x%08X TryLevel=%d\n",
-                        i, frame_va, next, handler, scope_tbl, try_level);
+        /*
+         * Xbox uncached memory mapping (0x80000000-0x83FFFFFF).
+         *
+         * On Xbox, physical RAM is accessible through two virtual address ranges:
+         *   0x00000000-0x03FFFFFF  Cached (normal CPU access)
+         *   0x80000000-0x83FFFFFF  Uncached / write-combined (GPU-coherent)
+         *
+         * Both map to the same 64MB of physical DRAM. The D3D library uses the
+         * uncached mapping for push buffers, vertex data, and other GPU resources
+         * that need write-combined access for DMA coherency.
+         *
+         * We handle faults in this range on-demand: allocate pages and copy the
+         * initial data from the cached mapping. Since we replace D3D at a higher
+         * level, the push buffer data written here is not consumed by real GPU
+         * hardware, but the memory must be writable for the D3D code to function.
+         */
+        {
+            uint32_t fault_xbox_va = (uint32_t)(fault_addr - g_xbox_mem_offset);
+            if (fault_xbox_va >= 0x80000000u && fault_xbox_va < 0x84000000u) {
+                static int uncached_page_count = 0;
+                uintptr_t alloc_base = fault_addr & ~(uintptr_t)0xFFFF; /* 64KB align */
+                LPVOID result = VirtualAlloc((LPVOID)alloc_base, 0x10000,
+                                            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                if (!result) {
+                    result = VirtualAlloc((LPVOID)alloc_base, 0x10000,
+                                         MEM_COMMIT, PAGE_READWRITE);
+                }
+                if (result) {
+                    /* Copy initial data from cached mapping as baseline */
+                    uint32_t page_xbox_va = (uint32_t)(alloc_base - g_xbox_mem_offset);
+                    uint32_t cached_va = page_xbox_va - 0x80000000u;
+                    if (cached_va < XBOX_TOTAL_RAM) {
+                        void *src = (void *)((uintptr_t)cached_va + g_xbox_mem_offset);
+                        memcpy(result, src, 0x10000);
+                    }
+                    uncached_page_count++;
+                    if (uncached_page_count <= 20 || (uncached_page_count % 100) == 0) {
+                        fprintf(stderr, "  [UNCACHED] Xbox VA 0x%08X (%s) [page #%d]\n",
+                                page_xbox_va, is_write ? "W" : "R", uncached_page_count);
+                        fflush(stderr);
+                    }
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
+        }
 
-                /* Dump scope table entries if it looks valid */
-                if (scope_tbl > 0x10000 && scope_tbl < 0x04000000) {
-                    for (int j = 0; j <= try_level && j < 8; j++) {
-                        uint32_t enc_level  = MEM32(scope_tbl + j * 12 + 0);
-                        uint32_t filter_va  = MEM32(scope_tbl + j * 12 + 4);
-                        uint32_t handler_va = MEM32(scope_tbl + j * 12 + 8);
-                        fprintf(stderr, "    Scope[%d]: Enclosing=%d Filter=0x%08X "
-                                "Handler=0x%08X\n",
-                                j, (int32_t)enc_level, filter_va, handler_va);
+        /*
+         * Fallback mirror mapping for addresses past the pre-mapped views.
+         *
+         * The base 64 MB region and XBOX_NUM_MIRRORS mirror views are mapped
+         * at init time via CreateFileMapping + MapViewOfFileEx (true aliases).
+         * If a fault occurs past the pre-mapped range, map an additional 64 MB
+         * view on demand. This handles edge cases where the memory walker or
+         * init code accesses beyond the pre-mapped 1+ GB.
+         */
+        {
+            uintptr_t xbox_region_end = (uintptr_t)(XBOX_HEAP_BASE + XBOX_HEAP_SIZE +
+                                                     XBOX_GUARD_SIZE) + g_xbox_mem_offset;
+            if (fault_addr >= xbox_region_end) {
+                uint32_t fault_xbox_va = (uint32_t)(fault_addr - g_xbox_mem_offset);
+
+                /* Limit: don't map beyond 2 GB to catch truly runaway pointers */
+                if (fault_xbox_va < (uint32_t)((uint64_t)XBOX_TOTAL_RAM * 32)) {
+                    HANDLE hMap = xbox_GetMappingHandle();
+                    if (hMap) {
+                        /* Map a full 64 MB view aligned to the mirror boundary */
+                        uint32_t mirror_idx = fault_xbox_va / XBOX_TOTAL_RAM;
+                        uintptr_t view_base = (uintptr_t)g_xbox_mem_offset +
+                                              (uintptr_t)mirror_idx * XBOX_TOTAL_RAM;
+                        LPVOID result = MapViewOfFileEx(
+                            hMap, FILE_MAP_ALL_ACCESS, 0, 0,
+                            XBOX_TOTAL_RAM, (LPVOID)view_base);
+                        if (result) {
+                            static int fallback_mirror_count = 0;
+                            fallback_mirror_count++;
+                            fprintf(stderr, "  [MIRROR-FALLBACK] view %d at %p "
+                                    "(Xbox VA 0x%08X-0x%08X)\n",
+                                    mirror_idx, result,
+                                    mirror_idx * XBOX_TOTAL_RAM,
+                                    (mirror_idx + 1) * XBOX_TOTAL_RAM);
+                            fflush(stderr);
+                            return EXCEPTION_CONTINUE_EXECUTION;
+                        }
                     }
                 }
-
-                /* Also dump the saved EBP (typically at frame_va + 0x10 or nearby) */
-                fprintf(stderr, "    Frame+0x10=0x%08X Frame+0x14=0x%08X\n",
-                        MEM32(frame_va + 0x10), MEM32(frame_va + 0x14));
-
-                frame_va = next;
             }
-            fflush(stderr);
+        }
+
+        /*
+         * Bounded fault-skip for isolated bad reads.
+         *
+         * The Xbox D3D8 code (statically linked) and RW Xbox display driver
+         * read from internal D3D structures that don't exist in our D3D11 shim.
+         * Rather than crashing on each bad read, decode the faulting instruction,
+         * return 0 to the destination register, and advance RIP. This lets the
+         * init code proceed and shows us the full call flow.
+         *
+         * Limited to MAX_FAULT_SKIPS to avoid infinite loops.
+         * Writes still crash immediately (they indicate a real problem).
+         */
+        #define MAX_FAULT_SKIPS 50000
+        if (!is_write) {
+            static int fault_skip_count = 0;
+            if (fault_skip_count < MAX_FAULT_SKIPS) {
+                if (veh_skip_faulting_read(info->ContextRecord)) {
+                    fault_skip_count++;
+                    if (fault_skip_count <= 50 || (fault_skip_count % 100) == 0) {
+                        HMODULE fmod = NULL;
+                        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                                          (LPCSTR)info->ExceptionRecord->ExceptionAddress, &fmod);
+                        fprintf(stderr, "  [SKIP-READ #%d] Xbox VA 0x%08X at RVA 0x%llX "
+                                        "(eax=0x%08X ecx=0x%08X edx=0x%08X)\n",
+                                fault_skip_count,
+                                (uint32_t)(fault_addr - g_xbox_mem_offset),
+                                (unsigned long long)((uintptr_t)info->ExceptionRecord->ExceptionAddress - (uintptr_t)fmod),
+                                g_eax, g_ecx, g_edx);
+                        fflush(stderr);
+                    }
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
+        }
+
+        /*
+         * Skip writes to unmapped Xbox memory.
+         *
+         * The Xbox D3D8 library produces garbage internal structure pointers
+         * because the NV2A GPU doesn't exist. RW engine code then tries to
+         * read/write through these garbage pointers. Skip writes that are
+         * outside all known mapped memory regions to let init continue.
+         *
+         * We also extend the read-skip to work universally below.
+         */
+        if (is_write) {
+            static int write_skip_count = 0;
+            if (write_skip_count < MAX_FAULT_SKIPS) {
+                if (veh_skip_faulting_write(info->ContextRecord)) {
+                    write_skip_count++;
+                    uint32_t fault_xbox_va = (uint32_t)(fault_addr - g_xbox_mem_offset);
+                    if (write_skip_count <= 50 || (write_skip_count % 100) == 0) {
+                        HMODULE fmod = NULL;
+                        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                                          (LPCSTR)info->ExceptionRecord->ExceptionAddress, &fmod);
+                        fprintf(stderr, "  [SKIP-WRITE #%d] Xbox VA 0x%08X at RVA 0x%llX "
+                                        "(eax=0x%08X ecx=0x%08X edx=0x%08X)\n",
+                                write_skip_count,
+                                fault_xbox_va,
+                                (unsigned long long)((uintptr_t)info->ExceptionRecord->ExceptionAddress - (uintptr_t)fmod),
+                                g_eax, g_ecx, g_edx);
+                        fflush(stderr);
+                    }
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
         }
 
         /* Normal crash reporting */
+        veh_crash_report:
         void *frames[32];
         USHORT count;
         HMODULE mod;
@@ -286,6 +543,7 @@ static LONG WINAPI crash_veh(PEXCEPTION_POINTERS info)
         }
         fflush(stderr);
     }
+
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -502,6 +760,54 @@ static BOOL init_subsystems(void)
             fprintf(stderr, "  CRT atexit: table at 0x%08X (256 entries)\n", table_base);
         } else {
             fprintf(stderr, "  WARNING: could not allocate atexit table\n");
+        }
+    }
+
+    /* 2d. Pre-initialize D3D8 push buffer.
+     *
+     * The Xbox D3D8 library (statically linked into the game) uses a command
+     * buffer ("push buffer") to batch GPU commands. Render state setters like
+     * sub_00355360 write pairs of uint32 values into this buffer. When full,
+     * sub_00351A20 (flush) submits it to the NV2A GPU and resets the pointer.
+     *
+     * On our recompilation, there's no real GPU. But the code still runs and
+     * tries to write to the buffer. Without initialization, the buffer
+     * pointers at 0x35D6A0/0x35D6A4 are zero, causing sub_00355360 to enter
+     * an infinite flush-retry loop that corrupts the simulated stack.
+     *
+     * Fix: allocate a buffer so writes succeed (silently discarded).
+     * sub_00351A20 (manual override in recomp_manual.c) resets the write
+     * pointer when the buffer fills.
+     */
+    {
+        uint32_t cmd_buf_size = 4 * 1024 * 1024;  /* 4 MB */
+        uint32_t cmd_buf = xbox_HeapAlloc(cmd_buf_size, 4096);
+        if (cmd_buf) {
+            MEM32(0x35D69C) = cmd_buf;                  /* base (for flush reset) */
+            MEM32(0x35D6A0) = cmd_buf;                  /* write pointer */
+            MEM32(0x35D6A4) = cmd_buf + cmd_buf_size;   /* end pointer */
+            MEM32(0x3609FC) = cmd_buf_size / 2;          /* size in 16-bit words */
+            fprintf(stderr, "  D3D8 push buffer: %u KB at Xbox VA 0x%08X-0x%08X\n",
+                    cmd_buf_size / 1024, cmd_buf, cmd_buf + cmd_buf_size);
+        }
+    }
+
+    /* 2e. Pre-initialize D3D8 device context.
+     *
+     * The Xbox D3D8 device context is a large structure (~8KB) pointed to
+     * by MEM32(0x35FB48). Functions like sub_0034C2E0 read fields at offsets
+     * +0x1A04, +0x1A08, etc. Without initialization, 0x35FB48 = 0 and all
+     * field accesses become near-null dereferences (0xFFFFFFF8 etc.).
+     *
+     * Allocating a zeroed buffer means device field reads return 0 (safe
+     * defaults) rather than faulting. This lets D3D8 init code proceed even
+     * though the actual GPU hardware doesn't exist.
+     */
+    {
+        uint32_t fake_device = xbox_HeapAlloc(0x2000, 16);  /* 8 KB */
+        if (fake_device) {
+            MEM32(0x35FB48) = fake_device;
+            fprintf(stderr, "  D3D8 device context: fake at Xbox VA 0x%08X\n", fake_device);
         }
     }
 

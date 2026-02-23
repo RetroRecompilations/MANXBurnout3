@@ -28,6 +28,7 @@
 #include "kernel.h"
 #include "xbox_memory_layout.h"
 #include <stdio.h>
+#include <float.h>
 
 /* Access to recompiled code globals */
 extern uint32_t g_eax, g_ecx, g_edx, g_esp;
@@ -766,8 +767,20 @@ static void bridge_RtlRaiseException(void)
         fflush(stderr);
     }
 
-    /* Don't actually raise - just return. Many Xbox games use SEH for
-     * benign purposes (e.g., probing memory, FPU state detection). */
+    /* Handle float exceptions by clearing the FPU status.
+     *
+     * On the real Xbox, RtlRaiseException dispatches through the SEH chain.
+     * For float exceptions (0xC0000090-0xC0000096), the CRT exception handler
+     * clears the x87/SSE status word and continues execution. Without clearing,
+     * the caller re-checks the FPU status, sees the exception still pending,
+     * and re-raises in an infinite loop.
+     *
+     * _clearfp() clears both x87 and SSE exception flags on Windows x64.
+     */
+    if (code >= 0xC0000090u && code <= 0xC0000096u) {
+        _clearfp();
+    }
+
     g_eax = 0;
 }
 

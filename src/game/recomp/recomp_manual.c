@@ -17,6 +17,7 @@ void sub_001D1818(void);
 void sub_001D2793(void);
 void sub_00249B7C(void);
 void sub_00249B9C(void);
+void sub_00351A20(void);
 
 /* ── Manual dispatch table ────────────────────────────────────────────
  *
@@ -32,6 +33,7 @@ static const struct {
     { 0x001D2793u, (recomp_func_t)sub_001D2793 },
     { 0x00249B7Cu, (recomp_func_t)sub_00249B7C },
     { 0x00249B9Cu, (recomp_func_t)sub_00249B9C },
+    { 0x00351A20u, (recomp_func_t)sub_00351A20 },
 };
 #define NUM_MANUAL_FUNCS (sizeof(g_manual_funcs) / sizeof(g_manual_funcs[0]))
 
@@ -445,3 +447,28 @@ void sub_00249B9C(void)
     #undef fp_top_m
 }
 
+/**
+ * sub_00351A20 - D3D8 push buffer flush
+ *
+ * On Xbox, this submits the current push buffer contents to the NV2A GPU
+ * via DMA and resets the write pointer for the next batch of commands.
+ *
+ * In our recompilation, there's no real GPU. We just reset the write pointer
+ * back to the buffer base so the caller can continue writing commands.
+ * The commands are silently discarded.
+ *
+ * The buffer base is stored at Xbox VA 0x35D69C (set during init in main.c).
+ * The write pointer is at 0x35D6A0, end pointer at 0x35D6A4.
+ *
+ * Calling convention: cdecl, no args.
+ * Called as: PUSH32(esp, 0); sub_00351A20();
+ */
+void sub_00351A20(void)
+{
+    /* Reset write pointer to buffer base */
+    MEM32(0x35D6A0) = MEM32(0x35D69C);
+
+    /* Pop dummy return address (simulated x86 'ret') */
+    esp += 4;
+    return;
+}

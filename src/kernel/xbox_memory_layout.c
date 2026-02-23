@@ -18,31 +18,54 @@
 
 /* Section info from XBE analysis */
 
+/* .text raw file offset (XBE stores this at section header +0x0C) */
+#define TEXT_RAW_OFFSET         0x00001000
+
 /* .rdata raw file offset */
 #define RDATA_RAW_OFFSET        0x0035C000
 
 /* .data raw file offset */
 #define DATA_RAW_OFFSET         0x003A3000
 
-/* Additional XDK data sections to map */
+/* Additional XBE sections to map.
+ * All sections need to be at their original Xbox VAs because the RW engine's
+ * memory walker processes ALL of physical RAM as data structures, including
+ * code sections (the walker doesn't distinguish code from data). */
 static const struct {
     const char *name;
     DWORD va;
     DWORD size;
     DWORD raw_offset;
 } g_extra_sections[] = {
-    /* DOLBY section */
-    { "DOLBY",  0x0076B940, 29056,  0x0040C000 },
-    /* XON_RD (Xbox Online read-only data) */
-    { "XON_RD", 0x00772AC0, 5416,  0x00414000 },
-    /* .data1 */
-    { ".data1", 0x00774000, 224,    0x00416000 },
+    /* XDK library code sections (between .text and .rdata) */
+    { "XMV",     0x002CC200, 163108, 0x002BD000 },
+    { "DSOUND",  0x002F3F40,  52052, 0x002E5000 },
+    { "WMADEC",  0x00300D00, 105828, 0x002F2000 },
+    { "XONLINE", 0x0031AA80, 124764, 0x0030C000 },
+    { "XNET",    0x003391E0,  78056, 0x0032B000 },
+    { "D3D",     0x0034C2E0,  69284, 0x0033F000 },
+    { "XGRPH",   0x00360A60,   8300, 0x00350000 },
+    { "XPP",     0x00362AE0,  36052, 0x00353000 },
+    /* Data sections past .data */
+    { "DOLBY",   0x0076B940,  29036, 0x0040C000 },
+    { "XON_RD",  0x00772AC0,   5416, 0x00414000 },
+    { ".data1",  0x00774000,    176, 0x00416000 },
 };
 #define NUM_EXTRA_SECTIONS (sizeof(g_extra_sections) / sizeof(g_extra_sections[0]))
 
 static void *g_memory_base = NULL;
 static size_t g_memory_size = 0;
 static ptrdiff_t g_memory_offset = 0;  /* actual_base - XBOX_BASE_ADDRESS */
+
+/* File mapping handle for the Xbox memory region.
+ * Using CreateFileMapping + MapViewOfFileEx allows mirror views to alias
+ * the same physical pages as the base region, so writes to mirror addresses
+ * (which wrap modulo 64 MB on real Xbox hardware) correctly modify the
+ * underlying data. */
+static HANDLE g_mapping_handle = NULL;
+
+/* Mirror view pointers for cleanup */
+static void *g_mirror_views[XBOX_NUM_MIRRORS] = {0};
 
 /* Separate allocation for Xbox kernel address space (0x80010000+).
  * Some RenderWare code reads the kernel PE header to detect features. */
@@ -78,7 +101,32 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     g_memory_size = map_end - XBOX_MAP_START;
 
     /*
-     * Reserve the entire virtual address range.
+     * Create a file mapping backed by the page file.
+     *
+     * Using file mapping instead of VirtualAlloc allows us to map the same
+     * physical pages at multiple virtual addresses via MapViewOfFileEx.
+     * This is critical for the Xbox RAM mirror: the Xbox memory controller
+     * uses a 26-bit address bus, so ALL addresses wrap modulo 64 MB.
+     * Code that writes to address 0x20000448 is really writing to 0x00000448.
+     * With file mapping views, we create aliased mappings at 64 MB intervals
+     * that all point to the same physical memory.
+     */
+    g_mapping_handle = CreateFileMappingA(
+        INVALID_HANDLE_VALUE,   /* page file backed */
+        NULL,                   /* default security */
+        PAGE_READWRITE,         /* read-write access */
+        0,                      /* high DWORD of size */
+        (DWORD)g_memory_size,   /* low DWORD of size (64 MB) */
+        NULL                    /* unnamed mapping */
+    );
+    if (!g_mapping_handle) {
+        fprintf(stderr, "xbox_MemoryLayoutInit: CreateFileMapping failed (error %lu)\n",
+                GetLastError());
+        return FALSE;
+    }
+
+    /*
+     * Map the base view at the desired virtual address.
      * Try the original Xbox base address first. If that fails (common on
      * Windows 11 where low addresses are often reserved), try page-aligned
      * addresses upward until we find a free region.
@@ -95,16 +143,17 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 
         for (int i = 0; try_bases[i] != 0 || i == 0; i++) {
             LPVOID hint = try_bases[i] ? (LPVOID)try_bases[i] : NULL;
-            g_memory_base = VirtualAlloc(
-                hint,
-                g_memory_size,
-                MEM_RESERVE | MEM_COMMIT,
-                PAGE_READWRITE
+            g_memory_base = MapViewOfFileEx(
+                g_mapping_handle,
+                FILE_MAP_ALL_ACCESS,
+                0, 0,           /* offset into mapping */
+                g_memory_size,  /* size */
+                hint            /* desired base address */
             );
             if (g_memory_base) {
                 if (try_bases[i] != 0 && (uintptr_t)g_memory_base != try_bases[i]) {
                     /* OS gave us a different address, retry */
-                    VirtualFree(g_memory_base, 0, MEM_RELEASE);
+                    UnmapViewOfFile(g_memory_base);
                     g_memory_base = NULL;
                     continue;
                 }
@@ -114,8 +163,10 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     }
 
     if (!g_memory_base) {
-        fprintf(stderr, "xbox_MemoryLayoutInit: failed to allocate %zu KB of virtual memory\n",
+        fprintf(stderr, "xbox_MemoryLayoutInit: failed to map base view (%zu KB)\n",
                 g_memory_size / 1024);
+        CloseHandle(g_mapping_handle);
+        g_mapping_handle = NULL;
         return FALSE;
     }
 
@@ -157,6 +208,25 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     }
 
     /*
+     * Copy .text section from XBE to its original Xbox VA.
+     *
+     * Even though the recompiled code runs natively (not from the .text
+     * section), the RW engine's memory walker processes ALL physical RAM
+     * as data structures, including the code pages. On Xbox, addresses
+     * past 64MB wrap back to lower memory via the RAM mirror. When the
+     * walker crosses 64MB and reads from mirrored .text addresses, it
+     * expects actual code bytes (not zeros). Without this, the walker's
+     * internal data structures are corrupted by zero-filled gaps.
+     */
+    if (TEXT_RAW_OFFSET + XBOX_TEXT_SIZE <= xbe_size) {
+        memcpy(XBOX_VA(XBOX_TEXT_VA), xbe + TEXT_RAW_OFFSET, XBOX_TEXT_SIZE);
+        fprintf(stderr, "  .text: %u bytes at %p (Xbox VA 0x%08X) [for memory walker]\n",
+                XBOX_TEXT_SIZE, XBOX_VA(XBOX_TEXT_VA), XBOX_TEXT_VA);
+    } else {
+        fprintf(stderr, "  WARNING: .text raw data out of bounds\n");
+    }
+
+    /*
      * Copy .rdata section from XBE.
      */
     if (RDATA_RAW_OFFSET + XBOX_RDATA_SIZE <= xbe_size) {
@@ -194,15 +264,14 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     }
 
     /*
-     * Set .rdata as read-only.
-     * This helps catch accidental writes to constants early.
+     * NOTE: .rdata is NOT set read-only.
+     * VirtualProtect rounds to page boundaries, and the .rdata end (0x003B2454)
+     * and .data start (0x003B2360) share the same 4KB page (0x003B2000-0x003B2FFF).
+     * Making .rdata read-only also makes the first ~0xCA0 bytes of .data read-only,
+     * which causes game initialization code to fault when writing to .data globals
+     * in that overlap range.
      */
-    VirtualProtect(
-        XBOX_VA(XBOX_RDATA_VA),
-        XBOX_RDATA_SIZE,
-        PAGE_READONLY,
-        &old_protect
-    );
+    (void)old_protect;
 
     #undef XBOX_VA
 
@@ -311,10 +380,48 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         #undef KERNEL_PAGE_SIZE
     }
 
-    /* Initialize the dynamic heap */
+    /* Initialize the dynamic heap. */
     fprintf(stderr, "  Heap: %u MB at Xbox VA 0x%08X-0x%08X\n",
             XBOX_HEAP_SIZE / (1024 * 1024), XBOX_HEAP_BASE,
             XBOX_HEAP_BASE + XBOX_HEAP_SIZE);
+
+    /*
+     * Map mirror views of the 64 MB region.
+     *
+     * On retail Xbox, physical RAM wraps at 64 MB due to the 26-bit
+     * address bus. Address 0x04070000 reads the same data as 0x00070000.
+     * The RenderWare engine's memory walker crosses 64 MB and accesses
+     * mirrored data for an extended walk covering 256+ MB of virtual
+     * addresses. Game init code also writes large data structures past
+     * 64 MB that on real hardware wrap into physical RAM.
+     *
+     * We map additional views of the SAME file mapping section at 64 MB
+     * intervals. All views alias the same physical pages, so reads and
+     * writes at any mirror address correctly access the base data.
+     */
+    {
+        int mirrors_ok = 0;
+        for (int m = 0; m < XBOX_NUM_MIRRORS; m++) {
+            uintptr_t mirror_base = (uintptr_t)g_memory_base +
+                                    (uintptr_t)(m + 1) * g_memory_size;
+            g_mirror_views[m] = MapViewOfFileEx(
+                g_mapping_handle,
+                FILE_MAP_ALL_ACCESS,
+                0, 0,
+                g_memory_size,
+                (LPVOID)mirror_base
+            );
+            if (g_mirror_views[m]) {
+                mirrors_ok++;
+            } else {
+                fprintf(stderr, "  Mirror %d: FAILED at %p (error %lu)\n",
+                        m + 1, (void *)mirror_base, GetLastError());
+            }
+        }
+        fprintf(stderr, "  RAM mirror: %d/%d views mapped (covers %d MB)\n",
+                mirrors_ok, XBOX_NUM_MIRRORS,
+                (int)((mirrors_ok + 1) * g_memory_size / (1024 * 1024)));
+    }
 
     fprintf(stderr, "xbox_MemoryLayoutInit: complete\n");
     return TRUE;
@@ -326,12 +433,25 @@ void xbox_MemoryLayoutShutdown(void)
         VirtualFree(g_kernel_memory, 0, MEM_RELEASE);
         g_kernel_memory = NULL;
     }
+    /* Unmap mirror views first */
+    for (int m = 0; m < XBOX_NUM_MIRRORS; m++) {
+        if (g_mirror_views[m]) {
+            UnmapViewOfFile(g_mirror_views[m]);
+            g_mirror_views[m] = NULL;
+        }
+    }
+    /* Unmap base view */
     if (g_memory_base) {
-        VirtualFree(g_memory_base, 0, MEM_RELEASE);
+        UnmapViewOfFile(g_memory_base);
         g_memory_base = NULL;
         g_memory_size = 0;
-        fprintf(stderr, "xbox_MemoryLayoutShutdown: released\n");
     }
+    /* Close file mapping handle */
+    if (g_mapping_handle) {
+        CloseHandle(g_mapping_handle);
+        g_mapping_handle = NULL;
+    }
+    fprintf(stderr, "xbox_MemoryLayoutShutdown: released\n");
 }
 
 BOOL xbox_IsXboxAddress(uintptr_t address)
@@ -366,6 +486,14 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
 
     if (alignment < 4) alignment = 4;
 
+    /* Enforce minimum allocation size.
+     * The Xbox D3D8 code sometimes computes resource sizes from GPU
+     * capabilities that return 0 (since we don't have real NV2A hardware),
+     * resulting in zero-size allocations. With a bump allocator, these all
+     * return the same address, causing overlapping structures. Enforce a
+     * minimum of 4096 bytes so each allocation gets its own memory. */
+    if (size < 4096) size = 4096;
+
     /* Align the next pointer */
     result = (g_heap_next + alignment - 1) & ~(alignment - 1);
 
@@ -393,4 +521,9 @@ void xbox_HeapFree(uint32_t xbox_va)
 {
     /* No-op for bump allocator */
     (void)xbox_va;
+}
+
+HANDLE xbox_GetMappingHandle(void)
+{
+    return g_mapping_handle;
 }

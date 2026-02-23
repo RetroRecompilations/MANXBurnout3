@@ -167,8 +167,13 @@ ptrdiff_t xbox_GetMemoryOffset(void);
  *  that the engine catches via SEH to determine available memory. */
 #define XBOX_HEAP_SIZE      (XBOX_TOTAL_RAM - XBOX_HEAP_BASE)  /* ~55.5 MB */
 
-/** No guard region - the heap fills up to the 64 MB boundary exactly. */
+/** No static mirror/guard region. RAM mirror is handled via file mapping
+ *  views that alias the same physical pages as the base 64 MB region. */
+#define XBOX_MIRROR_SIZE    0
 #define XBOX_GUARD_SIZE     0
+
+/** Number of 64 MB mirror views to pre-map (covers 1 GB of address space). */
+#define XBOX_NUM_MIRRORS    16
 
 /**
  * Allocate from the Xbox heap. Returns an Xbox VA, or 0 on failure.
@@ -181,6 +186,13 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
  * Free a block from the Xbox heap. Currently a no-op (bump allocator).
  */
 void xbox_HeapFree(uint32_t xbox_va);
+
+/**
+ * Get the file mapping handle for the Xbox memory region.
+ * Used by the VEH handler to map additional mirror views on demand.
+ * Returns NULL if file mapping is not available.
+ */
+HANDLE xbox_GetMappingHandle(void);
 
 #ifdef __cplusplus
 }
