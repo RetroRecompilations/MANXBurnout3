@@ -13,10 +13,22 @@
 #include <stdio.h>
 
 /* Forward declarations for manually implemented functions */
+void sub_0002DDF0(void);
+void sub_001BEFF0(void);
+void sub_001F5810(void);
+void sub_001F5840(void);
+void sub_001F5C40(void);
+void sub_001F5CB0(void);
+void sub_001CFDD0(void);
 void sub_001D1818(void);
 void sub_001D2793(void);
+void sub_001D5707(void);
+void sub_001D5E82(void);
+void sub_00244C51(void);
 void sub_00249B7C(void);
 void sub_00249B9C(void);
+void sub_003518E0(void);
+void sub_00351770(void);
 void sub_00351A20(void);
 
 /* ── Manual dispatch table ────────────────────────────────────────────
@@ -29,10 +41,22 @@ static const struct {
     uint32_t xbox_va;
     recomp_func_t func;
 } g_manual_funcs[] = {
+    { 0x0002DDF0u, (recomp_func_t)sub_0002DDF0 },
+    { 0x001BEFF0u, (recomp_func_t)sub_001BEFF0 },
+    { 0x001CFDD0u, (recomp_func_t)sub_001CFDD0 },
     { 0x001D1818u, (recomp_func_t)sub_001D1818 },
     { 0x001D2793u, (recomp_func_t)sub_001D2793 },
+    { 0x001D5707u, (recomp_func_t)sub_001D5707 },
+    { 0x001F5810u, (recomp_func_t)sub_001F5810 },
+    { 0x001F5840u, (recomp_func_t)sub_001F5840 },
+    { 0x001F5C40u, (recomp_func_t)sub_001F5C40 },
+    { 0x001F5CB0u, (recomp_func_t)sub_001F5CB0 },
+    { 0x001D5E82u, (recomp_func_t)sub_001D5E82 },
+    { 0x00244C51u, (recomp_func_t)sub_00244C51 },
     { 0x00249B7Cu, (recomp_func_t)sub_00249B7C },
     { 0x00249B9Cu, (recomp_func_t)sub_00249B9C },
+    { 0x003518E0u, (recomp_func_t)sub_003518E0 },
+    { 0x00351770u, (recomp_func_t)sub_00351770 },
     { 0x00351A20u, (recomp_func_t)sub_00351A20 },
 };
 #define NUM_MANUAL_FUNCS (sizeof(g_manual_funcs) / sizeof(g_manual_funcs[0]))
@@ -44,6 +68,65 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
             return g_manual_funcs[i].func;
     }
     return NULL;
+}
+
+/**
+ * sub_001BEFF0 - RW memory pool free list reorganization (STUB)
+ *
+ * Original: 0x001BEFF0 - 0x001BF03A (74 bytes, 32 insns)
+ * Category: game_engine (RenderWare core)
+ *
+ * This function reorganizes a memory pool's free list by scanning the
+ * contiguous block array and relinking free nodes in address order.
+ * The pool descriptor is passed in esi (register parameter):
+ *   esi+0x00 = head pointer (contiguous array base)
+ *   esi+0x04 = block stride
+ *   esi+0x10 = free list head
+ *
+ * When the pool contains uninitialized data (because the Xbox D3D cache
+ * wasn't properly initialized), the free list walk reads garbage pointers
+ * and enters a loop that exhausts all 50,000 VEH fault-skip slots.
+ *
+ * Stubbing as no-op: the existing free list order is preserved. This is
+ * safe because the pool is only used for Xbox D3D cache entries which
+ * don't exist in our D3D11 shim.
+ *
+ * Calling convention: cdecl, 0 params (esi = implicit pool pointer)
+ */
+void sub_001BEFF0(void)
+{
+    esp += 4;  /* pop dummy return address */
+    return;
+}
+
+/**
+ * sub_001CFDD0 - RW display mode query (STUB)
+ *
+ * Original: 0x001CFDD0 - 0x001CFE6F (159 bytes, 55 insns)
+ * Category: rw_driver_xbox
+ * Source: driver/xbox display driver
+ *
+ * This function queries the Xbox AV system for display timing information
+ * (resolution, refresh rate, bytes per scanline, etc.) via kernel calls
+ * through thunk entries at 0x36B7E0-0x36B7EC. Since we don't have a real
+ * Xbox AV encoder, these calls return 0, and the caller (sub_00021C20)
+ * divides by the result → STATUS_INTEGER_DIVIDE_BY_ZERO.
+ *
+ * The caller uses the return value as a chunk size for display buffer
+ * allocation: count = (retval + 0xE9FF) / retval + 2; total = count * retval.
+ *
+ * Returning 0xEA00 (59904) matches the stripe size the caller already uses
+ * for other display segments, giving: count=3, total=179712 bytes.
+ *
+ * Calling convention: stdcall, 1 param (ret 4)
+ *   [esp+4] = parameter (display string pointer)
+ * Returns: display buffer size in eax
+ */
+void sub_001CFDD0(void)
+{
+    eax = 0xEA00;  /* 59904 = display buffer stripe size */
+    esp += 8;      /* ret 4: pop return addr + 1 param */
+    return;
 }
 
 /**
@@ -329,6 +412,221 @@ loc_001D27DF:
 }
 
 /**
+ * sub_001D5707 - Xbox D3D8 cache initialization (STUB)
+ *
+ * Original: 0x001D5707 - 0x001D5E66 (1887 bytes, 563 insns)
+ * Category: rw_driver_xbox
+ * Source: driver/xbox/xbcache.c
+ *
+ * This function initializes the NV2A GPU texture/surface cache for the Xbox
+ * D3D8 library. It reads from internal D3D device fields (offsets +0x1A04,
+ * +0x1A08, etc.) that don't exist in our D3D11 shim, producing garbage
+ * pointers like 0xFFFFFFF8 (null + struct offset), 0x8DCC5823 (code bytes
+ * read as data), 0xEBFD7A2D, 0xCCCCCCCC, etc. These cause ~500
+ * SKIP-READ/SKIP-WRITE faults in the VEH handler.
+ *
+ * Since the NV2A GPU doesn't exist, the cache is meaningless. Stubbing this
+ * function eliminates the fault flood and may fix downstream issues caused
+ * by corrupted cache state.
+ *
+ * Calling convention: stdcall, 3 params (ret 12)
+ *   [esp+4] = memory pool pointer (first param, returned in eax)
+ *   [esp+8] = flags
+ *   [esp+C] = size
+ * Returns: first param (memory pool pointer) in eax
+ */
+void sub_001D5707(void)
+{
+    eax = MEM32(esp + 4);  /* return first param (memory pool ptr) */
+    esp += 16;             /* ret 12: pop return addr + 3 params */
+    return;
+}
+
+/**
+ * sub_001D5E82 - Xbox D3D8 cache init variant (STUB)
+ *
+ * Original: 0x001D5E82 - 0x001D6063 (481 bytes, 158 insns)
+ * Category: rw_driver_xbox
+ * Source: driver/xbox/xbcache.c
+ *
+ * Another Xbox D3D8 cache initialization function from the same module as
+ * sub_001D5707. Reads from uninitialized D3D device fields, producing
+ * garbage pointers (0x8DCC5823 etc.) and bogus heap allocation sizes
+ * (357MB, 1.4GB). Stubbed for same reason as sub_001D5707.
+ *
+ * Calling convention: stdcall, 3 params (ret 12)
+ *   [esp+4] = memory pool pointer (returned in eax)
+ *   [esp+8] = flags
+ *   [esp+C] = size
+ * Returns: first param in eax
+ */
+void sub_001D5E82(void)
+{
+    eax = MEM32(esp + 4);  /* return first param (memory pool ptr) */
+    esp += 16;             /* ret 12: pop return addr + 3 params */
+    return;
+}
+
+/**
+ * sub_001F5810 - Xbox render pipeline begin frame (STUB)
+ *
+ * Original: 0x001F5810 - 0x001F5834 (36 bytes, 8 insns)
+ * Category: rw_world_pipe_xbox
+ *
+ * "Begin render frame" for the Xbox NV2A render pipeline. Sets global
+ * MEM32(0x41B41C) = 1 (pipeline active flag), calls sub_001FBDF0 (init),
+ * sub_001F5E30/sub_001F5C40 (pipeline attach), then tail-jumps to
+ * sub_001FC3A0 (669 bytes, the main pipeline processor).
+ *
+ * sub_001FC3A0 triggers a deep call chain (sub_001CAD10 → sub_001CB2D0 →
+ * sub_001CD620 etc.) that processes all Xbox render operations. Since we
+ * don't have NV2A hardware and all pipeline data is garbage from stubbed
+ * D3D cache init, this call chain consumes ~160 bytes of Xbox stack per
+ * iteration and overflows the 1MB simulated stack.
+ *
+ * Stub: no-op. The paired sub_001F5840 (end frame) still increments the
+ * frame counter. sub_00135500 loops 30 times calling begin/end frame.
+ *
+ * Calling convention: cdecl, 0 params
+ */
+void sub_001F5810(void)
+{
+    esp += 4;    /* pop dummy return address */
+    return;
+}
+
+/**
+ * sub_001F5840 - Xbox render pipeline end frame (STUB)
+ *
+ * Original: 0x001F5840 - 0x001F5866 (38 bytes, 10 insns)
+ * Category: rw_world_pipe_xbox
+ *
+ * "End render frame" counterpart to sub_001F5810. Calls sub_001F5E30 +
+ * sub_001F5CB0 (pipeline detach, already stubbed), increments frame counter
+ * MEM32(0x41B418), clears pipeline active flag MEM32(0x41B41C) = 0.
+ *
+ * Since sub_001F5810 is stubbed, we only need to increment the frame counter
+ * to keep the game's frame tracking consistent.
+ *
+ * Calling convention: cdecl, 0 params
+ */
+void sub_001F5840(void)
+{
+    MEM32(0x41B418) = MEM32(0x41B418) + 1;  /* increment frame counter */
+    MEM32(0x41B41C) = 0;                      /* clear pipeline active flag */
+    esp += 4;    /* pop dummy return address */
+    return;
+}
+
+/**
+ * sub_001F5C40 - Xbox render pipeline process/attach (STUB)
+ *
+ * Original: 0x001F5C40 - 0x001F5CA5 (101 bytes, 47 insns)
+ * Category: rw_world_pipe_xbox
+ *
+ * Walks a linked list of RenderWare render pipeline entries starting at
+ * (esi + 0xC), calling a callback via vtable offset 0x2C on each entry.
+ * The linked list nodes are at offset +20 within each pipeline object.
+ *
+ * Problem: The linked list head was populated by Xbox D3D cache init
+ * (xbcache.c) which is stubbed. The list contains garbage pointers, causing
+ * MEM32(esi - 20) to read Xbox VA 0xFFFFFFEC (near-null - 20) in an infinite
+ * loop. Accounts for ~49,600 VEH fault-skips.
+ *
+ * Calling convention: cdecl, 2 params
+ *   [esp+4] = pipeline object pointer
+ *   [esp+8] = flag (0 or non-zero)
+ * Returns: eax = pipeline object pointer or 0 (no valid pipeline)
+ * Caller cleans 8 bytes of params.
+ */
+void sub_001F5C40(void)
+{
+    eax = 0;     /* no valid pipeline found */
+    esp += 4;    /* pop dummy return address */
+    return;
+}
+
+/**
+ * sub_001F5CB0 - Xbox render pipeline process/detach (STUB)
+ *
+ * Original: 0x001F5CB0 - 0x001F5D15 (101 bytes, 47 insns)
+ * Category: rw_world_pipe_xbox
+ *
+ * Twin of sub_001F5C40 - identical structure, walks same garbage linked list
+ * but calls vtable offset 0x30 instead of 0x2C. Same infinite loop problem.
+ *
+ * Calling convention: cdecl, 2 params. Caller cleans 8 bytes.
+ * Returns: eax = pipeline object pointer or 0
+ */
+void sub_001F5CB0(void)
+{
+    eax = 0;     /* no valid pipeline found */
+    esp += 4;    /* pop dummy return address */
+    return;
+}
+
+/**
+ * sub_0002DDF0 - Pipeline name lookup (STUB)
+ *
+ * Original: 0x0002DDF0 - 0x0002DE40 (80 bytes, 43 insns)
+ * Category: game_engine
+ *
+ * Searches a RenderWare pipeline table for a named entry by iterating
+ * entries at MEM32(esi+0xC) with count MEM32(esi+8), calling sub_00244C51
+ * for case-insensitive string comparison on each entry's name at offset 0x48.
+ *
+ * Problem: esi points to a pipeline table structure populated by Xbox D3D
+ * cache init (xbcache.c). Since those init functions are stubbed, the table
+ * contains garbage: count is huge, array pointer is ~0x6C000000 (out of
+ * range), causing 50,000+ VEH fault-skips as the loop reads progressively
+ * further into unmapped memory.
+ *
+ * Stub returns 0 (no match found). The caller (sub_0002DE40) stores this
+ * as the pipeline entry pointer, falling back to a default pipeline.
+ *
+ * Calling convention: stdcall, 1 param (ret 4)
+ *   [esp+4] = Xbox VA of pipeline name string to search for
+ * Returns: eax=0 (no match) or eax=pointer to matching entry
+ */
+void sub_0002DDF0(void)
+{
+    eax = 0;     /* no match found */
+    esp += 8;    /* ret 4: pop return addr + 1 param */
+    return;
+}
+
+/**
+ * sub_00244C51 - Xbox pipeline string comparison (STUB)
+ *
+ * Original: 0x00244C51 - 0x00244CA0 (79 bytes, 42 insns)
+ * Category: rw_world_pipe_xbox
+ *
+ * Case-insensitive string comparison used during RenderWare render pipeline
+ * selection. When the Xbox pipeline table (0x41D4A8) is active, this function
+ * compares two pipeline name strings byte-by-byte. One string pointer comes
+ * from the Xbox D3D cache which contains garbage from uninitialized NV2A
+ * state, causing 50,000+ VEH fault-skip iterations as it reads through
+ * code bytes interpreted as data.
+ *
+ * Both this function AND its fallback (sub_00248FF0, also xbcache.c) read
+ * from the same garbage pointers. Stub returns "not equal" (-1) to prevent
+ * the Xbox pipeline from being selected. The caller will fall through to
+ * the next candidate pipeline (eventually the generic software one).
+ *
+ * Calling convention: cdecl, 2 params
+ *   [esp+4] = string pointer 1 (from D3D cache structure + 0x48)
+ *   [esp+8] = string pointer 2 (pipeline name to match)
+ * Returns: 0 if equal, non-zero if not equal
+ * Caller cleans 8 bytes of params after call.
+ */
+void sub_00244C51(void)
+{
+    eax = (uint32_t)-1;  /* not equal - reject Xbox pipeline */
+    esp += 4;            /* pop dummy return address */
+    return;
+}
+
+/**
  * sub_00249B7C - CRT FPU exception handler (with inlined tail jump target)
  *
  * Original x86: 0x00249B7C sets up an EBP frame, copies some args to locals,
@@ -470,5 +768,52 @@ void sub_00351A20(void)
 
     /* Pop dummy return address (simulated x86 'ret') */
     esp += 4;
+    return;
+}
+
+
+/**
+ * sub_003518E0 - NV2A push buffer kickoff (STUB)
+ *
+ * Original: 0x003518E0 (D3D8LTCG section)
+ *
+ * On Xbox, this is the push buffer "kick" function that submits queued
+ * GPU commands to the NV2A via DMA. It updates the PUT pointer, waits
+ * for the GPU GET pointer to advance, and handles ring buffer wrapping.
+ *
+ * The function has spin-wait loops that poll NV2A hardware registers
+ * (0xFC000000 range) which don't exist in our recompilation, causing
+ * infinite loops and native stack overflow.
+ *
+ * Calling convention: ret 8 (2 params on stack).
+ * Called as: PUSH32(esp, arg1); PUSH32(esp, arg2); PUSH32(esp, 0); sub_003518E0();
+ */
+void sub_003518E0(void)
+{
+    eax = 0;      /* no GPU address to return */
+    esp += 12;    /* ret 8: pop return addr (4) + 2 params (8) */
+    return;
+}
+
+
+/**
+ * sub_00351770 - NV2A push buffer space allocation (STUB)
+ *
+ * Original: 0x00351770 (D3D8LTCG section)
+ *
+ * On Xbox, this allocates space in the push buffer ring, potentially
+ * triggering a kickoff (sub_003518E0) if insufficient space remains.
+ * It also reads the GPU GET pointer and spins waiting for the GPU
+ * to free space.
+ *
+ * Contains spin-wait loops on NV2A registers that cause hangs/overflow.
+ *
+ * Calling convention: ret 4 (1 param on stack).
+ * Returns eax = allocated push buffer address (we return 0 = no allocation).
+ */
+void sub_00351770(void)
+{
+    eax = 0;      /* no push buffer space allocated */
+    esp += 8;     /* ret 4: pop return addr (4) + 1 param (4) */
     return;
 }

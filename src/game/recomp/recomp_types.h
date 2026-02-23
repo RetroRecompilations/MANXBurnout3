@@ -213,13 +213,14 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
  * Looks up the Xbox VA and calls the translated function.
  * Falls back to kernel bridge for kernel thunk synthetic VAs.
  * The caller must PUSH32 a dummy return address before this macro.
- * If not found, the call is a no-op (stub target).
+ * If not found, pop the dummy return address to keep the stack balanced.
  */
 #define RECOMP_ICALL(xbox_va) do { \
     recomp_func_t _fn = recomp_lookup_manual((uint32_t)(xbox_va)); \
     if (!_fn) _fn = recomp_lookup((uint32_t)(xbox_va)); \
     if (!_fn) _fn = recomp_lookup_kernel((uint32_t)(xbox_va)); \
     if (_fn) _fn(); \
+    else g_esp += 4; /* pop leaked dummy return address */ \
 } while(0)
 
 /**

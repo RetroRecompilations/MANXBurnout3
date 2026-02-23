@@ -295,6 +295,16 @@ static BOOL veh_skip_faulting_write(PCONTEXT ctx)
 
 static LONG WINAPI crash_veh(PEXCEPTION_POINTERS info)
 {
+    /* Catch stack overflow early - can't do much except report and die */
+    if (info->ExceptionRecord->ExceptionCode == EXCEPTION_STACK_OVERFLOW) {
+        fprintf(stderr, "\n=== NATIVE STACK OVERFLOW at RIP=0x%p ===\n",
+                info->ExceptionRecord->ExceptionAddress);
+        fprintf(stderr, "  RSP=0x%p  Xbox ESP=0x%08X\n",
+                (void*)info->ContextRecord->Rsp, g_esp);
+        fflush(stderr);
+        ExitProcess(42);
+    }
+
     if (info->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
         uintptr_t fault_addr = info->ExceptionRecord->ExceptionInformation[1];
         int is_write = (int)info->ExceptionRecord->ExceptionInformation[0];
@@ -311,23 +321,23 @@ static LONG WINAPI crash_veh(PEXCEPTION_POINTERS info)
         }
 
         /*
-         * NV2A GPU address space:
+         * NV2A GPU / hardware I/O address space (0xF0000000+):
          *   0xF0000000-0xF3FFFFFF  GPU framebuffer / texture memory
+         *   0xF4000000-0xFCFFFFFF  AGP aperture, push buffer DMA, misc HW
          *   0xFD000000-0xFDFFFFFF  GPU MMIO registers
+         *   0xFE000000+            Flash ROM, misc
          *
-         * On Xbox, the NV2A GPU is mapped at these physical address ranges.
-         * The statically-linked D3D8 library accesses both during init:
-         * - Registers: capability queries, config reads
-         * - Framebuffer: push buffer writes, texture uploads
+         * On Xbox, the NV2A GPU and other hardware is mapped above 0xF0000000.
+         * The statically-linked D3D8 library accesses these during init and
+         * at runtime for push buffer submission, register queries, etc.
          *
          * We map pages on demand filled with zeros. For registers, zero
-         * means "feature not present" (safe default). For framebuffer,
-         * the writes are silently absorbed (no real GPU to consume them).
+         * means "feature not present" (safe default). For framebuffer and
+         * push buffers, the writes are silently absorbed (no real GPU).
          */
         {
             uint32_t fault_xbox_va = (uint32_t)(fault_addr - g_xbox_mem_offset);
-            if ((fault_xbox_va >= 0xF0000000u && fault_xbox_va < 0xF4000000u) ||
-                (fault_xbox_va >= 0xFD000000u && fault_xbox_va < 0xFE000000u)) {
+            if (fault_xbox_va >= 0xF0000000u) {
                 static int nv2a_page_count = 0;
                 uintptr_t alloc_base = fault_addr & ~(uintptr_t)0xFFFF; /* 64KB align */
                 LPVOID result = VirtualAlloc((LPVOID)alloc_base, 0x10000,
@@ -340,7 +350,8 @@ static LONG WINAPI crash_veh(PEXCEPTION_POINTERS info)
                     memset(result, 0, 0x10000);
                     nv2a_page_count++;
                     if (nv2a_page_count <= 20 || (nv2a_page_count % 100) == 0) {
-                        const char *region = (fault_xbox_va >= 0xFD000000u) ? "reg" : "fb";
+                        const char *region = (fault_xbox_va >= 0xFD000000u) ? "reg" :
+                                              (fault_xbox_va >= 0xF4000000u) ? "io" : "fb";
                         fprintf(stderr, "  [NV2A] GPU %s page 0x%08X (%s) [page #%d]\n",
                                 region, fault_xbox_va & 0xFFFF0000u,
                                 is_write ? "W" : "R", nv2a_page_count);

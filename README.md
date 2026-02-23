@@ -4,7 +4,15 @@ A project to statically recompile the original Xbox version of **Burnout 3: Take
 
 ## Project Status
 
-**Phase 5: Integration** - Game boots through RenderWare engine init, allocates memory pools, reaches memory probe loop. Active debugging of SEH/exception dispatch for RW memory boundary detection.
+**Phase 5: Integration** - The recompiled game boots through full RenderWare engine initialization, executes 22,097 translated functions, and **enters its main loop stably**. A D3D11 window opens and renders, the message pump runs, and the process stays alive until killed. Initialization completes via SEH exception recovery (matching original Xbox behavior). Active work on stubbing Xbox-specific GPU/pipeline code and improving init completion.
+
+### What Works
+- Full RenderWare engine init (memory pools, global setup, static constructors)
+- 200+ Xbox kernel calls dispatched to Win32 replacements
+- Xbox memory layout faithfully reproduced (64 MB + mirror views via file mapping)
+- D3D11 window creation and rendering (fixed-function pipeline emulation)
+- Game main loop executes stably after init
+- 22,097 recompiled x86 functions running as native x86-64 C code
 
 ## Overview
 
@@ -43,9 +51,17 @@ Static recompilation translates the original Xbox x86 machine code into equivale
 
 ### Windows 11 Target
 - **CPU**: x86-64 (backward compatible with x86 source)
-- **Graphics API**: Direct3D 11 or Vulkan
+- **Graphics API**: Direct3D 11
 - **Audio**: XAudio2 / WASAPI
 - **Input**: XInput / DirectInput
+
+### Recompilation Model
+All 22,097 Xbox functions are translated to C functions with a simulated register model:
+- **Global volatile registers**: `g_eax`, `g_ecx`, `g_edx`, `g_esp` (shared across all code)
+- **Global callee-saved registers**: `g_ebx`, `g_esi`, `g_edi` (callee-save enforced by PUSH/POP in generated code)
+- **Local per-function**: `ebp` (bridged via `g_seh_ebp` for SEH prolog/epilog)
+- **Calling convention**: Arguments pass via simulated Xbox stack (PUSH32/POP32), return values via `g_eax`
+- **Indirect calls**: RECOMP_ICALL macro with 3-tier lookup (manual overrides, auto-generated dispatch table, kernel bridges)
 
 ## XBE Analysis Summary
 
@@ -97,9 +113,9 @@ The main executable (`default.xbe`) contains:
 - [x] String extraction (1,988 strings)
 - [x] Xbox kernel replacement layer (147/147 imports, builds as static lib)
 - [x] Function identification tool (85.3% classified: RW, CRT, vtables, stubs)
-- [x] x86→C static recompiler (4,044 game functions, 445K lines of C, pattern-matching lifter)
+- [x] x86→C static recompiler (22,095 functions, 4.43M lines of C, pattern-matching lifter)
 
-### Phase 2: Analysis
+### Phase 2: Analysis (Complete)
 - [x] Identify all function boundaries in `.text` (20,816 detected)
 - [x] Match CRT/MSVC runtime functions (13 identified via byte signatures)
 - [x] Identify RenderWare engine functions (2,758 classified across 67 source modules)
@@ -107,12 +123,12 @@ The main executable (`default.xbe`) contains:
 - [x] Map global variables and data structures (22,587 globals, 1,836 structures)
 - [x] Document calling conventions and ABI (76% FPO, 1,182 thiscall methods)
 
-### Phase 3: Core Recompilation
+### Phase 3: Core Recompilation (Complete)
 - [x] Replace Xbox kernel calls with Win32 equivalents (all 147)
 - [x] Replace D3D8 (Xbox) with D3D11 (resource layer: VB/IB/texture creation, Lock/Unlock, shaders, states)
 - [x] Replace DirectSound (Xbox) with XAudio2 (buffer objects: Play/Stop/Volume/Lock)
 - [x] Replace Xbox input with XInput (functional: controller state + vibration)
-- [x] Handle memory layout differences (VirtualAlloc maps data sections to Xbox VAs)
+- [x] Handle memory layout differences (CreateFileMapping maps data sections to Xbox VAs)
 - [x] Fixed-function pipeline emulation (HLSL shaders, FVF input layouts, render state translation)
 
 ### Phase 4: Asset Pipeline
@@ -124,26 +140,28 @@ The main executable (`default.xbe`) contains:
 - [ ] Audio bank converter (Xbox ADPCM → standard PCM/Vorbis)
 - [ ] Video player replacement (XMV → standard format)
 
-### Phase 5: Integration & Testing
+### Phase 5: Integration & Testing (In Progress)
 - [x] Game executable scaffold (WinMain, window, subsystem init, game loop)
-- [x] 22,096 recompiled functions in dispatch table (22,095 auto + 1 manual)
-- [x] Kernel bridge: 30 per-ordinal bridges, 117 stubs (147 total thunk entries)
+- [x] 22,097 recompiled functions in dispatch table (22,095 auto + 2 manual)
+- [x] Kernel bridge: 55 per-ordinal bridges, 92 stubs (147 total thunk entries)
 - [x] Game entry point (0x001D2807) runs to completion → creates thread → calls RW init → returns
-- [x] Manual function for mid-function entry point 0x001D1818 (thread start routine)
+- [x] Manual function overrides for 17 functions (mid-function entries, SEH, NV2A stubs, Xbox pipeline stubs)
 - [x] Fake TIB/TLS for fs:[N] references (translator drops segment prefix)
 - [x] Single-threaded critical section model (no-op CS for ABI safety)
 - [x] Xbox heap allocator (bump allocator, 55.5 MB, returns Xbox VAs)
-- [x] VEH crash diagnostics (stack trace, register dump, SEH chain dump)
-- [x] ExAllocatePool/ExAllocatePoolWithTag → Xbox heap (was returning truncated 64-bit native pointers)
-- [x] MmGetPhysicalAddress → identity mapping (Xbox physical == virtual)
-- [x] RtlRaiseException bridge (ordinal 302) - logs FPU/SEH exceptions
-- [x] MmMapIoSpace bridge (ordinal 177) - allocates from Xbox heap
-- [x] Xbox memory region limited to 64 MB (matches real Xbox physical RAM)
+- [x] VEH crash diagnostics (stack trace, register dump, native stack overflow detection)
+- [x] Xbox memory region: 64 MB via CreateFileMapping + 16 mirror views (true aliases)
+- [x] NV2A GPU address space: on-demand page mapping for all of 0xF0000000+
+- [x] Uncached memory mirror (0x80000000+) with on-demand page mapping
+- [x] RECOMP_ICALL stack leak fix (pops dummy return addr on failed dispatch)
+- [x] NV2A push buffer subsystem stubbed (no real GPU to submit to)
+- [x] Xbox render pipeline functions stubbed (rw_world_pipe_xbox)
 - [x] RenderWare engine initializes, allocates 3 memory pools (~32 MB total)
-- [ ] SEH exception dispatch for RW memory boundary probing (in progress)
-- [ ] D3D8 device initialization from game code
+- [x] Game enters main loop stably (D3D11 window renders, message pump works)
+- [ ] D3D8 device initialization from game code (higher-level init)
 - [ ] Asset loading and rendering pipeline
 - [ ] Input mapping (Xbox controller → PC gamepad/keyboard)
+- [ ] Audio playback
 - [ ] Performance profiling and optimization
 - [ ] Gameplay testing and bug fixes
 
@@ -152,6 +170,8 @@ The main executable (`default.xbe`) contains:
 ```
 burnout3/
 ├── README.md                 # This file
+├── CLAUDE.md                 # AI assistant project instructions
+├── CMakeLists.txt            # Build configuration
 ├── docs/                     # Detailed documentation
 │   ├── xbe-analysis.md       # Full XBE header/section analysis
 │   ├── kernel-imports.md     # Xbox kernel → Win32 mapping
@@ -165,10 +185,15 @@ burnout3/
 │   └── asset_tools/          # Asset conversion utilities
 ├── src/                      # Recompiled/reimplemented source
 │   ├── kernel/               # Xbox kernel replacement (Win32)
-│   ├── d3d/                  # Graphics abstraction layer
-│   ├── audio/                # Audio system
-│   ├── input/                # Input system
-│   └── game/                 # Decompiled game code
+│   ├── d3d/                  # Graphics abstraction layer (D3D8→D3D11)
+│   ├── audio/                # Audio system (DirectSound stubs)
+│   ├── input/                # Input system (XInput)
+│   └── game/                 # Recompiled game code
+│       ├── main.c            # Entry point, VEH handler, window/game loop
+│       └── recomp/           # Recompiled function infrastructure
+│           ├── recomp_types.h    # Register model, memory macros, ICALL dispatch
+│           ├── recomp_manual.c   # 17 manually implemented function overrides
+│           └── gen/              # Auto-generated code (gitignored, ~4.43M lines)
 └── Burnout 3 Takedown/       # Original game files (gitignored)
 ```
 
@@ -182,6 +207,9 @@ burnout3/
 
 ### Build Steps
 ```bash
+# Generate recompiled code (requires original default.xbe)
+py -3 -m tools.recomp "Burnout 3 Takedown/default.xbe" --all --split 1000
+
 # Configure
 cmake -S . -B build
 
