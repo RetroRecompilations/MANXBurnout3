@@ -12,6 +12,12 @@
 #include <math.h>
 #include <stdio.h>
 
+/* D3D8 frame pump (implemented in d3d8_device.c) */
+extern void d3d8_PresentFrame(void);
+
+/* RW linked-list traversal with loop limit */
+void sub_001FE1E0(void);
+
 /* Forward declarations for manually implemented functions */
 void sub_0002DDF0(void);
 void sub_001BEFF0(void);
@@ -30,6 +36,115 @@ void sub_00249B9C(void);
 void sub_003518E0(void);
 void sub_00351770(void);
 void sub_00351A20(void);
+void sub_001C1670(void);
+void sub_001D7180(void);
+void sub_001D7857(void);
+void sub_001D7876(void);
+void sub_001D7D90(void);
+void sub_001D88E0(void);
+void sub_001D8A80(void);
+void sub_001D8FA0(void);
+void sub_001D9180(void);
+void sub_001D91B0(void);
+void sub_001D91F0(void);
+void sub_001D9230(void);
+void sub_001D9280(void);
+void sub_001D9290(void);
+void sub_001D92A0(void);
+void sub_001D92EF(void);
+void sub_001D9360(void);
+void sub_001D93AF(void);
+void sub_001D9420(void);
+void sub_001D9450(void);
+void sub_001D94A0(void);
+void sub_001D94D0(void);
+void sub_001D9510(void);
+void sub_001D7D50(void);
+void sub_001D7D70(void);
+void sub_001D9700(void);
+void sub_001D9A50(void);
+void sub_001D9AF0(void);
+void sub_001D9BC0(void);
+void sub_001D9D40(void);
+void sub_001C1740(void);
+
+/* Newly-exposed mid-function entry point stubs (switch table fix) */
+void sub_00014FB0(void);
+void sub_0006AE80(void);
+void sub_000983E0(void);
+void sub_000E32F0(void);
+void sub_00154270(void);
+void sub_0015BC50(void);
+void sub_00169BD0(void);
+void sub_00188BA9(void);
+void sub_0018BF50(void);
+void sub_001BDD50(void);
+void sub_002F55AC(void);
+void sub_002F6770(void);
+void sub_0031AAE7(void);
+void sub_0031AB7A(void);
+void sub_0031AB90(void);
+void sub_0031ABB1(void);
+void sub_0031ABDD(void);
+void sub_0031ABE8(void);
+void sub_0034FBA0(void);
+/* Round 2: more mid-function entry points */
+void sub_0006E680(void);
+void sub_0008E8D0(void);
+void sub_00090A27(void);
+void sub_0009E127(void);
+void sub_000A0BF0(void);
+void sub_000A7410(void);
+void sub_000E0080(void);
+void sub_00200470(void);
+void sub_0031ABD2(void);
+void sub_0031AC0D(void);
+void sub_003392F8(void);
+void sub_003394FB(void);
+void sub_00339506(void);
+void sub_00339511(void);
+void sub_0035B3B0(void);
+void sub_00361BB4(void);
+
+/* D3D8LTCG rendering pipeline stubs */
+void sub_0034D530(void);
+
+/* Rendering context tick (stubbed - Xbox rendering pipeline not needed) */
+void sub_000110E0(void);
+
+/* Audio/streaming init (stubbed - hangs in RW pipe iteration) */
+void sub_00135040(void);
+
+/* Resource slot polling (overridden - skip version check for deferred workers) */
+void sub_00018BB0(void);
+
+/* RW resource fixup (stubbed - resources not worker-processed) */
+void sub_00020930(void);
+
+/* RW resource pointer relocation (stubbed - resources not worker-processed) */
+void sub_00159710(void);
+
+/* Track/scene setup (stubbed - depends on valid RW world data) */
+void sub_0001BE60(void);
+
+/* Audio streaming setup (stubbed - audio init was skipped) */
+void sub_00135240(void);
+
+/* Track environment loader (stubbed - RW stream reader hangs) */
+void sub_00062BD0(void);
+
+/* Pipeline/material name lookup (stubbed - RW world not initialized) */
+void sub_0004DD00(void);
+
+/* RW hash table lookup (safe - guards against div-by-zero) */
+void sub_00221F20(void);
+
+/* RW world linked list cleanup (stubbed - world data not initialized) */
+void sub_001C66F0(void);
+
+/* Game state notification dispatch (recursion-guarded) */
+void sub_00022660(void);
+
 
 /* ── Manual dispatch table ────────────────────────────────────────────
  *
@@ -58,6 +173,101 @@ static const struct {
     { 0x003518E0u, (recomp_func_t)sub_003518E0 },
     { 0x00351770u, (recomp_func_t)sub_00351770 },
     { 0x00351A20u, (recomp_func_t)sub_00351A20 },
+    { 0x001C1670u, (recomp_func_t)sub_001C1670 },
+    { 0x001D7180u, (recomp_func_t)sub_001D7180 },
+    { 0x001D7857u, (recomp_func_t)sub_001D7857 },
+    { 0x001D7876u, (recomp_func_t)sub_001D7876 },
+    { 0x001D7D90u, (recomp_func_t)sub_001D7D90 },
+    { 0x001D88E0u, (recomp_func_t)sub_001D88E0 },
+    { 0x001D8A80u, (recomp_func_t)sub_001D8A80 },
+    { 0x001D8FA0u, (recomp_func_t)sub_001D8FA0 },
+    { 0x001D9180u, (recomp_func_t)sub_001D9180 },
+    { 0x001D91B0u, (recomp_func_t)sub_001D91B0 },
+    { 0x001D91F0u, (recomp_func_t)sub_001D91F0 },
+    { 0x001D9230u, (recomp_func_t)sub_001D9230 },
+    { 0x001D9280u, (recomp_func_t)sub_001D9280 },
+    { 0x001D9290u, (recomp_func_t)sub_001D9290 },
+    { 0x001D92A0u, (recomp_func_t)sub_001D92A0 },
+    { 0x001D92EFu, (recomp_func_t)sub_001D92EF },
+    { 0x001D9360u, (recomp_func_t)sub_001D9360 },
+    { 0x001D93AFu, (recomp_func_t)sub_001D93AF },
+    { 0x001D9420u, (recomp_func_t)sub_001D9420 },
+    { 0x001D9450u, (recomp_func_t)sub_001D9450 },
+    { 0x001D94A0u, (recomp_func_t)sub_001D94A0 },
+    { 0x001D94D0u, (recomp_func_t)sub_001D94D0 },
+    { 0x001D9510u, (recomp_func_t)sub_001D9510 },
+    { 0x001D7D50u, (recomp_func_t)sub_001D7D50 },
+    { 0x001D7D70u, (recomp_func_t)sub_001D7D70 },
+    { 0x001D9700u, (recomp_func_t)sub_001D9700 },
+    { 0x001D9A50u, (recomp_func_t)sub_001D9A50 },
+    { 0x001D9AF0u, (recomp_func_t)sub_001D9AF0 },
+    { 0x001D9BC0u, (recomp_func_t)sub_001D9BC0 },
+    { 0x001D9D40u, (recomp_func_t)sub_001D9D40 },
+    { 0x001C1740u, (recomp_func_t)sub_001C1740 },
+    /* Mid-function entry points exposed by switch table fix */
+    { 0x00014FB0u, (recomp_func_t)sub_00014FB0 },
+    { 0x0006AE80u, (recomp_func_t)sub_0006AE80 },
+    { 0x000983E0u, (recomp_func_t)sub_000983E0 },
+    { 0x000E32F0u, (recomp_func_t)sub_000E32F0 },
+    { 0x00154270u, (recomp_func_t)sub_00154270 },
+    { 0x0015BC50u, (recomp_func_t)sub_0015BC50 },
+    { 0x00169BD0u, (recomp_func_t)sub_00169BD0 },
+    { 0x00188BA9u, (recomp_func_t)sub_00188BA9 },
+    { 0x0018BF50u, (recomp_func_t)sub_0018BF50 },
+    { 0x001BDD50u, (recomp_func_t)sub_001BDD50 },
+    { 0x002F55ACu, (recomp_func_t)sub_002F55AC },
+    { 0x002F6770u, (recomp_func_t)sub_002F6770 },
+    { 0x0031AAE7u, (recomp_func_t)sub_0031AAE7 },
+    { 0x0031AB7Au, (recomp_func_t)sub_0031AB7A },
+    { 0x0031AB90u, (recomp_func_t)sub_0031AB90 },
+    { 0x0031ABB1u, (recomp_func_t)sub_0031ABB1 },
+    { 0x0031ABDDu, (recomp_func_t)sub_0031ABDD },
+    { 0x0031ABE8u, (recomp_func_t)sub_0031ABE8 },
+    { 0x0034FBA0u, (recomp_func_t)sub_0034FBA0 },
+    /* Round 2 mid-function entry points */
+    { 0x0006E680u, (recomp_func_t)sub_0006E680 },
+    { 0x0008E8D0u, (recomp_func_t)sub_0008E8D0 },
+    { 0x00090A27u, (recomp_func_t)sub_00090A27 },
+    { 0x0009E127u, (recomp_func_t)sub_0009E127 },
+    { 0x000A0BF0u, (recomp_func_t)sub_000A0BF0 },
+    { 0x000A7410u, (recomp_func_t)sub_000A7410 },
+    { 0x000E0080u, (recomp_func_t)sub_000E0080 },
+    { 0x00200470u, (recomp_func_t)sub_00200470 },
+    { 0x0031ABD2u, (recomp_func_t)sub_0031ABD2 },
+    { 0x0031AC0Du, (recomp_func_t)sub_0031AC0D },
+    { 0x003392F8u, (recomp_func_t)sub_003392F8 },
+    { 0x003394FBu, (recomp_func_t)sub_003394FB },
+    { 0x00339506u, (recomp_func_t)sub_00339506 },
+    { 0x00339511u, (recomp_func_t)sub_00339511 },
+    { 0x0035B3B0u, (recomp_func_t)sub_0035B3B0 },
+    { 0x00361BB4u, (recomp_func_t)sub_00361BB4 },
+    /* RW linked-list traversal with loop limit */
+    { 0x001FE1E0u, (recomp_func_t)sub_001FE1E0 },
+    /* D3D8LTCG rendering pipeline */
+    { 0x0034D530u, (recomp_func_t)sub_0034D530 },
+    /* Rendering context tick (stubbed) */
+    { 0x000110E0u, (recomp_func_t)sub_000110E0 },
+    { 0x00020930u, (recomp_func_t)sub_00020930 },
+    /* RW resource relocation (stubbed) */
+    { 0x00159710u, (recomp_func_t)sub_00159710 },
+    /* Track/scene setup (stubbed) */
+    { 0x0001BE60u, (recomp_func_t)sub_0001BE60 },
+    /* Audio streaming setup (stubbed) */
+    { 0x00135240u, (recomp_func_t)sub_00135240 },
+    /* Track environment loader (stubbed) */
+    { 0x00062BD0u, (recomp_func_t)sub_00062BD0 },
+    /* Pipeline/material name lookup (stubbed) */
+    { 0x0004DD00u, (recomp_func_t)sub_0004DD00 },
+    /* RW hash table lookup (div-by-zero safe) */
+    { 0x00221F20u, (recomp_func_t)sub_00221F20 },
+    /* RW world linked list cleanup (stubbed) */
+    { 0x001C66F0u, (recomp_func_t)sub_001C66F0 },
+    /* Game state notification dispatch (recursion-guarded) */
+    { 0x00022660u, (recomp_func_t)sub_00022660 },
+    /* Audio/streaming init (stubbed) */
+    { 0x00135040u, (recomp_func_t)sub_00135040 },
+    /* Resource slot polling (version-check bypass) */
+    { 0x00018BB0u, (recomp_func_t)sub_00018BB0 },
 };
 #define NUM_MANUAL_FUNCS (sizeof(g_manual_funcs) / sizeof(g_manual_funcs[0]))
 
@@ -816,4 +1026,960 @@ void sub_00351770(void)
     eax = 0;      /* no push buffer space allocated */
     esp += 8;     /* ret 4: pop return addr (4) + 1 param (4) */
     return;
+}
+
+
+/**
+ * sub_001C1670 - RW frame matrix propagation (depth-limited)
+ *
+ * Original: 0x001C1670 - 0x001C173A (202 bytes, 56 insns)
+ * CC: stdcall, 1 param (parent LTM pointer via stack), ecx = frame node
+ * Frame: EBP-based (0 bytes locals, 24 bytes aligned scratch)
+ *
+ * Recursively propagates local-to-world matrix through the RW scene graph.
+ * Reads parent LTM from stack arg, multiplies with local transform at ecx,
+ * stores result at ecx+0x20, then recurses into children linked at ecx+0x44.
+ *
+ * Manual override: adds recursion depth limiting and pointer validation.
+ * Without this, uninitialized scene graph nodes contain non-zero garbage
+ * child pointers in valid Xbox RAM, causing unbounded recursion and
+ * native stack overflow.
+ */
+static int s_frame_propagate_depth = 0;
+#define MAX_FRAME_DEPTH 64
+#define VALID_XBOX_PTR(p) ((p) >= 0x10000u && (p) < 0x04000000u)
+
+void sub_001C1670(void)
+{
+    uint32_t ebp;
+    int _flags = 0;
+    float xmm0, xmm1;
+
+    /* Standard EBP-based prologue */
+    PUSH32(esp, ebp);
+    ebp = esp;
+    esp = esp & 0xFFFFFFF0u;
+    esp = esp - 0x18;
+    PUSH32(esp, esi);
+    PUSH32(esp, edi);
+
+    eax = MEM32(ebp + 8); /* parent LTM pointer (arg) */
+
+    /* Validate input pointers */
+    if (!VALID_XBOX_PTR(eax) || !VALID_XBOX_PTR(ecx)) {
+        goto done;
+    }
+
+    /* --- Matrix math (identical to generated code) --- */
+    xmm0 = MEMF(eax + 8);
+    xmm0 = xmm0 * MEMF(ecx);
+    MEMF(esp + 0x10) = xmm0;
+    xmm0 = MEMF(eax + 0xC);
+    xmm0 = xmm0 * MEMF(ecx + 4);
+    edx = MEM32(esp + 0x10);
+    MEMF(esp + 0x14) = xmm0;
+    xmm0 = MEMF(eax);
+    MEM32(esp + 0x18) = edx;
+    xmm0 = xmm0 + MEMF(esp + 0x18);
+    edx = MEM32(esp + 0x14);
+    MEMF(esp + 0x10) = xmm0;
+    xmm0 = MEMF(eax + 4);
+    MEM32(esp + 0x1C) = edx;
+    xmm0 = xmm0 + MEMF(esp + 0x1C);
+    edx = MEM32(esp + 0x10);
+    MEM32(ecx + 0x20) = edx;
+    MEMF(esp + 0x14) = xmm0;
+    edx = MEM32(esp + 0x14);
+    MEM32(ecx + 0x24) = edx;
+    xmm0 = MEMF(ecx + 8);
+    xmm0 = xmm0 * MEMF(eax + 8);
+    edi = ecx + 0x20;
+    MEMF(esp + 0x18) = xmm0;
+    xmm0 = MEMF(eax + 0xC);
+    xmm0 = xmm0 * MEMF(ecx + 0xC);
+    edx = MEM32(esp + 0x18);
+    MEMF(esp + 0x1C) = xmm0;
+    xmm0 = MEMF(ecx + 0x10);
+    MEM32(ecx + 0x28) = edx;
+    edx = MEM32(esp + 0x1C);
+    MEM32(ecx + 0x2C) = edx;
+    xmm1 = MEMF(eax + 0x10);
+    /* mulps: xmm0 *= xmm1 (packed 4xfloat - scalar approximation) */
+    xmm0 = xmm0 * xmm1;
+    MEMF(ecx + 0x30) = xmm0;
+
+    /* --- Recurse into children (depth-limited) --- */
+    esi = MEM32(ecx + 0x44);
+    if (esi == 0) goto done;
+
+    if (s_frame_propagate_depth >= MAX_FRAME_DEPTH) goto done;
+    s_frame_propagate_depth++;
+
+    while (esi != 0) {
+        if (!VALID_XBOX_PTR(esi)) break;
+
+        PUSH32(esp, edi);
+        ecx = esi + 8;
+        PUSH32(esp, 0); sub_001C1670();
+
+        esi = MEM32(esi);  /* next sibling */
+    }
+
+    s_frame_propagate_depth--;
+
+done:
+    POP32(esp, edi);
+    POP32(esp, esi);
+    esp = ebp;
+    POP32(esp, ebp);
+    esp += 8; return; /* ret 4 */
+}
+
+
+/**
+ * sub_001D7180 - RW Xbox display driver rendering function (STUB)
+ *
+ * Original: 0x001D7180 - 0x001D7D10 (2960 bytes, 811 insns)
+ * Category: rw_driver_xbox
+ * CC: cdecl, 0 params
+ *
+ * Large Xbox-specific rendering function in the RW display driver.
+ * Iterates over D3D internal structures (vertex buffers, texture
+ * descriptors, render states) setting up hardware-specific state.
+ * These structures are garbage in our D3D11 shim, causing 50K+
+ * VEH fault-skip events per frame from reads of addresses in the
+ * 0x920xxxxx range (unmapped Xbox VA).
+ *
+ * Stubbed as no-op since all rendering goes through D3D11.
+ */
+void sub_001D7180(void)
+{
+    esp += 4; return; /* ret */
+}
+
+/**
+ * sub_001D7857 - Mid-function entry into sub_001D7180 (STUB)
+ * sub_001D7876 - Mid-function entry into sub_001D7180 (STUB)
+ *
+ * These are alternate entry points into the same RW Xbox rendering
+ * function. Both are cdecl, 0 params, fpo_leaf. Same stub treatment.
+ */
+void sub_001D7857(void)
+{
+    esp += 4; return; /* ret */
+}
+
+void sub_001D7876(void)
+{
+    esp += 4; return; /* ret */
+}
+
+/**
+ * sub_001D7D90 - RW Xbox display driver rendering function #2 (STUB)
+ *
+ * Original: 0x001D7D90 - 0x001D88D7 (2887 bytes, 661 insns)
+ * Category: rw_driver_xbox
+ * CC: cdecl, 0 params
+ *
+ * Second large Xbox rendering function, processes vertex/texture state.
+ * Same stubbing rationale as sub_001D7180.
+ */
+void sub_001D7D90(void)
+{
+    esp += 4; return; /* ret */
+}
+
+/**
+ * sub_001D88E0 - RW Xbox world pipeline rendering #1 (STUB)
+ * sub_001D8A80 - RW Xbox world pipeline rendering #2 (STUB)
+ * sub_001D8FA0 - RW Xbox world pipeline rendering #3 (STUB)
+ *
+ * Original: 0x001D88E0-0x001D9130 (rw_world_pipe_xbox category)
+ * All cdecl, 0 params. These iterate over D3D vertex/texture structures
+ * producing 500K+ VEH fault-skips per second from unmapped addresses.
+ * Stubbed since all rendering goes through D3D11.
+ */
+void sub_001D88E0(void)
+{
+    esp += 4; return; /* ret */
+}
+
+void sub_001D8A80(void)
+{
+    esp += 4; return; /* ret */
+}
+
+void sub_001D8FA0(void)
+{
+    esp += 4; return; /* ret */
+}
+
+/**
+ * sub_001D93AF - RW Xbox rendering pipeline dispatch (STUB)
+ *
+ * Original: 0x001D93AF - 0x001D9420 (113 bytes, 38 insns)
+ * CC: cdecl, 0 params
+ *
+ * Top-level dispatch for Xbox rendering pipeline. Calls into
+ * sub_001D9230 and related functions that iterate over D3D
+ * vertex/texture structures, producing millions of VEH faults.
+ */
+/**
+ * sub_001D9180..sub_001D9360 - RW Xbox rendering pipeline cluster (STUBS)
+ *
+ * Nine functions (0x001D9180, 0x001D91B0, 0x001D91F0, 0x001D9230,
+ * 0x001D9280, 0x001D9290, 0x001D92A0, 0x001D92EF, 0x001D9360)
+ * All rw_world_pipe_xbox category, cdecl 0 params.
+ *
+ * These form a cluster of rendering pipeline helper functions that
+ * read/write D3D vertex/texture structures. sub_001D9230 is the
+ * hottest function, called from multiple paths and producing millions
+ * of VEH fault-skips per frame.
+ */
+void sub_001D9180(void) { esp += 4; return; }
+void sub_001D91B0(void) { esp += 4; return; }
+void sub_001D91F0(void) { esp += 4; return; }
+void sub_001D9230(void) { esp += 4; return; }
+void sub_001D9280(void) { esp += 4; return; }
+void sub_001D9290(void) { esp += 4; return; }
+void sub_001D92A0(void) { esp += 4; return; }
+void sub_001D92EF(void) { esp += 4; return; }
+void sub_001D9360(void) { esp += 4; return; }
+
+void sub_001D93AF(void)
+{
+    esp += 4; return; /* ret */
+}
+
+/*
+ * sub_001D9420 - RW Xbox display driver (rw_driver_xbox) rendering helper
+ * sub_001D9450 - RW Xbox world pipeline (rw_world_pipe_xbox) viewport setup
+ * sub_001D94A0 - RW Xbox display driver (rw_driver_xbox) rendering submit
+ * sub_001D94D0 - RW Xbox world pipeline (rw_world_pipe_xbox) hot rendering path
+ *
+ * These four functions complete the Xbox rendering pipeline cluster.
+ * sub_001D94D0 was the hottest remaining function producing millions
+ * of VEH fault-skips per frame via indirect calls into D3D structures.
+ */
+volatile uint32_t g_present_count = 0;
+void sub_001D9420(void) {
+    /* RW driver "Present" - forward to our D3D11 backend.
+     * Original: passes device context through sub_001DE7E0.
+     * We intercept here and call our frame pump directly. */
+    g_present_count++;
+    if (g_present_count <= 5 || (g_present_count % 1000) == 0)
+        fprintf(stderr, "  [PRESENT] sub_001D9420 called #%u\n", g_present_count);
+    d3d8_PresentFrame();
+    esp += 4; return;
+}
+void sub_001D9450(void) { esp += 4; return; }
+void sub_001D94A0(void) { esp += 4; return; }
+void sub_001D94D0(void) { esp += 4; return; }
+
+/*
+ * sub_001D9510 - RW camera create (rw_core, src/bacamera.c)
+ *
+ * Creates a camera raster object by calling into Xbox D3D device via
+ * ICALL(MEM32(0x7593E4)), which returns a pointer to GPU-allocated raster
+ * memory in the 0x92-0x93 range. Without real Xbox D3D, these reads fault
+ * 10 million times per frame. Stub returns 0 (no camera created).
+ */
+void sub_001D9510(void) { eax = 0; esp += 4; return; }
+
+/**
+ * sub_001D7D50 - Xbox render state setter entry point (STUB)
+ * sub_001D7D70 - Xbox render state setter #2 (STUB)
+ *
+ * Original: 0x001D7D50-0x001D7D6F (31 bytes), 0x001D7D70-0x001D7D85 (21 bytes)
+ * Category: rw_driver_xbox, cdecl
+ *
+ * Called from RW core (sub_001C69C0) to set Xbox GPU render states via
+ * sub_001D7040 and sub_0034FD80. These chain into sub_001D9A50/sub_001D9AF0
+ * which iterate over GPU-allocated memory (0x92-0x93 Xbox VA range) producing
+ * millions of VEH fault-skips. Stubbed since rendering uses D3D11.
+ */
+static uint32_t g_1D7D50_count = 0;
+void sub_001D7D50(void) {
+    g_1D7D50_count++;
+    if (g_1D7D50_count <= 3 || (g_1D7D50_count % 10000) == 0)
+        fprintf(stderr, "  [TRACE] sub_001D7D50 called #%u\n", g_1D7D50_count);
+    esp += 4; return;
+}
+void sub_001D7D70(void) { esp += 4; return; }
+
+/**
+ * sub_001D9700 - Xbox render state dispatch (STUB)
+ *
+ * Original: 0x001D9700-0x001D987A (378 bytes, 106 insns)
+ * Category: rw_driver_xbox, cdecl, 1 param (render state ID 1-30)
+ *
+ * Dispatch function: takes a render state ID, decrements, and does indirect
+ * tail jump through a 30-entry table at 0x1D98F8 to handlers like
+ * sub_001D9A50, sub_001D9AF0, sub_001D9BC0. Returns 1 for valid IDs.
+ * Stubbed: return 1 (success) without setting any GPU state.
+ */
+void sub_001D9700(void) { eax = 1; esp += 4; return; }
+
+/**
+ * sub_001D9A50 - Xbox render state handler (STUB)
+ * sub_001D9AF0 - Xbox render state handler #2 (STUB)
+ * sub_001D9BC0 - Xbox render state handler #3 (STUB)
+ * sub_001D9D40 - Xbox render state handler #4 (STUB)
+ *
+ * Category: rw_driver_xbox, cdecl
+ *
+ * These are dispatch targets of sub_001D9700. They read/write GPU render
+ * state tables at 0x75D2A0-0x75D9B0 using eax as an index. When eax
+ * contains garbage (e.g. 0x3F800001 = float 1.0), the computed addresses
+ * land in the 0x92-0x93 Xbox VA range (GPU-allocated memory), producing
+ * 10 million+ VEH fault-skips per call. Stubbed as no-ops.
+ */
+void sub_001D9A50(void) { eax = 1; esp += 4; return; }
+void sub_001D9AF0(void) { eax = 1; esp += 4; return; }
+void sub_001D9BC0(void) { eax = 1; esp += 4; return; }
+void sub_001D9D40(void) { eax = 1; esp += 4; return; }
+
+/**
+ * sub_001C1740 - RW scene graph child list merge/traversal (STUB)
+ *
+ * Original: 0x001C1740-0x001C1796 (86 bytes, 35 insns)
+ * CC: thiscall_cdecl (ecx = this), 0 stack params
+ *
+ * Recursive tree traversal: reads child list from this+0x44, recursively
+ * processes each child (ecx = child + 8), then merges child list into parent.
+ * With garbage scene graph (no real D3D objects), this chases random
+ * pointers and overflows the native stack (1M+ nested calls).
+ * Stubbed as no-op since scene graph data isn't initialized.
+ */
+void sub_001C1740(void) { esp += 4; return; }
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * Mid-function entry point stubs (exposed by switch table fix)
+ *
+ * These addresses are mid-function entry points that the recompiler
+ * didn't recognize as separate functions. They're now called from
+ * code paths made reachable by the switch table fix. Stubbed as no-ops
+ * until proper implementations can be created.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+/* 0x00014FB0: gap after sub_00014D80 (end 0x14F99), +0x17 past end */
+void sub_00014FB0(void) { esp += 4; return; }
+
+/* 0x0006AE80: gap after sub_0006ADE0 (end 0x6AE70), +0x10 past end */
+void sub_0006AE80(void) { esp += 4; return; }
+
+/* 0x000983E0: gap after sub_00098370 (end 0x983C5), +0x1B past end */
+void sub_000983E0(void) { esp += 4; return; }
+
+/* 0x000E32F0: gap after sub_000E3140 (end 0xE32DF), +0x11 past end */
+void sub_000E32F0(void) { esp += 4; return; }
+
+/* 0x00154270: inside sub_0015414B (+0x125) */
+void sub_00154270(void) { esp += 4; return; }
+
+/* 0x0015BC50: inside sub_0015B7AB (+0x4A5) */
+void sub_0015BC50(void) { esp += 4; return; }
+
+/* 0x00169BD0: inside sub_00169540 (+0x690) */
+void sub_00169BD0(void) { esp += 4; return; }
+
+/* 0x00188BA9: at end of sub_001888F0 */
+void sub_00188BA9(void) { esp += 4; return; }
+
+/* 0x0018BF50: inside sub_0018BED0 (+0x80) */
+void sub_0018BF50(void) { esp += 4; return; }
+
+/* 0x001BDD50: inside sub_001BDCD0 (+0x80) */
+void sub_001BDD50(void) { esp += 4; return; }
+
+/* 0x002F55AC: inside sub_002F5594 (+0x18) - RenderWare */
+void sub_002F55AC(void) { esp += 4; return; }
+
+/* 0x002F6770: inside sub_002F6750 (+0x20) - RenderWare */
+void sub_002F6770(void) { esp += 4; return; }
+
+/* 0x0031AAE7: inside sub_0031AADC (+0xB) - RenderWare D3D */
+void sub_0031AAE7(void) { esp += 4; return; }
+
+/* 0x0031AB7A: inside sub_0031AB59 (+0x21) - RenderWare D3D */
+void sub_0031AB7A(void) { esp += 4; return; }
+
+/* 0x0031AB90: inside sub_0031AB85 (+0xB) - RenderWare D3D */
+void sub_0031AB90(void) { esp += 4; return; }
+
+/* 0x0031ABB1: inside sub_0031AB85 (+0x2C) - RenderWare D3D */
+void sub_0031ABB1(void) { esp += 4; return; }
+
+/* 0x0031ABDD: inside sub_0031AB85 (+0x58) - RenderWare D3D */
+void sub_0031ABDD(void) { esp += 4; return; }
+
+/* 0x0031ABE8: inside sub_0031AB85 (+0x63) - RenderWare D3D */
+void sub_0031ABE8(void) { esp += 4; return; }
+
+/* 0x0034FBA0: inside sub_0034FAF0 (+0xB0) - RenderWare */
+void sub_0034FBA0(void) { esp += 4; return; }
+
+/* Round 2: more mid-function entry points (block-splitting fix) */
+void sub_0006E680(void) { esp += 4; return; }
+void sub_0008E8D0(void) { esp += 4; return; }
+void sub_00090A27(void) { esp += 4; return; }
+void sub_0009E127(void) { esp += 4; return; }
+void sub_000A0BF0(void) { esp += 4; return; }
+void sub_000A7410(void) { esp += 4; return; }
+void sub_000E0080(void) { esp += 4; return; }
+void sub_00200470(void) { esp += 4; return; }
+void sub_0031ABD2(void) { esp += 4; return; }
+void sub_0031AC0D(void) { esp += 4; return; }
+void sub_003392F8(void) { esp += 4; return; }
+void sub_003394FB(void) { esp += 4; return; }
+void sub_00339506(void) { esp += 4; return; }
+void sub_00339511(void) { esp += 4; return; }
+void sub_0035B3B0(void) { esp += 4; return; }
+void sub_00361BB4(void) { esp += 4; return; }
+
+/**
+ * sub_001FE1E0 - RenderWare linked-list traversal with callback
+ * Original: 0x001FE1E0 (53 bytes) - rw_world_pipe_xbox
+ *
+ * Traverses a circular linked list and calls a comparison callback
+ * for each element. Returns count of non-matching elements.
+ *
+ * Stack params: [esp+4]=list_head, [esp+8]=comp_func, [esp+C]=comp_arg
+ *
+ * BUG: The linked list at 0x41B44C can be uninitialized/corrupt,
+ * causing an infinite loop. Added max iteration limit.
+ */
+void sub_001FE1E0(void)
+{
+    /* RW linked list traversal - skip entirely because lists can be
+     * uninitialized/corrupt. Returns 0 (no matches found). */
+    eax = 0;
+    esp += 4; return;
+}
+
+/**
+ * sub_0034D530 - D3D8LTCG rendering pipeline (STUB)
+ *
+ * Original: 0x0034D530-0x00360A54 (79 KB, D3D section)
+ *
+ * This is the Xbox D3D8's main rendering pipeline function - it processes
+ * the NV2A push buffer, configures GPU state, and spin-waits for GPU
+ * completion. Since the NV2A GPU doesn't exist in our D3D11 environment,
+ * this function would hang forever in spin-wait loops reading GPU registers.
+ *
+ * Our D3D11 layer (d3d8_device.c) handles actual rendering separately.
+ * This stub matches the original's ret 12 (pops 3 dword args + ret addr).
+ */
+volatile uint32_t g_d3d_render_count = 0;
+void sub_0034D530(void)
+{
+    g_d3d_render_count++;
+    if (g_d3d_render_count <= 5 || (g_d3d_render_count % 10000) == 0)
+        fprintf(stderr, "  [D3D8-RENDER] sub_0034D530 called #%u\n", g_d3d_render_count);
+    eax = 0;
+    esp += 16; return; /* ret 12: pop 12 bytes of args + 4 byte ret addr */
+}
+
+/**
+ * sub_000110E0 - Rendering context tick (STUB)
+ *
+ * Original: 0x000110E0 - 0x00011236 (342 bytes, 99 insns)
+ *
+ * This function is the Xbox rendering pipeline "tick". It:
+ *   Part 1: Processes async callback from global list at 0x4AED9C
+ *   Part 2: Iterates the rendering context's scene objects, calling
+ *           vtable methods to sort/compare world pipes
+ *
+ * Part 2 makes hundreds of thousands of ICALLs (to sub_001F8860 and
+ * invalid addresses like 0x12FE7CF0), eventually hanging in a spin-wait
+ * on NV2A GPU registers. Since we use D3D11 for rendering, the Xbox
+ * rendering pipeline tick is not needed.
+ *
+ * We keep Part 1 (async callback) since the loading pipeline's async
+ * completion notifications may flow through it.
+ *
+ * Calling convention: cdecl, no params. Uses edi (set by caller to
+ * rendering context pointer). Preserves ebx, esi.
+ */
+volatile uint32_t g_tick_110e0_count = 0;
+
+void sub_000110E0(void)
+{
+    g_tick_110e0_count++;
+    uint32_t tick_count = g_tick_110e0_count;
+
+    /* Part 1: Process async callback (preserved for loading pipeline) */
+    {
+        uint32_t cb = MEM32(0x4AED9C);
+        if (cb != 0) {
+            uint32_t vtable = MEM32(cb);
+            ecx = cb;
+            uint32_t saved_esp = g_esp;
+            PUSH32(esp, 0);
+            RECOMP_ICALL_SAFE(MEM32(vtable + 4), saved_esp);
+            if (tick_count <= 5)
+                fprintf(stderr, "  [TICK] sub_000110E0 #%u: async callback at 0x%08X → eax=%u\n",
+                        tick_count, MEM32(vtable + 4), eax);
+        }
+    }
+
+    /* Part 2: Process task queue (file load completions).
+     *
+     * Original flow: checks queue at edi, creates reader via sub_001B33A0,
+     * polls reader, sets completion flag when done. The reader uses RW
+     * streaming pipeline which hangs on NV2A GPU registers.
+     *
+     * Simplified: skip the reader entirely. If there's an active queue entry,
+     * immediately set its completion flag to 1 and advance the head.
+     * This works because the resource data was already loaded into the
+     * resource slots by init code before sub_00011240 was called.
+     *
+     * Queue layout (at edi):
+     *   +0x788: head index (0-23 circular)
+     *   +0x78C: tail/free index
+     *   +0x790: version counter
+     *   Entries at index*80: name string at +0, completion_flag_ptr at +0x40,
+     *     resource at +0x44, param at +0x48, status at +0x4C (0 = empty)
+     */
+    /* Queue processing removed - completion flags now set directly
+     * in sub_00011240 (gen patch) since the async RW stream reader
+     * hangs on NV2A GPU registers. */
+
+    /* Diagnostic: print state and ICALL count */
+    if (tick_count <= 50)
+        fprintf(stderr, "  [TICK] sub_000110E0 #%u: load=0x%X game=0x%X icalls=%llu\n",
+                tick_count, MEM32(0x4D5388), MEM32(0x4D53B8),
+                (unsigned long long)g_icall_count);
+
+    /* Signal "rendering complete" to the game state machine.
+     * The gate flag at 0x4D53BC (= ebp + 0x2E21C) controls whether the
+     * game_state can transition. It's set to 1 when MEM8(0x4D53BE) is
+     * non-zero (checked in sub_000165F0 at loc_0001663B). In the original
+     * game, the RW rendering pipeline sets this after completing a frame.
+     * Since we stub rendering, set it here so the game can advance states. */
+    MEM8(0x4D53BE) = 1;
+
+    /* Pump the Windows message loop and present a D3D frame.
+     * The original Xbox rendering pipeline (Part 2) is stubbed because it
+     * hangs on NV2A GPU registers. Instead, we call our D3D11 frame pump
+     * which clears to a solid color and presents. This runs at ~60fps
+     * (throttled inside game_frame_pump). */
+    {
+        extern void game_frame_pump(void);
+        game_frame_pump();
+    }
+
+    esp += 4; return; /* ret: pop dummy return address */
+}
+
+/**
+ * sub_00135040 - Audio/streaming subsystem init (STUB)
+ *
+ * Original: 0x00135040 - 0x00135240 (512 bytes, 134 insns)
+ * Category: game_audio
+ *
+ * This function initializes the game's audio/streaming subsystem at edi+0x40B310.
+ * It calls many RW functions (sub_001F7150, sub_001F77C0, etc.) and enters a
+ * spin-loop in the RW rendering pipe iteration (0x12FE7CF0 / sub_001F8860 pattern).
+ *
+ * Stubbed because the audio subsystem isn't needed for initial rendering.
+ * The original function uses edi (set by caller to 0x40B310) and sets up
+ * various fields at edi+offsets.
+ */
+void sub_00135040(void)
+{
+    fprintf(stderr, "  [STUB] sub_00135040 (audio init) - skipped\n");
+    esp += 4; return; /* ret: pop dummy return address */
+}
+
+/**
+ * sub_00018BB0 - Resource slot polling
+ * Original checks a version counter at [ecx+4] against edx (global version).
+ * Since we defer worker threads (they can't run synchronously), the version
+ * field is never updated, causing a permanent mismatch.
+ *
+ * This override skips the version check: if the slot status [ecx] == 0
+ * (free) and the resource pointer [ecx+C] is non-zero, return it.
+ * Otherwise return 0 (not ready).
+ *
+ * Original logic:
+ *   if ([ecx+4] < 0) skip version check
+ *   if ([ecx+4] != edx) return 0
+ *   if ([ecx] != 0) return 0
+ *   return [ecx+C], set [ecx] = -1
+ */
+void sub_00018BB0(void)
+{
+    uint32_t slot_status = MEM32(ecx);
+    uint32_t resource_ptr = MEM32(ecx + 0xC);
+    static int _18bb0_count = 0;
+
+    if (slot_status == 0 && resource_ptr != 0) {
+        /* Resource is available - return it and mark slot consumed */
+        MEM32(ecx) = 0xFFFFFFFFu;
+        eax = resource_ptr;
+        if (_18bb0_count < 30)
+            fprintf(stderr, "  [18BB0] ecx=0x%08X status=%u res=0x%08X edx=0x%08X → RETURN 0x%08X\n",
+                    ecx, slot_status, resource_ptr, edx, eax);
+    } else {
+        eax = 0;
+        if (_18bb0_count < 30)
+            fprintf(stderr, "  [18BB0] ecx=0x%08X status=0x%08X res=0x%08X edx=0x%08X → NULL\n",
+                    ecx, slot_status, resource_ptr, edx);
+    }
+    _18bb0_count++;
+    esp += 4; return; /* ret */
+}
+
+/**
+ * sub_00020930 - RW resource pointer fixup (STUB)
+ *
+ * Original: 0x00020930 - 0x00020961 (49 bytes)
+ *
+ * This function does pointer fixup on RW binary data: reads a count
+ * and offset table from the resource, adds the base address to each
+ * offset to create absolute pointers. Since worker threads were deferred
+ * and never processed the raw resource data, the count/offset fields
+ * contain garbage, causing the fixup loop to access invalid memory.
+ *
+ * Stub: stores the resource pointer at the destination and returns 1.
+ */
+void sub_00020930(void)
+{
+    /* MEM32(ecx) = eax: store resource ptr at destination */
+    MEM32(ecx) = eax;
+    SET_LO8(eax, 1);
+    esp += 4; return; /* ret */
+}
+
+/**
+ * sub_00159710 - RW resource pointer relocation (STUB)
+ *
+ * Original: 0x00159710 - 0x0015974F (63 bytes, 28 insns)
+ *
+ * Adjusts internal pointers in a loaded RW resource by a delta:
+ *   esi = struct pointer, eax = delta (base address to add)
+ *   +4: pointer to array → adjusted by delta
+ *   +8: count of entries → loops calling sub_001596B0
+ *   +0xC: another pointer → adjusted by delta
+ *
+ * Stubbed because worker threads are deferred and resource data
+ * isn't parsed into the expected RW format. The loop iterates
+ * through sub-structures that don't exist, causing hangs.
+ *
+ * The top-level pointer adjustments are preserved since the
+ * caller reads esi+4 after the return.
+ */
+void sub_00159710(void)
+{
+    uint32_t delta = eax;
+    MEM32(esi + 4) = MEM32(esi + 4) + delta;
+    MEM32(esi + 0xC) = MEM32(esi + 0xC) + delta;
+    fprintf(stderr, "  [STUB] sub_00159710: esi=0x%08X delta=0x%08X (relocation skipped)\n",
+            esi, delta);
+    esp += 4; return; /* ret */
+}
+
+/**
+ * sub_0001BE60 - Track/scene setup (STUB)
+ *
+ * Original: 0x0001BE60 - 0x0001BFC8 (360 bytes, 86 insns)
+ * Category: game_engine
+ *
+ * Initializes track rendering data: processes materials, textures,
+ * and geometry from the RW world structure. Calls 13 sub-functions
+ * including sub_0001C340 (scene processing, 485 insns) which iterates
+ * through world geometry data.
+ *
+ * Stubbed because the RW world data at 0x4D1FE8 isn't properly loaded
+ * (worker threads deferred). sub_0001C340 hangs reading garbage
+ * geometry counts from unprocessed RW structures.
+ */
+void sub_0001BE60(void)
+{
+    fprintf(stderr, "  [STUB] sub_0001BE60 (track/scene setup) - skipped\n");
+    esp += 4; return; /* ret */
+}
+
+/**
+ * sub_00135240 - Audio streaming setup (STUB)
+ *
+ * Original: 0x00135240 - 0x00135350 (272 bytes, 75 insns)
+ * Category: game_audio
+ *
+ * Polls resource slots for audio data, then initializes the streaming
+ * audio subsystem (DirectSound buffers, XMA decoders, etc.).
+ * Depends on sub_00135040 having run first (which we stubbed).
+ * Returns non-zero LO8 on success.
+ */
+void sub_00135240(void)
+{
+    fprintf(stderr, "  [STUB] sub_00135240 (audio streaming setup) - skipped\n");
+    SET_LO8(eax, 1);
+    esp += 4; return; /* ret */
+}
+
+/**
+ * sub_00062BD0 - Track environment loader (STUB)
+ *
+ * Original: 0x00062BD0 - 0x00062D60 (400 bytes, 119 insns)
+ * Category: game_engine
+ *
+ * Loads track environment data via resource slot 0x3F9DB4 and processes
+ * it through a multi-state internal state machine. The first state calls
+ * sub_001B33A0 (RW stream reader) which hangs on NV2A GPU registers.
+ *
+ * Stubbed to return 1 (success) since the track environment can't be
+ * loaded without the RW streaming pipeline.
+ */
+void sub_00062BD0(void)
+{
+    static int _62bd0_count = 0;
+    if (_62bd0_count < 3)
+        fprintf(stderr, "  [STUB] sub_00062BD0 (track env loader) - returning 1\n");
+    _62bd0_count++;
+    SET_LO8(eax, 1);
+    esp += 4; return; /* ret */
+}
+
+/**
+ * sub_0004DD00 - Pipeline/material name lookup (STUB)
+ *
+ * Original: 0x0004DD00 - 0x0004DEA6 (422 bytes, 137 insns)
+ * Category: game_engine
+ *
+ * Looks up named rendering pipelines and materials in the RW world.
+ * Iterates through world entries (MEM32(0x4D1FE0)+8 = count) searching
+ * by name (via sub_00244C51/strcmp). Populates tables at 0x460770,
+ * 0x4607C8, 0x460848 with pointers to found entries.
+ *
+ * Stubbed because RW world structure isn't properly initialized
+ * (worker threads deferred, scene setup skipped). The world entry
+ * count at 0x4D1FE0+8 may be garbage, causing infinite loops.
+ */
+void sub_0004DD00(void)
+{
+    fprintf(stderr, "  [STUB] sub_0004DD00 (pipeline/material lookup) - skipped\n");
+    esp += 4; return; /* ret */
+}
+
+/**
+ * sub_00221F20 - RW hash table lookup (SAFE OVERRIDE)
+ *
+ * Original: 0x00221F20 - 0x00221F80 (96 bytes, 49 insns)
+ * Category: rw_world_pipe_xbox
+ *
+ * Hash table entry removal: reads table_size from ecx+0x10,
+ * uses it as divisor for index probing. When RW pipeline tables
+ * aren't initialized, table_size=0, causing division-by-zero.
+ *
+ * This override adds a guard: if table_size is 0, return 0.
+ * Otherwise performs the original hash table lookup logic.
+ *
+ * Calling convention: stdcall-like, 1 param on stack (ecx via stack)
+ *   [esp+4] = pointer to hash table structure
+ */
+void sub_00221F20(void)
+{
+    /* ecx = [esp+4] (param) */
+    ecx = MEM32(esp + 4);
+
+    /* Original early-out: if count == 0, return 0 */
+    if (MEM32(ecx) == 0) {
+        eax = 0;
+        esp += 4; return;
+    }
+
+    /* Guard: if table_size (ecx+0x10) is 0, return 0 to avoid div-by-zero */
+    uint32_t table_size_val = MEM32(ecx + 0x10);
+    if (table_size_val == 0) {
+        eax = 0;
+        esp += 4; return;
+    }
+
+    /* Original logic: probe for non-null entry */
+    eax = MEM32(ecx + 4);
+    uint32_t table_ptr = MEM32(ecx + 0x14);
+
+    if (MEM32(table_ptr + eax * 4) == 0) {
+        /* Probe until we find a non-null slot */
+        for (int i = 0; i < (int)table_size_val; i++) {
+            eax = MEM32(ecx + 4);
+            eax++;
+            int32_t s_eax = (int32_t)eax;
+            int32_t rem = s_eax % (int32_t)table_size_val;
+            MEM32(ecx + 4) = (uint32_t)rem;
+            if (MEM32(table_ptr + rem * 4) != 0) {
+                eax = (uint32_t)rem;
+                break;
+            }
+        }
+    }
+
+    /* If slot is still empty, return 0 */
+    uint32_t idx = MEM32(ecx + 4);
+    uint32_t entry = MEM32(table_ptr + idx * 4);
+    if (entry == 0) {
+        eax = 0;
+        esp += 4; return;
+    }
+
+    /* Remove entry from table, add to free list */
+    uint32_t next = MEM32(entry);
+    MEM32(table_ptr + idx * 4) = next;
+    uint32_t free_head = MEM32(ecx + 0x1C);
+    MEM32(entry) = free_head;
+    uint32_t count = MEM32(ecx);
+    count--;
+    MEM32(ecx + 0x1C) = entry;
+    MEM32(ecx) = count;
+    eax = MEM32(entry + 4);
+    esp += 4; return;
+}
+
+/**
+ * sub_001C66F0 - RW world linked list cleanup (STUB)
+ *
+ * Original: 0x001C66F0 - 0x001C67CE (222 bytes, 74 insns)
+ *
+ * Walks linked lists in the RW world rendering structure, clearing
+ * entries and resetting float matrices. Contains an unbounded linked
+ * list traversal that hangs on uninitialized/circular list data.
+ *
+ * Called with eax = pointer to RW world rendering context.
+ * Also calls sub_001C1740 and sub_001BEFF0 (both already stubbed).
+ *
+ * Stubbed because RW world data isn't properly initialized.
+ */
+void sub_001C66F0(void)
+{
+    static int _1c66f0_count = 0;
+    if (_1c66f0_count < 5)
+        fprintf(stderr, "  [STUB] sub_001C66F0 (RW world cleanup) eax=0x%08X\n", eax);
+    _1c66f0_count++;
+    esp += 4; return; /* ret */
+}
+
+/**
+ * sub_00022660 - Game state notification dispatch (RECURSION-GUARDED)
+ *
+ * Original: 0x00022660 - 0x000226C6 (102 bytes, 41 insns)
+ * Category: game_vtable
+ *
+ * Dispatches state change notifications through vtable callbacks.
+ * When RW world data isn't initialized, vtable pointers can form
+ * circular chains causing infinite recursion → stack overflow.
+ *
+ * This override adds a recursion depth guard (max 32 levels).
+ * CC: thiscall with 3 params on stack (ret 12)
+ */
+void sub_00022660(void)
+{
+    static int _depth = 0;
+    static int _guard_count = 0;
+
+    if (_depth >= 32) {
+        if (_guard_count < 5)
+            fprintf(stderr, "  [GUARD] sub_00022660 recursion depth %d, bailing\n", _depth);
+        _guard_count++;
+        esp += 16; return; /* ret 12 */
+    }
+
+    _depth++;
+
+    /* Save params from stack */
+    uint32_t param1 = MEM32(esp + 4);
+    uint32_t param2 = MEM32(esp + 8);
+    uint32_t param3 = MEM32(esp + 0xC);
+
+    /* ecx = this (ebx in original), call sub_001B4170 */
+    uint32_t saved_ebx = ebx;
+    ebx = ecx;
+    PUSH32(esp, param3);
+    PUSH32(esp, param2);
+    PUSH32(esp, param1);
+    ecx = ebx;
+    PUSH32(esp, 0); sub_001B4170();
+
+    /* Call sub_001B4260 to hash-lookup the state */
+    PUSH32(esp, 0x93D12267u);
+    PUSH32(esp, 0x889D607Fu);
+    PUSH32(esp, 0); sub_001B4260();
+
+    uint32_t new_state = eax;
+    if (MEM32(ebx + 4) != new_state) {
+        /* Dispatch: call vtable[0x10](this, new_state, 0) */
+        uint32_t vtable = MEM32(ebx);
+        uint32_t method1 = MEM32(vtable + 0x10);
+        recomp_func_t fn1 = recomp_lookup_manual(method1);
+        if (!fn1) fn1 = recomp_lookup(method1);
+        if (!fn1) fn1 = recomp_lookup_kernel(method1);
+        if (fn1) {
+            uint32_t _saved_esp = esp;
+            PUSH32(esp, 0);
+            PUSH32(esp, new_state);
+            ecx = ebx;
+            PUSH32(esp, 0);
+            fn1();
+        }
+
+        /* Update state */
+        uint32_t old_state = MEM32(ebx + 4);
+        MEM32(ebx + 4) = new_state;
+
+        /* If ebx+0x10 is non-null, update related pointers */
+        uint32_t ptr = MEM32(ebx + 0x10);
+        if (ptr != 0) {
+            MEM32(ebx + 0x14) = MEM32(ptr + 0x20);
+            if (new_state != 0) {
+                MEM32(new_state + 0x10) = MEM32(ptr + 0x20);
+            }
+        }
+
+        /* Dispatch: call vtable[0x14](this, old_state, 0) */
+        vtable = MEM32(ebx);
+        uint32_t method2 = MEM32(vtable + 0x14);
+        recomp_func_t fn2 = recomp_lookup_manual(method2);
+        if (!fn2) fn2 = recomp_lookup(method2);
+        if (!fn2) fn2 = recomp_lookup_kernel(method2);
+        if (fn2) {
+            PUSH32(esp, 0);
+            PUSH32(esp, old_state);
+            ecx = ebx;
+            PUSH32(esp, 0);
+            fn2();
+        }
+    }
+
+    ebx = saved_ebx;
+    _depth--;
+    esp += 16; return; /* ret 12 */
+}
+
+/**
+ * sub_0003D9E0 - Game render orchestrator (STUB)
+ *
+ * Original: 0x0003D9E0 - 0x0003DA90 (176 bytes, 41 insns)
+ * Category: game_render
+ *
+ * Called from the common exit path (loc_00016C42) of the main game tick
+ * function sub_000165F0. Orchestrates a single frame of RenderWare rendering:
+ *   1. sub_0002F330 - sets render state pointers based on edi (mode select)
+ *   2. sub_0034D530 - D3D rendering (already stubbed separately)
+ *   3. sub_00040660 - copies camera/matrix data from RW global tables
+ *
+ * All three callees chase pointers through uninitialized RenderWare structures
+ * (vtable chains, D3D state objects), producing millions of garbage ICALLs to
+ * addresses like 0x24000168, 0x23800068, etc. and leaking ESP massively
+ * (24+ bytes per ICALL). This causes the game loop to hang after one iteration.
+ *
+ * Stub: skip all rendering operations. Our frame output comes from
+ * game_frame_pump() called via sub_000110E0 instead.
+ *
+ * Implicit register params: esi = game object base (0x4D6170), edi = mode (0)
+ * Calling convention: cdecl, caller pushes dummy ret addr
+ */
+void sub_0003D9E0(void)
+{
+    esp += 4; return; /* pop dummy return address */
 }

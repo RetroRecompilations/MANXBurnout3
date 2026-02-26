@@ -83,6 +83,24 @@ static IDirect3DBaseTexture8  *g_cur_textures[4] = { NULL };
 static const IDirect3DDevice8Vtbl g_device_vtbl;
 
 /* ================================================================
+ * Public frame pump (called from recompiled game code)
+ * ================================================================ */
+void d3d8_PresentFrame(void)
+{
+    /* Pump Windows messages */
+    MSG msg;
+    while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
+        if (msg.message == WM_QUIT) ExitProcess(0);
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+
+    /* Present the backbuffer (VSync = 1) */
+    if (g_device_state.swap_chain)
+        IDXGISwapChain_Present(g_device_state.swap_chain, 1, 0);
+}
+
+/* ================================================================
  * Internal accessors (used by d3d8_resources/shaders/states)
  * ================================================================ */
 
@@ -313,9 +331,53 @@ static HRESULT __stdcall dev_Reset(IDirect3DDevice8 *self, D3DPRESENT_PARAMETERS
     return S_OK;
 }
 
+static DWORD g_d3d_begin_count = 0;
+static DWORD g_d3d_end_count = 0;
+static DWORD g_d3d_clear_count = 0;
+static DWORD g_d3d_draw_count = 0;
+static DWORD g_d3d_settransform_count = 0;
+static DWORD g_d3d_setrs_count = 0;
+static DWORD g_d3d_settexture_count = 0;
+
 static HRESULT __stdcall dev_Present(IDirect3DDevice8 *self, const RECT *src, const RECT *dst, HWND hWnd, void *pDirty)
 {
+    static DWORD frame_count = 0;
+    static DWORD last_tick = 0;
     (void)self; (void)src; (void)dst; (void)hWnd; (void)pDirty;
+
+    frame_count++;
+    DWORD now = GetTickCount();
+    if (last_tick == 0) last_tick = now;
+    if (now - last_tick >= 2000) {
+        fprintf(stderr, "  [D3D] %.1fs: %u present (%.1f fps), %u begin, %u end, "
+                "%u clear, %u draw, %u xform, %u rs, %u tex\n",
+                (now - last_tick) / 1000.0, frame_count,
+                frame_count * 1000.0 / (now - last_tick),
+                g_d3d_begin_count, g_d3d_end_count,
+                g_d3d_clear_count, g_d3d_draw_count,
+                g_d3d_settransform_count, g_d3d_setrs_count,
+                g_d3d_settexture_count);
+        fflush(stderr);
+        frame_count = 0;
+        g_d3d_begin_count = g_d3d_end_count = 0;
+        g_d3d_clear_count = g_d3d_draw_count = 0;
+        g_d3d_settransform_count = g_d3d_setrs_count = 0;
+        g_d3d_settexture_count = 0;
+        last_tick = now;
+    }
+
+    /* Pump Windows messages: the game's internal main loop drives rendering,
+     * so our external message pump never runs. Process messages here to keep
+     * the window responsive and handle input. */
+    MSG msg;
+    while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
+        if (msg.message == WM_QUIT) {
+            ExitProcess(0);
+        }
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+
     return IDXGISwapChain_Present(g_device_state.swap_chain, 1, 0);
 }
 
@@ -330,6 +392,7 @@ static HRESULT __stdcall dev_BeginScene(IDirect3DDevice8 *self)
 {
     (void)self;
     g_device_state.in_scene = TRUE;
+    g_d3d_begin_count++;
     return S_OK;
 }
 
@@ -337,12 +400,14 @@ static HRESULT __stdcall dev_EndScene(IDirect3DDevice8 *self)
 {
     (void)self;
     g_device_state.in_scene = FALSE;
+    g_d3d_end_count++;
     return S_OK;
 }
 
 static HRESULT __stdcall dev_Clear(IDirect3DDevice8 *self, DWORD Count, const D3DRECT *pRects, DWORD Flags, D3DCOLOR Color, float Z, DWORD Stencil)
 {
     (void)self; (void)Count; (void)pRects; (void)Stencil;
+    g_d3d_clear_count++;
 
     if (Flags & D3DCLEAR_TARGET) {
         float clear_color[4] = {
@@ -372,6 +437,7 @@ static HRESULT __stdcall dev_Clear(IDirect3DDevice8 *self, DWORD Count, const D3
 static HRESULT __stdcall dev_SetTransform(IDirect3DDevice8 *self, D3DTRANSFORMSTATETYPE State, const D3DMATRIX *pMatrix)
 {
     (void)self;
+    g_d3d_settransform_count++;
     if ((DWORD)State < MAX_TRANSFORMS && pMatrix) {
         g_device_state.transforms[(DWORD)State] = *pMatrix;
     }
@@ -390,6 +456,7 @@ static HRESULT __stdcall dev_GetTransform(IDirect3DDevice8 *self, D3DTRANSFORMST
 static HRESULT __stdcall dev_SetRenderState(IDirect3DDevice8 *self, D3DRENDERSTATETYPE State, DWORD Value)
 {
     (void)self;
+    g_d3d_setrs_count++;
     if ((DWORD)State < MAX_RENDER_STATES) {
         g_device_state.render_states[(DWORD)State] = Value;
     }
@@ -427,6 +494,7 @@ static HRESULT __stdcall dev_GetTextureStageState(IDirect3DDevice8 *self, DWORD 
 static HRESULT __stdcall dev_SetTexture(IDirect3DDevice8 *self, DWORD Stage, IDirect3DBaseTexture8 *pTexture)
 {
     (void)self;
+    g_d3d_settexture_count++;
     if (Stage >= 4) return E_INVALIDARG;
     g_cur_textures[Stage] = pTexture;
 
@@ -515,6 +583,7 @@ static D3D11_PRIMITIVE_TOPOLOGY map_primitive_type(D3DPRIMITIVETYPE pt, UINT cou
 static HRESULT __stdcall dev_DrawPrimitive(IDirect3DDevice8 *self, D3DPRIMITIVETYPE PrimitiveType, UINT StartVertex, UINT PrimitiveCount)
 {
     (void)self;
+    g_d3d_draw_count++;
     D3D11_PRIMITIVE_TOPOLOGY topology;
     UINT vertex_count;
 
@@ -533,6 +602,7 @@ static HRESULT __stdcall dev_DrawPrimitive(IDirect3DDevice8 *self, D3DPRIMITIVET
 static HRESULT __stdcall dev_DrawIndexedPrimitive(IDirect3DDevice8 *self, D3DPRIMITIVETYPE PrimitiveType, UINT MinVertexIndex, UINT NumVertices, UINT StartIndex, UINT PrimitiveCount)
 {
     (void)self; (void)MinVertexIndex; (void)NumVertices;
+    g_d3d_draw_count++;
     D3D11_PRIMITIVE_TOPOLOGY topology;
     UINT index_count;
 
@@ -550,6 +620,7 @@ static HRESULT __stdcall dev_DrawIndexedPrimitive(IDirect3DDevice8 *self, D3DPRI
 static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *self, D3DPRIMITIVETYPE PrimitiveType, UINT PrimitiveCount, const void *pVertexData, UINT VertexStreamZeroStride)
 {
     (void)self;
+    g_d3d_draw_count++;
     D3D11_PRIMITIVE_TOPOLOGY topology;
     D3D11_BUFFER_DESC bd;
     D3D11_SUBRESOURCE_DATA sd;
@@ -601,6 +672,7 @@ static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *self, D3DPRIMITIV
 static HRESULT __stdcall dev_DrawIndexedPrimitiveUP(IDirect3DDevice8 *self, D3DPRIMITIVETYPE PrimitiveType, UINT MinVertexIndex, UINT NumVertices, UINT PrimitiveCount, const void *pIndexData, D3DFORMAT IndexDataFormat, const void *pVertexData, UINT VertexStreamZeroStride)
 {
     (void)self; (void)MinVertexIndex;
+    g_d3d_draw_count++;
     D3D11_PRIMITIVE_TOPOLOGY topology;
     D3D11_BUFFER_DESC bd;
     D3D11_SUBRESOURCE_DATA sd;
@@ -851,6 +923,17 @@ static HRESULT __stdcall dev_EndPush(IDirect3DDevice8 *self, DWORD *pPush)
 static HRESULT __stdcall dev_Swap(IDirect3DDevice8 *self, DWORD Flags)
 {
     (void)self; (void)Flags;
+
+    /* Pump Windows messages (same as dev_Present) */
+    MSG msg;
+    while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
+        if (msg.message == WM_QUIT) {
+            ExitProcess(0);
+        }
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+
     return IDXGISwapChain_Present(g_device_state.swap_chain, 1, 0);
 }
 

@@ -164,25 +164,91 @@ static BOOL veh_skip_faulting_read(PCONTEXT ctx)
         return TRUE;
     }
 
-    /* F3 0F 10 /r : movss xmm, m32 */
-    /* Check if we had F3 prefix */
+    /* SSE instructions with memory operands.
+     * These use legacy prefixes (F3/F2/66/none) + 0F opcode + modrm.
+     * For faulting memory reads, zero the destination XMM register
+     * and advance RIP to let execution continue.
+     */
     {
-        int has_f3 = 0;
+        int has_f3 = 0, has_f2 = 0, has_66 = 0;
         for (int i = 0; i < prefix_len; i++) {
             if (rip[i] == 0xF3) has_f3 = 1;
+            if (rip[i] == 0xF2) has_f2 = 1;
+            if (rip[i] == 0x66) has_66 = 1;
         }
-        if (has_f3 && op[0] == 0x0F && op[1] == 0x10) {
-            /* Zero the XMM register */
-            int xmm_idx = ((op[2] >> 3) & 7) | (rex_r << 3);
-            MODRM_LEN(op[2]);
-            /* XMM registers in CONTEXT: Xmm0-Xmm15 */
-            if (xmm_idx < 16) {
-                M128A *xmm = &ctx->Xmm0 + xmm_idx;
-                xmm->Low = 0;
-                xmm->High = 0;
+
+        if (op[0] == 0x0F) {
+            int is_sse_mem_read = 0;
+
+            /* F3 0F xx: scalar single-precision */
+            if (has_f3) {
+                switch (op[1]) {
+                case 0x10: /* movss xmm, m32 */
+                case 0x58: /* addss xmm, m32 */
+                case 0x59: /* mulss xmm, m32 */
+                case 0x5C: /* subss xmm, m32 */
+                case 0x5E: /* divss xmm, m32 */
+                case 0x51: /* sqrtss xmm, m32 */
+                case 0x5D: /* minss xmm, m32 */
+                case 0x5F: /* maxss xmm, m32 */
+                case 0x2A: /* cvtsi2ss xmm, r/m32 */
+                case 0x2C: /* cvttss2si r32, xmm/m32 */
+                case 0x2D: /* cvtss2si r32, xmm/m32 */
+                    is_sse_mem_read = 1;
+                    break;
+                }
             }
-            ctx->Rip += prefix_len + 2 + modrm_total;
-            return TRUE;
+            /* F2 0F xx: scalar double-precision */
+            else if (has_f2) {
+                switch (op[1]) {
+                case 0x10: /* movsd xmm, m64 */
+                case 0x58: /* addsd */
+                case 0x59: /* mulsd */
+                case 0x5C: /* subsd */
+                case 0x5E: /* divsd */
+                    is_sse_mem_read = 1;
+                    break;
+                }
+            }
+            /* 66 0F xx: packed double / integer */
+            else if (has_66) {
+                switch (op[1]) {
+                case 0x28: /* movapd xmm, m128 */
+                case 0x10: /* movupd xmm, m128 */
+                case 0x6F: /* movdqa xmm, m128 */
+                    is_sse_mem_read = 1;
+                    break;
+                }
+            }
+            /* No prefix: packed single-precision */
+            else {
+                switch (op[1]) {
+                case 0x28: /* movaps xmm, m128 */
+                case 0x10: /* movups xmm, m128 */
+                case 0x58: /* addps xmm, m128 */
+                case 0x59: /* mulps xmm, m128 */
+                case 0x5C: /* subps xmm, m128 */
+                case 0x5E: /* divps xmm, m128 */
+                    is_sse_mem_read = 1;
+                    break;
+                }
+            }
+
+            if (is_sse_mem_read) {
+                int xmm_idx = ((op[2] >> 3) & 7) | (rex_r << 3);
+                MODRM_LEN(op[2]);
+
+                /* For cvttss2si/cvtss2si, dest is GPR, not XMM */
+                if ((has_f3 && (op[1] == 0x2C || op[1] == 0x2D))) {
+                    *gpr[xmm_idx] = 0;
+                } else if (xmm_idx < 16) {
+                    M128A *xmm = &ctx->Xmm0 + xmm_idx;
+                    xmm->Low = 0;
+                    xmm->High = 0;
+                }
+                ctx->Rip += prefix_len + 2 + modrm_total;
+                return TRUE;
+            }
         }
     }
 
@@ -287,6 +353,34 @@ static BOOL veh_skip_faulting_write(PCONTEXT ctx)
             ctx->Rip += prefix_len + 2 + modrm_total;
             return TRUE;
         }
+
+        /* F3 A4 : rep movsb (inline memcpy)
+         * F3 A5 : rep movsd (inline memcpy, 4-byte)
+         * F3 AA : rep stosb (inline memset)
+         * F3 AB : rep stosd (inline memset, 4-byte)
+         *
+         * Cancel remaining iterations: set RCX=0, advance RSI/RDI past
+         * the unmapped region. The rep prefix with RCX=0 is a no-op,
+         * so the CPU will naturally advance RIP past the instruction.
+         * Assumes DF=0 (CLD), which is standard for MSVC code.
+         */
+        if (has_f3 && (op[0] == 0xA4 || op[0] == 0xA5)) {
+            /* rep movsb / rep movsd */
+            uint64_t stride = (op[0] == 0xA5) ? 4 : 1;
+            uint64_t remaining = ctx->Rcx * stride;
+            ctx->Rcx = 0;
+            ctx->Rsi += remaining;
+            ctx->Rdi += remaining;
+            return TRUE;
+        }
+        if (has_f3 && (op[0] == 0xAA || op[0] == 0xAB)) {
+            /* rep stosb / rep stosd */
+            uint64_t stride = (op[0] == 0xAB) ? 4 : 1;
+            uint64_t remaining = ctx->Rcx * stride;
+            ctx->Rcx = 0;
+            ctx->Rdi += remaining;
+            return TRUE;
+        }
     }
 
     #undef MODRM_LEN
@@ -317,6 +411,38 @@ static LONG WINAPI crash_veh(PEXCEPTION_POINTERS info)
          */
         if (fault_addr < (uintptr_t)g_xbox_mem_offset) {
             /* Fall through to crash reporting at bottom of handler */
+            goto veh_crash_report;
+        }
+
+        /*
+         * Guard: 32-bit overflow addresses.
+         *
+         * When recompiled code computes an Xbox VA >= 0xFFFFFFFF and does
+         * a multi-byte access (e.g., MEM32(0xFFFFFFFF)), the read spans
+         * bytes 0xFFFFFFFF..0x100000002. The CPU faults at the page
+         * boundary (native offset 0x100000000+), which exceeds 32 bits.
+         * Converting back to Xbox VA wraps to 0, confusing downstream
+         * handlers (NV2A, mirror, etc.).
+         *
+         * Skip these directly - they're sentinel/NULL pointer accesses.
+         */
+        if ((fault_addr - (uintptr_t)g_xbox_mem_offset) >= 0x100000000ULL) {
+            if (!is_write) {
+                if (veh_skip_faulting_read(info->ContextRecord)) {
+                    static int overflow_skip_count = 0;
+                    overflow_skip_count++;
+                    if (overflow_skip_count <= 5 || (overflow_skip_count % 50000) == 0) {
+                        fprintf(stderr, "  [SKIP-OVERFLOW #%d] native=%p (32-bit VA overflow)\n",
+                                overflow_skip_count, (void*)fault_addr);
+                        fflush(stderr);
+                    }
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            } else {
+                if (veh_skip_faulting_write(info->ContextRecord)) {
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
             goto veh_crash_report;
         }
 
@@ -363,15 +489,16 @@ static LONG WINAPI crash_veh(PEXCEPTION_POINTERS info)
         }
 
         /*
-         * Xbox uncached memory mapping (0x80000000-0x83FFFFFF).
+         * Xbox mirror memory mapping (0x80000000 and 0xC0000000 ranges).
          *
-         * On Xbox, physical RAM is accessible through two virtual address ranges:
+         * On Xbox, physical RAM is accessible through three virtual address ranges:
          *   0x00000000-0x03FFFFFF  Cached (normal CPU access)
-         *   0x80000000-0x83FFFFFF  Uncached / write-combined (GPU-coherent)
+         *   0x80000000-0x83FFFFFF  Cached mirror
+         *   0xC0000000-0xC3FFFFFF  Uncached / write-combined (GPU-coherent)
          *
-         * Both map to the same 64MB of physical DRAM. The D3D library uses the
-         * uncached mapping for push buffers, vertex data, and other GPU resources
-         * that need write-combined access for DMA coherency.
+         * All three map to the same 64MB of physical DRAM. The D3D library uses
+         * the uncached mapping for push buffers, vertex data, and other GPU
+         * resources that need write-combined access for DMA coherency.
          *
          * We handle faults in this range on-demand: allocate pages and copy the
          * initial data from the cached mapping. Since we replace D3D at a higher
@@ -380,7 +507,8 @@ static LONG WINAPI crash_veh(PEXCEPTION_POINTERS info)
          */
         {
             uint32_t fault_xbox_va = (uint32_t)(fault_addr - g_xbox_mem_offset);
-            if (fault_xbox_va >= 0x80000000u && fault_xbox_va < 0x84000000u) {
+            if ((fault_xbox_va >= 0x80000000u && fault_xbox_va < 0x84000000u) ||
+                (fault_xbox_va >= 0xC0000000u && fault_xbox_va < 0xC4000000u)) {
                 static int uncached_page_count = 0;
                 uintptr_t alloc_base = fault_addr & ~(uintptr_t)0xFFFF; /* 64KB align */
                 LPVOID result = VirtualAlloc((LPVOID)alloc_base, 0x10000,
@@ -392,7 +520,9 @@ static LONG WINAPI crash_veh(PEXCEPTION_POINTERS info)
                 if (result) {
                     /* Copy initial data from cached mapping as baseline */
                     uint32_t page_xbox_va = (uint32_t)(alloc_base - g_xbox_mem_offset);
-                    uint32_t cached_va = page_xbox_va - 0x80000000u;
+                    uint32_t cached_va = (page_xbox_va >= 0xC0000000u)
+                        ? page_xbox_va - 0xC0000000u
+                        : page_xbox_va - 0x80000000u;
                     if (cached_va < XBOX_TOTAL_RAM) {
                         void *src = (void *)((uintptr_t)cached_va + g_xbox_mem_offset);
                         memcpy(result, src, 0x10000);
@@ -423,8 +553,11 @@ static LONG WINAPI crash_veh(PEXCEPTION_POINTERS info)
             if (fault_addr >= xbox_region_end) {
                 uint32_t fault_xbox_va = (uint32_t)(fault_addr - g_xbox_mem_offset);
 
-                /* Limit: don't map beyond 2 GB to catch truly runaway pointers */
-                if (fault_xbox_va < (uint32_t)((uint64_t)XBOX_TOTAL_RAM * 32)) {
+                /* Map mirrors for all RAM aliases below the NV2A MMIO range.
+                 * Xbox memory map: 0x00-0x03 = cached RAM, 0x80-0x83 = uncached,
+                 * 0xC0-0xC3 = write-combined, 0xD0+ = contiguous GPU aperture.
+                 * All map to the same 64 MB physical RAM (modulo 0x04000000). */
+                if (fault_xbox_va < 0xF0000000u) {
                     HANDLE hMap = xbox_GetMappingHandle();
                     if (hMap) {
                         /* Map a full 64 MB view aligned to the mirror boundary */
@@ -444,6 +577,12 @@ static LONG WINAPI crash_veh(PEXCEPTION_POINTERS info)
                                     (mirror_idx + 1) * XBOX_TOTAL_RAM);
                             fflush(stderr);
                             return EXCEPTION_CONTINUE_EXECUTION;
+                        } else {
+                            fprintf(stderr, "  [MIRROR-FAIL] view %d at %p "
+                                    "(Xbox VA 0x%08X, error %lu)\n",
+                                    mirror_idx, (void*)view_base,
+                                    fault_xbox_va, GetLastError());
+                            fflush(stderr);
                         }
                     }
                 }
@@ -462,20 +601,21 @@ static LONG WINAPI crash_veh(PEXCEPTION_POINTERS info)
          * Limited to MAX_FAULT_SKIPS to avoid infinite loops.
          * Writes still crash immediately (they indicate a real problem).
          */
-        #define MAX_FAULT_SKIPS 50000
+        #define MAX_FAULT_SKIPS 10000000  /* 10M: rendering loop produces many skips */
         if (!is_write) {
             static int fault_skip_count = 0;
             if (fault_skip_count < MAX_FAULT_SKIPS) {
                 if (veh_skip_faulting_read(info->ContextRecord)) {
                     fault_skip_count++;
-                    if (fault_skip_count <= 50 || (fault_skip_count % 100) == 0) {
+                    if (fault_skip_count <= 50 || (fault_skip_count % 10000) == 0) {
                         HMODULE fmod = NULL;
                         GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
                                           (LPCSTR)info->ExceptionRecord->ExceptionAddress, &fmod);
-                        fprintf(stderr, "  [SKIP-READ #%d] Xbox VA 0x%08X at RVA 0x%llX "
+                        fprintf(stderr, "  [SKIP-READ #%d] Xbox VA 0x%08X native=%p at RVA 0x%llX "
                                         "(eax=0x%08X ecx=0x%08X edx=0x%08X)\n",
                                 fault_skip_count,
                                 (uint32_t)(fault_addr - g_xbox_mem_offset),
+                                (void *)fault_addr,
                                 (unsigned long long)((uintptr_t)info->ExceptionRecord->ExceptionAddress - (uintptr_t)fmod),
                                 g_eax, g_ecx, g_edx);
                         fflush(stderr);
@@ -501,7 +641,7 @@ static LONG WINAPI crash_veh(PEXCEPTION_POINTERS info)
                 if (veh_skip_faulting_write(info->ContextRecord)) {
                     write_skip_count++;
                     uint32_t fault_xbox_va = (uint32_t)(fault_addr - g_xbox_mem_offset);
-                    if (write_skip_count <= 50 || (write_skip_count % 100) == 0) {
+                    if (write_skip_count <= 50 || (write_skip_count % 10000) == 0) {
                         HMODULE fmod = NULL;
                         GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
                                           (LPCSTR)info->ExceptionRecord->ExceptionAddress, &fmod);
@@ -708,6 +848,9 @@ static BOOL init_subsystems(void)
         return FALSE;
     }
 
+    /* Verify .text section data integrity */
+    fprintf(stderr, "  .text verify: JT[0x16CC8]=0x%08X (expect 0x000166D1)\n", MEM32(0x16CC8));
+
     /* 2. Xbox kernel replacement layer */
     fprintf(stderr, "[2/4] Kernel layer...\n");
     fflush(stderr);
@@ -888,6 +1031,114 @@ static void shutdown_subsystems(void)
     fprintf(stderr, "Shutdown complete.\n");
 }
 
+/* ── KeTickCount updater thread ──────────────────────────── */
+/* Xbox KeTickCount is a data export at VA 0x00740020 that increments
+ * every ~1ms. The game reads it directly from memory for timing.
+ * We update it from a background thread using GetTickCount(). */
+
+static DWORD WINAPI tick_count_thread_func(LPVOID param)
+{
+    (void)param;
+    uint32_t tick_va = XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT;
+    for (;;) {
+        MEM32(tick_va) = GetTickCount();
+        Sleep(1);  /* ~1ms Xbox tick interval */
+    }
+    return 0;
+}
+
+/* ── Watchdog thread: periodically dumps register state ──── */
+
+static DWORD WINAPI watchdog_thread_func(LPVOID param)
+{
+    (void)param;
+    uint64_t prev_count = 0;
+    for (;;) {
+        Sleep(2000);
+        uint64_t count = g_icall_count;
+        uint32_t idx = g_icall_trace_idx;
+        fprintf(stderr, "  [WATCHDOG] ICALLs: %llu total (+%llu/2s) esp=0x%08X\n",
+                count, count - prev_count, g_esp);
+        /* Dump game state variables */
+        {
+            extern volatile uint32_t g_d3d_render_count;
+            extern volatile uint32_t g_present_count;
+            extern volatile uint32_t g_tick_110e0_count;
+            fprintf(stderr, "  [WATCHDOG] game_state=0x%08X pending=0x%08X load_state=0x%08X flag=0x%02X d3d=%u present=%u tick=%u\n",
+                    MEM32(0x4D53B8), MEM32(0x4D53B4), MEM32(0x4D5388), MEM8(0x4D5378),
+                    g_d3d_render_count, g_present_count, g_tick_110e0_count);
+        }
+        /* Print last ICALL targets */
+        fprintf(stderr, "  [WATCHDOG] ICALLs:");
+        for (int j = ICALL_TRACE_SIZE - 1; j >= 0; j--) {
+            uint32_t va = g_icall_trace[(idx - 1 - j) & (ICALL_TRACE_SIZE - 1)];
+            if (va) fprintf(stderr, " 0x%06X", va);
+        }
+        fprintf(stderr, "\n");
+        /* Dump Xbox stack to identify stuck function */
+        {
+            uint32_t sp = g_esp;
+            fprintf(stderr, "  [WATCHDOG] Stack@0x%08X:", sp);
+            for (int k = 0; k < 12; k++)
+                fprintf(stderr, " %08X", MEM32(sp + k * 4));
+            fprintf(stderr, "\n");
+        }
+        fflush(stderr);
+        prev_count = count;
+    }
+    return 0;
+}
+
+/* ── Frame pump (called from recompiled game loop) ─────────── */
+
+void game_frame_pump(void)
+{
+    static LARGE_INTEGER s_freq = {0};
+    static LARGE_INTEGER s_last = {0};
+
+    /* Initialize timer on first call */
+    if (s_freq.QuadPart == 0) {
+        QueryPerformanceFrequency(&s_freq);
+        QueryPerformanceCounter(&s_last);
+    }
+
+    /* Throttle to ~60fps: only render if >= 16ms since last frame */
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    double elapsed_ms = (double)(now.QuadPart - s_last.QuadPart) * 1000.0 / (double)s_freq.QuadPart;
+    if (elapsed_ms < 16.0)
+        return;
+    s_last = now;
+
+    /* Pump Windows messages */
+    {
+        MSG msg;
+        while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) {
+                g_running = FALSE;
+                return;
+            }
+            TranslateMessage(&msg);
+            DispatchMessageA(&msg);
+        }
+    }
+
+    /* Render frame */
+    if (g_d3d_device) {
+        g_d3d_device->lpVtbl->BeginScene(g_d3d_device);
+        g_d3d_device->lpVtbl->Clear(g_d3d_device, 0, NULL,
+            D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER,
+            0xFF001030, /* Dark blue */
+            1.0f, 0);
+        g_d3d_device->lpVtbl->EndScene(g_d3d_device);
+        g_d3d_device->lpVtbl->Present(g_d3d_device, NULL, NULL, NULL, NULL);
+        {
+            extern volatile uint32_t g_present_count;
+            g_present_count++;
+        }
+    }
+}
+
 /* ── Main game loop ─────────────────────────────────────────── */
 
 static void game_loop(void)
@@ -985,11 +1236,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     /* Register VEH for crash diagnostics */
     AddVectoredExceptionHandler(1, crash_veh);
 
+    /* Start KeTickCount updater thread (Xbox timing) */
+    CreateThread(NULL, 0, tick_count_thread_func, NULL, 0, NULL);
+
+    /* Start watchdog thread for periodic register dumps */
+    CreateThread(NULL, 0, watchdog_thread_func, NULL, 0, NULL);
+
     /* Call the recompiled game entry point with crash protection.
      * We push a dummy return address (simulating x86 'call' instruction)
      * because the translated code expects [esp] = return addr on entry. */
     fprintf(stderr, "\n=== Calling xbe_entry_point (0x001D2807) ===\n");
     fprintf(stderr, "  g_esp = 0x%08X before call\n", g_esp);
+    fprintf(stderr, "  JT verify pre-entry: [0x16CC8]=0x%08X (expect 0x000166D1)\n", MEM32(0x16CC8));
+    fprintf(stderr, "  RW vtable BEFORE init: 0x36B860=0x%08X 0x36B89C=0x%08X\n",
+            MEM32(0x36B860), MEM32(0x36B89C));
     __try {
         PUSH32(g_esp, 0); /* simulate 'call' pushing return address */
         xbe_entry_point();

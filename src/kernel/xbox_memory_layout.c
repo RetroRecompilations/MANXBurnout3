@@ -81,6 +81,11 @@ uint32_t g_ebx = 0, g_esi = 0, g_edi = 0;
 /* SEH frame pointer bridge (see recomp_types.h for explanation) */
 uint32_t g_seh_ebp = 0;
 
+/* ICALL trace ring buffer */
+volatile uint32_t g_icall_trace[16] = {0};
+volatile uint32_t g_icall_trace_idx = 0;
+volatile uint64_t g_icall_count = 0;
+
 BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 {
     DWORD old_protect;

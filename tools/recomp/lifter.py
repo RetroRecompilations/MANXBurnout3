@@ -14,8 +14,10 @@ Memory model:
   - Xbox data sections mapped at original VAs
 """
 
+import struct
+
 from .disasm import Instruction, Operand
-from .config import is_code_address, is_data_address, KERNEL_THUNK_ADDR
+from .config import is_code_address, is_data_address, va_to_file_offset, KERNEL_THUNK_ADDR
 
 
 # ── Operand formatting ──────────────────────────────────────
@@ -641,15 +643,17 @@ def try_match_cmp_jcc(insns, idx, lifter=None):
 class Lifter:
     """Translates x86 instructions to C statements."""
 
-    def __init__(self, func_db=None, label_db=None, abi_db=None):
+    def __init__(self, func_db=None, label_db=None, abi_db=None, xbe_data=None):
         """
         func_db: dict of func_addr → func_info (for naming call targets)
         label_db: dict of addr → name (for kernel imports, etc.)
         abi_db: dict of addr → ABI info (for calling conventions)
+        xbe_data: raw XBE file bytes (for reading jump tables)
         """
         self.func_db = func_db or {}
         self.label_db = label_db or {}
         self.abi_db = abi_db or {}
+        self.xbe_data = xbe_data
         self._fp_top = 0  # FPU stack top index
         self.func_start = 0  # Set per-function by translator
         self.func_end = 0
@@ -1084,7 +1088,8 @@ class Lifter:
             return lines
         elif len(ops) >= 1:
             target = _fmt_operand_read(ops[0])
-            return [f"PUSH32(esp, 0); RECOMP_ICALL({target}); /* indirect call */"]
+            # Mark indirect calls for post-processing by _fixup_icall_esp_save
+            return [f"PUSH32(esp, 0); RECOMP_ICALL_SAFE({target}, _icall_esp); /* indirect call */"]
         return ["/* call: no target */"]
 
     def _lift_ret(self, insn, ops):
@@ -1104,6 +1109,46 @@ class Lifter:
         """Check if a jump target is outside the current function."""
         return not (self.func_start <= addr < self.func_end)
 
+    def _read_jump_table(self, table_va, max_entries=256):
+        """Read 32-bit jump table entries from the XBE at a given VA.
+        Returns list of target addresses. Stops when an entry is not a
+        valid code address or max_entries is reached."""
+        if not self.xbe_data:
+            return []
+        offset = va_to_file_offset(table_va)
+        if offset is None:
+            return []
+        targets = []
+        for i in range(max_entries):
+            o = offset + i * 4
+            if o + 4 > len(self.xbe_data):
+                break
+            val = struct.unpack_from('<I', self.xbe_data, o)[0]
+            if not is_code_address(val):
+                break
+            targets.append(val)
+        return targets
+
+    def _analyze_switch_table(self, ops):
+        """Detect if an indirect jmp operand is an intra-function switch table.
+        Pattern: jmp [reg*scale + table_base] or jmp [reg + table_base]
+        Returns (targets: list[int]) if ALL table entries are within the current
+        function, else empty list."""
+        if not ops or ops[0].type != "mem":
+            return []
+        op = ops[0]
+        # Need a table base (displacement) and an index register
+        if not op.mem_disp or not (op.mem_index or op.mem_base):
+            return []
+        table_va = op.mem_disp
+        targets = self._read_jump_table(table_va)
+        if not targets:
+            return []
+        # Check that ALL targets are within the current function
+        if all(self.func_start <= t < self.func_end for t in targets):
+            return targets
+        return []
+
     def _lift_jmp(self, insn, ops):
         if insn.jump_target:
             if self._is_external_target(insn.jump_target):
@@ -1113,6 +1158,16 @@ class Lifter:
                 return [f"g_seh_ebp = ebp; {name}(); return; /* tail jmp 0x{insn.jump_target:08X} */"]
             return [f"goto loc_{insn.jump_target:08X};"]
         elif len(ops) >= 1:
+            # Detect intra-function switch tables (computed gotos)
+            switch_targets = self._analyze_switch_table(ops)
+            if switch_targets:
+                target_expr = _fmt_operand_read(ops[0])
+                unique_targets = sorted(set(switch_targets))
+                lines = [f"{{ uint32_t _jt = {target_expr}; /* switch: {len(switch_targets)} entries, {len(unique_targets)} targets */"]
+                for t in unique_targets:
+                    lines.append(f"if (_jt == 0x{t:08X}u) goto loc_{t:08X};")
+                lines.append(f"g_seh_ebp = ebp; RECOMP_ITAIL(_jt); return; }}")
+                return lines
             target = _fmt_operand_read(ops[0])
             return [f"g_seh_ebp = ebp; RECOMP_ITAIL({target}); return; /* indirect tail jmp */"]
         return ["/* jmp: no target */"]

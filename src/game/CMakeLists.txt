@@ -61,11 +61,14 @@ if(MSVC)
         _CRT_SECURE_NO_WARNINGS
     )
     # Disable ASLR so we can map Xbox memory at fixed addresses
+    # Large stack: recompiled code uses deep native call chains
+    # (each Xbox call/ret becomes a C function call/return)
     target_link_options(burnout3 PRIVATE
         /DYNAMICBASE:NO
         /FIXED:NO
         /MAP
         /DEBUG
+        /STACK:16777216
     )
 elseif(CMAKE_C_COMPILER_ID STREQUAL "GNU" OR CMAKE_C_COMPILER_ID STREQUAL "Clang")
     target_compile_options(burnout3 PRIVATE

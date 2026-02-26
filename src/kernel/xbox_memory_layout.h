@@ -144,8 +144,11 @@ ptrdiff_t xbox_GetMemoryOffset(void);
 #define KDATA_ALT_SIGNATURE_KEYS 0x130 /* XboxAlternateSignatureKeys (256 bytes) */
 #define KDATA_XE_PUBLIC_KEY     0x300  /* XePublicKeyData (284 bytes) */
 
-/** Size of the simulated Xbox stack (1 MB). */
-#define XBOX_STACK_SIZE     (1 * 1024 * 1024)
+/** Size of the simulated Xbox stack (8 MB).
+ *  Increased from 1 MB because failed RECOMP_ICALL indirect calls
+ *  can leak stdcall args onto the stack each frame. An 8 MB stack
+ *  provides enough headroom for extended gameplay sessions. */
+#define XBOX_STACK_SIZE     (8 * 1024 * 1024)
 
 /** Base VA of the stack area (above last XBE section). */
 #define XBOX_STACK_BASE     0x00780000
@@ -172,8 +175,8 @@ ptrdiff_t xbox_GetMemoryOffset(void);
 #define XBOX_MIRROR_SIZE    0
 #define XBOX_GUARD_SIZE     0
 
-/** Number of 64 MB mirror views to pre-map (covers 1 GB of address space). */
-#define XBOX_NUM_MIRRORS    16
+/** Number of 64 MB mirror views to pre-map (covers 1.75 GB of address space). */
+#define XBOX_NUM_MIRRORS    28
 
 /**
  * Allocate from the Xbox heap. Returns an Xbox VA, or 0 on failure.

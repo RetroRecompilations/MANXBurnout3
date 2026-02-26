@@ -79,10 +79,20 @@ extern uint32_t g_ebx, g_esi, g_edi;
  */
 extern uint32_t g_seh_ebp;
 
+/* ── ICALL trace ring buffer (for debugging) ────────── */
+#define ICALL_TRACE_SIZE 16
+extern volatile uint32_t g_icall_trace[ICALL_TRACE_SIZE];
+extern volatile uint32_t g_icall_trace_idx;
+extern volatile uint64_t g_icall_count;
+
 /* ── Memory access helpers ──────────────────────────────── */
 
-/** Translate an Xbox VA to an actual pointer. */
-#define XBOX_PTR(addr) ((uintptr_t)(addr) + g_xbox_mem_offset)
+/** Translate an Xbox VA to an actual pointer.
+ *  Mask to 32-bit first: Xbox addresses are 32-bit and arithmetic
+ *  in the recompiled code can overflow. Without the mask, a 64-bit
+ *  uintptr_t cast preserves the overflow bits, landing us 4GB+ past
+ *  our mapping and causing access violations. */
+#define XBOX_PTR(addr) ((uintptr_t)(uint32_t)(addr) + g_xbox_mem_offset)
 
 /** Read N bytes from a flat memory address. */
 #define MEM8(addr)   (*(volatile uint8_t  *)XBOX_PTR(addr))
@@ -216,11 +226,32 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
  * If not found, pop the dummy return address to keep the stack balanced.
  */
 #define RECOMP_ICALL(xbox_va) do { \
-    recomp_func_t _fn = recomp_lookup_manual((uint32_t)(xbox_va)); \
-    if (!_fn) _fn = recomp_lookup((uint32_t)(xbox_va)); \
-    if (!_fn) _fn = recomp_lookup_kernel((uint32_t)(xbox_va)); \
+    uint32_t _va = (uint32_t)(xbox_va); \
+    g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
+    g_icall_trace_idx++; \
+    g_icall_count++; \
+    recomp_func_t _fn = recomp_lookup_manual(_va); \
+    if (!_fn) _fn = recomp_lookup(_va); \
+    if (!_fn) _fn = recomp_lookup_kernel(_va); \
     if (_fn) _fn(); \
-    else g_esp += 4; /* pop leaked dummy return address */ \
+    else { g_esp += 4; eax = 0; } /* pop dummy ret addr; zero return value */ \
+} while(0)
+
+/**
+ * Stack-safe indirect call.
+ * Restores g_esp to saved_esp (pre-arg value) on lookup failure,
+ * preventing stdcall argument leaks on failed vtable calls.
+ */
+#define RECOMP_ICALL_SAFE(xbox_va, saved_esp) do { \
+    uint32_t _va = (uint32_t)(xbox_va); \
+    g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
+    g_icall_trace_idx++; \
+    g_icall_count++; \
+    recomp_func_t _fn = recomp_lookup_manual(_va); \
+    if (!_fn) _fn = recomp_lookup(_va); \
+    if (!_fn) _fn = recomp_lookup_kernel(_va); \
+    if (_fn) _fn(); \
+    else { g_esp = (saved_esp); eax = 0; } /* restore esp; zero return value */ \
 } while(0)
 
 /**

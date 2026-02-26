@@ -187,19 +187,23 @@ class Disassembler:
 
         return instructions
 
-    def build_basic_blocks(self, instructions, func_start, func_end):
+    def build_basic_blocks(self, instructions, func_start, func_end,
+                           extra_leaders=None):
         """
         Partition instructions into basic blocks.
         A new block starts at:
         - Function entry
         - Branch targets
         - Instructions after branches/calls
+        - Any address in extra_leaders (e.g., switch table targets)
         """
         if not instructions:
             return []
 
         # Find block leaders (addresses that start a new basic block)
         leaders = {func_start}
+        if extra_leaders:
+            leaders.update(extra_leaders)
         for insn in instructions:
             if insn.is_branch or insn.is_cond_jump:
                 if insn.jump_target and func_start <= insn.jump_target < func_end:

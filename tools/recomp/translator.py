@@ -19,6 +19,77 @@ from .disasm import Disassembler
 from .lifter import Lifter, lift_basic_block
 
 
+def _fixup_icall_esp_save(lines):
+    """
+    Post-process generated C lines to insert _icall_esp save points.
+
+    When RECOMP_ICALL_SAFE is used, we need to save g_esp BEFORE any
+    args are pushed so the macro can restore it on lookup failure.
+
+    Scans backwards from each RECOMP_ICALL_SAFE line to find consecutive
+    PUSH32 lines (the arg pushes), then inserts a save before the first.
+    """
+    import re
+    result = []
+    # Find indices of all ICALL_SAFE lines
+    icall_indices = []
+    for i, line in enumerate(lines):
+        if 'RECOMP_ICALL_SAFE(' in line:
+            icall_indices.append(i)
+
+    if not icall_indices:
+        return lines  # nothing to do
+
+    # For each ICALL, determine where to insert the save
+    insert_before = set()  # map: line_index → True (insert save before this line)
+    for icall_idx in icall_indices:
+        # The ICALL line itself contains "PUSH32(esp, 0); RECOMP_ICALL_SAFE(...)"
+        # Look backwards for consecutive lines containing PUSH32(esp,
+        first_push_idx = icall_idx
+        j = icall_idx - 1
+        while j >= 0:
+            stripped = lines[j].strip()
+            # Skip blank lines
+            if not stripped:
+                j -= 1
+                continue
+            # Check if this is a PUSH32 line (arg push)
+            if stripped.startswith('PUSH32(esp,'):
+                first_push_idx = j
+                j -= 1
+                continue
+            # Check if this is a non-push instruction that could be part of
+            # arg evaluation (e.g., "eax = MEM32(...);") - these are interleaved
+            # with pushes in the x86 code. We need to look past them.
+            # Stop at labels, gotos, other control flow, or other ICALL lines.
+            if (re.match(r'^loc_[0-9A-Fa-f]+:', stripped) or
+                'goto ' in stripped or
+                'RECOMP_ICALL' in stripped or
+                'return;' in stripped or
+                stripped.startswith('if (') or
+                stripped.startswith('POP32(') or
+                stripped.startswith('PUSH32(esp, 0); sub_')):
+                break
+            # It's an interleaved computation - skip past it
+            j -= 1
+            continue
+
+        insert_before.add(first_push_idx)
+
+    # Build result with saves inserted
+    for i, line in enumerate(lines):
+        if i in insert_before:
+            # Determine indentation from the current line
+            indent = line[:len(line) - len(line.lstrip())]
+            result.append(f"{indent}{{ uint32_t _icall_esp = g_esp;")
+        result.append(line)
+        if 'RECOMP_ICALL_SAFE(' in line:
+            indent = line[:len(line) - len(line.lstrip())]
+            result.append(f"{indent}}}")
+
+    return result
+
+
 class FunctionTranslator:
     """Translates individual x86 functions to C source code."""
 
@@ -37,7 +108,7 @@ class FunctionTranslator:
         self.classification_db = classification_db or {}
         self.abi_db = abi_db or {}
         self.disasm = Disassembler()
-        self.lifter = Lifter(func_db=func_db, label_db=label_db, abi_db=abi_db)
+        self.lifter = Lifter(func_db=func_db, label_db=label_db, abi_db=abi_db, xbe_data=xbe_data)
 
     def _read_func_bytes(self, start_va, end_va):
         """Read raw bytes for a function from the XBE."""
@@ -95,8 +166,19 @@ class FunctionTranslator:
         if not instructions:
             return None
 
+        # Collect switch table targets as extra block leaders
+        switch_leaders = set()
+        for insn in instructions:
+            if insn.mnemonic == "jmp" and not insn.jump_target and insn.operands:
+                targets = self.lifter._analyze_switch_table(insn.operands)
+                for t in targets:
+                    if start <= t < end:
+                        switch_leaders.add(t)
+
         # Build basic blocks
-        blocks = self.disasm.build_basic_blocks(instructions, start, end)
+        blocks = self.disasm.build_basic_blocks(
+            instructions, start, end,
+            extra_leaders=switch_leaders if switch_leaders else None)
         if not blocks:
             return None
 
@@ -256,6 +338,12 @@ class FunctionTranslator:
         for insn in instructions:
             if insn.jump_target and start <= insn.jump_target < end:
                 label_addrs.add(insn.jump_target)
+        # Add switch table targets (indirect jmp with intra-function table)
+        for insn in instructions:
+            if insn.mnemonic == "jmp" and not insn.jump_target and insn.operands:
+                switch_targets = self.lifter._analyze_switch_table(insn.operands)
+                for t in switch_targets:
+                    label_addrs.add(t)
 
         flag_state = None
         for bb in blocks:
@@ -272,6 +360,11 @@ class FunctionTranslator:
                 lines.append(f"    {stmt}")
 
             lines.append(f"")
+
+        # Insert _icall_esp save points before RECOMP_ICALL_SAFE arg pushes.
+        # The pattern is: optional PUSH32 args, then PUSH32(esp, 0); RECOMP_ICALL_SAFE(...).
+        # We insert "uint32_t _icall_esp = g_esp;" before the first arg push.
+        lines = _fixup_icall_esp_save(lines)
 
         # Validate: comment out goto targets that reference missing labels
         # (dead code after unconditional jumps may reference non-existent labels)
