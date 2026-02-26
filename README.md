@@ -4,15 +4,17 @@ A project to statically recompile the original Xbox version of **Burnout 3: Take
 
 ## Project Status
 
-**Phase 5: Integration** - The recompiled game boots through full RenderWare engine initialization, executes 22,097 translated functions, and **enters its main loop stably**. A D3D11 window opens and renders, the message pump runs, and the process stays alive until killed. Initialization completes via SEH exception recovery (matching original Xbox behavior). Active work on stubbing Xbox-specific GPU/pipeline code and improving init completion.
+**Phase 5: Integration** - The recompiled game boots, loads all resources, and **runs its main gameplay loop continuously in the in-race state (state 4)**. The game's state machine properly transitions through loading → init (state 1) → setup (state 7) → gameplay (state 4). A D3D11 window renders at ~17fps, the full gameplay tick executes each frame (physics, AI, timers), and all ICALLs resolve to valid functions. Active work on enabling the RenderWare 3D rendering pipeline.
 
 ### What Works
-- Full RenderWare engine init (memory pools, global setup, static constructors)
+- Full game boot sequence: RW engine init → resource loading → state machine → gameplay loop
+- Game state machine transitions: loading → state 1 → 7 → 4 (in-race gameplay)
+- Main gameplay tick running at ~18 ticks/sec with stable stack and registers
 - 200+ Xbox kernel calls dispatched to Win32 replacements
 - Xbox memory layout faithfully reproduced (64 MB + mirror views via file mapping)
 - D3D11 window creation and rendering (fixed-function pipeline emulation)
-- Game main loop executes stably after init
 - 22,097 recompiled x86 functions running as native x86-64 C code
+- 30 manually overridden functions (render stubs, vtable fixes, pipeline bridges)
 
 ## Overview
 
@@ -145,7 +147,7 @@ The main executable (`default.xbe`) contains:
 - [x] 22,097 recompiled functions in dispatch table (22,095 auto + 2 manual)
 - [x] Kernel bridge: 55 per-ordinal bridges, 92 stubs (147 total thunk entries)
 - [x] Game entry point (0x001D2807) runs to completion → creates thread → calls RW init → returns
-- [x] Manual function overrides for 17 functions (mid-function entries, SEH, NV2A stubs, Xbox pipeline stubs)
+- [x] Manual function overrides for 30 functions (mid-function entries, SEH, NV2A stubs, Xbox pipeline stubs)
 - [x] Fake TIB/TLS for fs:[N] references (translator drops segment prefix)
 - [x] Single-threaded critical section model (no-op CS for ABI safety)
 - [x] Xbox heap allocator (bump allocator, 55.5 MB, returns Xbox VAs)
@@ -158,8 +160,12 @@ The main executable (`default.xbe`) contains:
 - [x] Xbox render pipeline functions stubbed (rw_world_pipe_xbox)
 - [x] RenderWare engine initializes, allocates 3 memory pools (~32 MB total)
 - [x] Game enters main loop stably (D3D11 window renders, message pump works)
-- [ ] D3D8 device initialization from game code (higher-level init)
-- [ ] Asset loading and rendering pipeline
+- [x] Resource loading pipeline completes (load_state 0x17 = fully loaded)
+- [x] Game state machine runs (state transitions 1→7→4, gameplay tick loop)
+- [x] .text section corruption workaround (hardcoded switch tables from XBE)
+- [x] Render orchestrator stubbed (sub_0003D9E0, game_frame_pump via sub_000110E0)
+- [x] Callee-saved register preservation across game loop iterations
+- [ ] RenderWare 3D rendering pipeline (vertex transforms, draw calls)
 - [ ] Input mapping (Xbox controller → PC gamepad/keyboard)
 - [ ] Audio playback
 - [ ] Performance profiling and optimization
@@ -192,7 +198,7 @@ burnout3/
 │       ├── main.c            # Entry point, VEH handler, window/game loop
 │       └── recomp/           # Recompiled function infrastructure
 │           ├── recomp_types.h    # Register model, memory macros, ICALL dispatch
-│           ├── recomp_manual.c   # 17 manually implemented function overrides
+│           ├── recomp_manual.c   # 30 manually implemented function overrides
 │           └── gen/              # Auto-generated code (gitignored, ~4.43M lines)
 └── Burnout 3 Takedown/       # Original game files (gitignored)
 ```
