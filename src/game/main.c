@@ -22,7 +22,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <dbghelp.h>
+#include <xinput.h>
 #pragma comment(lib, "dbghelp.lib")
+#pragma comment(lib, "xinput.lib")
 
 /* Compatibility layers */
 #include "../kernel/kernel.h"
@@ -1123,6 +1125,113 @@ void game_frame_pump(void)
         }
     }
 
+    /* ── Input polling & injection into game memory ── */
+    {
+        extern ptrdiff_t g_xbox_mem_offset;
+        #define XINP_MEM32(a) (*(volatile uint32_t*)((uintptr_t)(a) + g_xbox_mem_offset))
+        #define XINP_MEMF(a)  (*(volatile float*)((uintptr_t)(a) + g_xbox_mem_offset))
+        #define XINP_MEM8(a)  (*(volatile uint8_t*)((uintptr_t)(a) + g_xbox_mem_offset))
+
+        /* Only inject input when game is in state 4 (gameplay) */
+        uint32_t game_st = XINP_MEM32(0x4D53B8);
+        if (game_st == 4) {
+            int32_t throttle = 0;  /* positive = gas */
+            int32_t steering = 0;  /* positive = right */
+
+            /* Keyboard: WASD for driving */
+            if (GetAsyncKeyState('W') & 0x8000) throttle += 1000;
+            if (GetAsyncKeyState('S') & 0x8000) throttle -= 1000;
+            if (GetAsyncKeyState('A') & 0x8000) steering -= 1000;
+            if (GetAsyncKeyState('D') & 0x8000) steering += 1000;
+
+            /* XInput gamepad (port 0) */
+            {
+                XINPUT_STATE xi;
+                memset(&xi, 0, sizeof(xi));
+                if (XInputGetState(0, &xi) == ERROR_SUCCESS) {
+                    throttle += (int32_t)xi.Gamepad.bRightTrigger * 8;
+                    throttle -= (int32_t)xi.Gamepad.bLeftTrigger * 8;
+                    steering += (int32_t)xi.Gamepad.sThumbLX / 32;
+                }
+            }
+
+            /* Write to game input accumulator addresses.
+             * sub_000636D0 computes force = (0x4D652C - 0x4D6B24 - 0x4D6B20) * scale.
+             * We set the accumulators directly and zero the base/prev values. */
+            XINP_MEM32(0x4D652C) = (uint32_t)throttle;
+            XINP_MEM32(0x4D6530) = (uint32_t)steering;
+            XINP_MEM32(0x4D6B20) = 0;
+            XINP_MEM32(0x4D6B24) = 0;
+            XINP_MEM32(0x4D6B28) = 0;
+
+            /* Force physics scale factors to known-good values.
+             * sub_000636D0 multiplies input by these; if any are 0, force is 0.
+             * On Xbox, the game sets these during car/track setup, but some
+             * may not be initialized in our recompilation. Force non-zero. */
+            {
+                float s1 = XINP_MEMF(0x557870);
+                float s2 = XINP_MEMF(0x3B1C40);
+                float s3 = XINP_MEMF(0x5592C8);
+                float s4 = XINP_MEMF(0x3B1C38);
+                if (s1 > -1e-10f && s1 < 1e-10f) XINP_MEMF(0x557870) = 0.001f;
+                if (s2 > -1e-10f && s2 < 1e-10f) XINP_MEMF(0x3B1C40) = 1.0f;
+                if (s3 > -1e-10f && s3 < 1e-10f) XINP_MEMF(0x5592C8) = 0.001f;
+                if (s4 > -1e-10f && s4 < 1e-10f) XINP_MEMF(0x3B1C38) = 1.0f;
+            }
+
+            /* Direct physics velocity injection as fallback.
+             * If the scale chain produces 0 (broken .rdata scales),
+             * write force directly to the car's physics velocity vector.
+             * Physics ptr = MEM32(0x557880 + 0x1B4), vel at +8/+0xC. */
+            if (throttle != 0 || steering != 0) {
+                uint32_t phys_ptr = XINP_MEM32(0x557880 + 0x1B4);
+                if (phys_ptr > 0x10000 && phys_ptr < 0x4000000) {
+                    float cur_vx = XINP_MEMF(phys_ptr + 8);
+                    float cur_vy = XINP_MEMF(phys_ptr + 0xC);
+                    /* Only inject if the scale path produced 0 */
+                    if (cur_vx == 0.0f && cur_vy == 0.0f) {
+                        XINP_MEMF(phys_ptr + 8) = (float)throttle * 0.01f;
+                        XINP_MEMF(phys_ptr + 0xC) = (float)steering * 0.01f;
+                    }
+                }
+            }
+
+            /* Button events for menu navigation */
+            if (GetAsyncKeyState(VK_UP) & 0x8000)     XINP_MEM8(0x4A1C74) = 1;
+            if (GetAsyncKeyState(VK_DOWN) & 0x8000)    XINP_MEM8(0x4A1C78) = 1;
+            if (GetAsyncKeyState(VK_LEFT) & 0x8000)    XINP_MEM8(0x4A1C76) = 1;
+            if (GetAsyncKeyState(VK_RIGHT) & 0x8000)   XINP_MEM8(0x4A1C77) = 1;
+            if (GetAsyncKeyState(VK_RETURN) & 0x8000)  XINP_MEM8(0x4A1C75) = 1;
+            if (GetAsyncKeyState(VK_ESCAPE) & 0x8000)  XINP_MEM8(0x4A1C79) = 1;
+
+            /* Debug: log input state */
+            {
+                static int _inp_dbg = 0;
+                _inp_dbg++;
+                if (_inp_dbg == 1 || (_inp_dbg % 300 == 0) ||
+                    (throttle != 0 && _inp_dbg % 30 == 0) ||
+                    (steering != 0 && _inp_dbg % 30 == 0)) {
+                    float s1 = XINP_MEMF(0x557870);
+                    float s2 = XINP_MEMF(0x3B1C40);
+                    float s3 = XINP_MEMF(0x5592C8);
+                    float s4 = XINP_MEMF(0x3B1C38);
+                    uint32_t phys_ptr = XINP_MEM32(0x557880 + 0x1B4);
+                    float vx = 0.0f, vy = 0.0f;
+                    if (phys_ptr > 0x10000 && phys_ptr < 0x4000000) {
+                        vx = XINP_MEMF(phys_ptr + 8);
+                        vy = XINP_MEMF(phys_ptr + 0xC);
+                    }
+                    fprintf(stderr, "  [INPUT] #%d thr=%d steer=%d scales=(%.6f,%.4f,%.6f,%.4f) vel=(%.2f,%.2f)\n",
+                            _inp_dbg, throttle, steering, s1, s2, s3, s4, vx, vy);
+                }
+            }
+        }
+
+        #undef XINP_MEM32
+        #undef XINP_MEMF
+        #undef XINP_MEM8
+    }
+
     /* Render frame */
     if (g_d3d_device) {
         g_d3d_device->lpVtbl->BeginScene(g_d3d_device);
@@ -1135,6 +1244,42 @@ void game_frame_pump(void)
         {
             extern volatile uint32_t g_present_count;
             g_present_count++;
+        }
+    }
+
+    /* Update window title with game state (every 30 frames) */
+    {
+        static uint32_t s_title_counter = 0;
+        s_title_counter++;
+        if (g_hwnd && (s_title_counter % 30) == 0) {
+            extern volatile uint64_t g_icall_count;
+            extern volatile uint32_t g_tick_110e0_count;
+            extern volatile uint32_t g_present_count;
+            /* Read game state from Xbox memory */
+            extern ptrdiff_t g_xbox_mem_offset;
+            #define XMEM32(a) (*(volatile uint32_t*)((uintptr_t)(a) + g_xbox_mem_offset))
+            #define XMEMF(a)  (*(volatile float*)((uintptr_t)(a) + g_xbox_mem_offset))
+            uint32_t game_state = XMEM32(0x4D53B8);
+            uint32_t load_state = XMEM32(0x4D5388);
+            float delta_time    = XMEMF(0x4AE1FC);
+            uint32_t frame_ctr  = XMEM32(0x4A1D84);
+            /* Car state: 0x557880 + 0x1E4 = state machine index */
+            uint32_t car_state  = XMEM32(0x557880 + 0x1E4);
+            char title[256];
+            /* Read physics velocity for display */
+            uint32_t phys_ptr = XMEM32(0x557880 + 0x1B4);
+            float vx = 0.0f, vy = 0.0f;
+            if (phys_ptr > 0x10000 && phys_ptr < 0x4000000) {
+                vx = XMEMF(phys_ptr + 8);
+                vy = XMEMF(phys_ptr + 0xC);
+            }
+            snprintf(title, sizeof(title),
+                "Burnout 3 | state=%u car=%u tick=%u dt=%.3f vel=(%.1f,%.1f) icalls=%llu",
+                game_state, car_state, g_tick_110e0_count,
+                delta_time, vx, vy, (unsigned long long)g_icall_count);
+            #undef XMEM32
+            #undef XMEMF
+            SetWindowTextA(g_hwnd, title);
         }
     }
 }

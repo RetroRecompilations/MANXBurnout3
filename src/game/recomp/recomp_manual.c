@@ -1545,11 +1545,19 @@ void sub_000110E0(void)
      * in sub_00011240 (gen patch) since the async RW stream reader
      * hangs on NV2A GPU registers. */
 
-    /* Diagnostic: print state and ICALL count */
-    if (tick_count <= 50)
-        fprintf(stderr, "  [TICK] sub_000110E0 #%u: load=0x%X game=0x%X icalls=%llu\n",
-                tick_count, MEM32(0x4D5388), MEM32(0x4D53B8),
+    /* Diagnostic: print state, timing, and simulation data */
+    if (tick_count <= 20 || (tick_count % 500 == 0)) {
+        uint32_t phys_ptr = MEM32(0x557880 + 0x1B4);
+        float vel_x = 0.0f, vel_y = 0.0f;
+        if (phys_ptr > 0x10000 && phys_ptr < 0x800000) {
+            vel_x = MEMF(phys_ptr + 8);
+            vel_y = MEMF(phys_ptr + 0xC);
+        }
+        fprintf(stderr, "  [TICK] #%u: game=%u dt=%.4f car=%u vel=(%.2f,%.2f) icalls=%llu\n",
+                tick_count, MEM32(0x4D53B8), MEMF(0x4AE1FC),
+                MEM32(0x557880 + 0x1E4), vel_x, vel_y,
                 (unsigned long long)g_icall_count);
+    }
 
     /* Signal "rendering complete" to the game state machine.
      * The gate flag at 0x4D53BC (= ebp + 0x2E21C) controls whether the
