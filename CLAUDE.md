@@ -34,10 +34,10 @@ The goal is to translate the original x86 Xbox code into a native Windows execut
 - Addresses are always shown as hex with 0x prefix (e.g., 0x001D2807)
 - Xbox kernel function names use their original Xbox names with `xbox_` prefix when reimplemented
 
-## Current Work State (Session 18)
+## Current Work State (Session 20)
 
-### Status: Full driving demo with arcade gameplay (Session 19)
-Game boots, loads, runs gameplay loop in state 4. Pseudo-3D OutRun-style driving with curving roads, traffic, boost meter, takedowns, and scaling difficulty.
+### Status: Full arcade driving game with weather, tunnels, scoring, and rearview mirror
+Game boots, loads, runs gameplay loop in state 4. Pseudo-3D OutRun-style driving with curving/hilly roads, 12 traffic cars, boost/takedown/crash mechanics, score combos, weather cycling, tunnel sections, varied roadside scenery, rear-view mirror, and time-of-day lighting.
 
 ### Physics Model (sub_000636D0 + sub_000110E0)
 - **Heading angle** at fake physics body +0x18 (radians, 0=north, CW positive)
@@ -48,39 +48,56 @@ Game boots, loads, runs gameplay loop in state 4. Pseudo-3D OutRun-style driving
 
 ### D3D8 Rendering (main.c)
 - **Pseudo-3D perspective** (OutRun-style): camera behind car, road to horizon
-- 50 road segments with accumulated curve AND hill offsets (sine-wave S-curves + undulation)
-- Sky gradient, mountain silhouettes with parallax, grass ground plane
-- Alternating road stripes, rumble strip edges, yellow center dashes (all curved + hilly)
-- Roadside posts every 20 world units along both edges (follow curves/hills)
-- 12 traffic obstacles (8 same-dir + 4 oncoming) with curve/hill-corrected projection
-- Oncoming cars have headlights, bright red/pink colors
+- 50 road segments with accumulated curve AND hill offsets
+- Sky gradient with **stars during night phase** (twinkle, color variation)
+- Mountain silhouettes with parallax, grass ground plane
+- **Time-of-day**: dawn→day→sunset→night color cycling every 3000 world units
+- Alternating road stripes, rumble strip edges, yellow center dashes, white lane dividers
+- **6 roadside object types**: guard posts, trees (2 sizes), buildings, road signs, billboards
+- **Tunnel sections** every 2000 units: ceiling, walls, orange strip lights
+- **Rain puddles** on road surface during rain weather
+- 12 traffic obstacles (8 same-dir + 4 oncoming) with taillights and headlights
+- AI traffic: sine-wave lane drifting + **braking when player approaches**
 - Player car with shadow, steering tilt, windshield, taillights, boost exhaust flames
-- Speed lines at 25+ speed (alpha-blended streaks)
-- Screen shake with random viewport offset during crash (1s decay)
-- HUD: speed bar, boost bar (blue=charging, orange=active), takedown pips
-- Flash overlay: white=takedown, red=crash
+- **Headlight beams** projecting forward during night phase
+- **Wall collision sparks**: orange/yellow particle burst
+- Speed lines at 25+ speed
+- **Rain weather**: diagonal streaks + fog overlay cycling every 6000 units
+- Screen shake on crash
+- **Rear-view mirror** at top center showing traffic behind player
+- HUD: speed bar, boost bar, takedown pips, **score/multiplier bar**, checkpoint banner
+- Flash overlay: white=takedown, red=crash, **green=checkpoint**
 
 ### Memory Layout
 - 0x5FFF00: Fake physics body (+08 accel, +0C turn, +10 px, +14 py, +18 hdg, +1C spd)
-- 0x5FFE00: Obstacle array (12 × 16B: pos_x, pos_y, speed, flags; bit0=active, bit1=oncoming)
+- 0x5FFE00: Obstacle array (12 × 16B: pos_x, pos_y, speed, flags)
 - 0x5FFD00: Takedown count (uint32)
-- 0x5FFD04: Flash timer (float, white=takedown, red=crash)
+- 0x5FFD04: Flash timer (float)
 - 0x5FFD08: Boost meter 0-100 (float)
-- 0x5FFD0C: Boost button state (uint32, from Shift/gamepad A/RB)
-- 0x5FFD10: Road curve at player (float, from renderer)
-- 0x5FFD14: Distance traveled (uint32, meters)
-- 0x5FFD18: Screen shake timer (float, set on crash)
+- 0x5FFD0C: Boost button state (uint32)
+- 0x5FFD10: Road curve at player (float)
+- 0x5FFD14: Distance traveled (uint32)
+- 0x5FFD18: Screen shake timer (float)
+- 0x5FFD1C: Last checkpoint distance (uint32)
+- 0x5FFD20: Checkpoint flash timer (float)
+- 0x5FFD24: Score (uint32)
+- 0x5FFD28: Score multiplier (float, 1.0-8.0)
+- 0x5FFD2C: Combo timer (float, resets multiplier decay)
+- 0x5FFD30: Spark timer (float)
+- 0x5FFD34: Spark side (uint32, 0=left, 1=right)
 
 ### Gameplay Features
-- Road curves: overlapping sine waves creating smooth S-curves
-- Road hills: sine-wave vertical undulation for depth
-- Road edge collision: bounce off walls at ±14 units, half speed penalty
-- Same-dir traffic (8 cars): TAKEDOWN on collision → speed boost + white flash + boost +25
-- Oncoming traffic (4 cars): CRASH on head-on → 85% speed loss + red flash + screen shake
-- Near-miss: pass within 5 units → gradual boost fill (faster for oncoming)
-- Boost: hold Shift or gamepad A/RB to drain meter for +50% max speed, exhaust flames
-- Difficulty scales with distance (tighter spacing, faster cars over 5000m)
-- Distance counter displayed in window title
+- Road curves and hills with centripetal physics
+- Wall collision: bounce, half speed, sparks, multiplier reset
+- TAKEDOWN (same-dir): speed boost + 500pts × multiplier + boost +25
+- CRASH (oncoming): 85% speed loss + shake + multiplier reset
+- Near-miss: boost fill + 50-100pts × multiplier (continuous)
+- Boost: Shift/gamepad drains meter for +50% max speed
+- **Score system**: points from near-misses, takedowns, checkpoints
+- **Combo multiplier**: 1x-8x, builds with actions, decays when idle, resets on crash/wall
+- **Checkpoints** every 500m: green flash + 15 boost + 1000pts × multiplier
+- Difficulty ramps with distance (traffic density + speed)
+- AI braking when player approaches from behind in same lane
 
 ### Next Steps
 1. Long-term: fix the real physics world initialization
