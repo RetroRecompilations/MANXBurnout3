@@ -48,32 +48,38 @@ Game boots, loads, runs gameplay loop in state 4. Pseudo-3D OutRun-style driving
 
 ### D3D8 Rendering (main.c)
 - **Pseudo-3D perspective** (OutRun-style): camera behind car, road to horizon
-- 50 road segments with accumulated curve offsets (sine-wave S-curves)
-- Sky gradient, mountain silhouettes, grass ground plane
-- Alternating road stripes, rumble strip edges, yellow center dashes (all curved)
-- Traffic obstacles with curve-corrected perspective projection
-- Player car with steering tilt, windshield, taillights, boost exhaust flames
+- 50 road segments with accumulated curve AND hill offsets (sine-wave S-curves + undulation)
+- Sky gradient, mountain silhouettes with parallax, grass ground plane
+- Alternating road stripes, rumble strip edges, yellow center dashes (all curved + hilly)
+- Roadside posts every 20 world units along both edges (follow curves/hills)
+- 12 traffic obstacles (8 same-dir + 4 oncoming) with curve/hill-corrected projection
+- Oncoming cars have headlights, bright red/pink colors
+- Player car with shadow, steering tilt, windshield, taillights, boost exhaust flames
 - Speed lines at 25+ speed (alpha-blended streaks)
+- Screen shake with random viewport offset during crash (1s decay)
 - HUD: speed bar, boost bar (blue=charging, orange=active), takedown pips
-- Takedown flash overlay (alpha-blended white)
+- Flash overlay: white=takedown, red=crash
 
 ### Memory Layout
 - 0x5FFF00: Fake physics body (+08 accel, +0C turn, +10 px, +14 py, +18 hdg, +1C spd)
-- 0x5FFE00: Obstacle array (8 × 16B: pos_x, pos_y, speed, flags)
+- 0x5FFE00: Obstacle array (12 × 16B: pos_x, pos_y, speed, flags; bit0=active, bit1=oncoming)
 - 0x5FFD00: Takedown count (uint32)
-- 0x5FFD04: Takedown flash timer (float)
+- 0x5FFD04: Flash timer (float, white=takedown, red=crash)
 - 0x5FFD08: Boost meter 0-100 (float)
-- 0x5FFD0C: Boost button state (uint32, from Shift key)
+- 0x5FFD0C: Boost button state (uint32, from Shift/gamepad A/RB)
 - 0x5FFD10: Road curve at player (float, from renderer)
 - 0x5FFD14: Distance traveled (uint32, meters)
+- 0x5FFD18: Screen shake timer (float, set on crash)
 
 ### Gameplay Features
 - Road curves: overlapping sine waves creating smooth S-curves
+- Road hills: sine-wave vertical undulation for depth
 - Road edge collision: bounce off walls at ±14 units, half speed penalty
-- Traffic: 8 AI cars, difficulty scales with distance (tighter spacing, faster)
-- Takedowns: hit obstacle → speed boost + flash + boost meter +25
-- Near-miss: pass within 5 units → gradual boost fill
-- Boost: hold Shift to drain meter for +50% max speed, exhaust flames
+- Same-dir traffic (8 cars): TAKEDOWN on collision → speed boost + white flash + boost +25
+- Oncoming traffic (4 cars): CRASH on head-on → 85% speed loss + red flash + screen shake
+- Near-miss: pass within 5 units → gradual boost fill (faster for oncoming)
+- Boost: hold Shift or gamepad A/RB to drain meter for +50% max speed, exhaust flames
+- Difficulty scales with distance (tighter spacing, faster cars over 5000m)
 - Distance counter displayed in window title
 
 ### Next Steps
@@ -83,8 +89,12 @@ Game boots, loads, runs gameplay loop in state 4. Pseudo-3D OutRun-style driving
 ### Key Input Addresses
 - Accumulators: 0x4D652C (throttle), 0x4D6530 (steering) - written by game_frame_pump()
 - Car object: 0x557880 (esi in sub_000636D0), +0x1B4 → velocity ptr (= 0x5FFF00)
-- Boost button: 0x5FFD0C (from VK_SHIFT in game_frame_pump)
+- Boost button: 0x5FFD0C (from VK_SHIFT or gamepad A/RB in game_frame_pump)
 - Button events: 0x4A1C74-0x4A1C79 (processed by sub_00013F10)
+
+### Controls
+- **Keyboard**: WASD = drive, Shift = boost, ESC = quit
+- **Gamepad**: Left stick = steer, RT/LT = gas/brake, A or RB = boost
 
 ### Gen File Patches (must re-apply after regen)
 1. **recomp_0000.c**: extern g_tick_110e0_count, sub_000165F0 entry/ESP traces, sub_00015570 vtable guard, sub_0003D9E0 #if 0, **sub_000636D0 #if 0**, jump table→C switch (replace_all), state traces, exit path traces, case 3 traces
