@@ -1625,6 +1625,15 @@ void sub_000110E0(void)
             float new_px = MEMF(phys_ptr + 0x10) + dx;
             float new_py = MEMF(phys_ptr + 0x14) + dy;
 
+            /* Centripetal force from road curves.
+             * Road curve value (set by renderer) at 0x5FFD10. Positive = right curve.
+             * Car drifts outward on curves proportional to speed². */
+            {
+                float road_curve = MEMF(0x5FFD10);
+                float centripetal = road_curve * speed * speed * 0.0003f;
+                new_px += centripetal * dt;
+            }
+
             /* Road edge collision: road is 30 units wide centered at x=0.
              * Car half-width is ~1 unit, so effective edge at ±14. */
             {

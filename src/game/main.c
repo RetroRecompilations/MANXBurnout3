@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <dbghelp.h>
 #include <xinput.h>
 #pragma comment(lib, "dbghelp.lib")
@@ -1274,6 +1275,37 @@ void game_frame_pump(void)
                 #define PROJ_Y(d) (HORIZON + CAM_H * FOCAL / (d))
                 #define PROJ_SCALE(d) (FOCAL / (d))
 
+                /* Road curve function: overlapping sine waves for S-curves.
+                 * Returns a curvature value (positive = road bends right). */
+                #define ROAD_CURVE(world_y) \
+                    (sinf((world_y) * 0.008f) * 0.5f + sinf((world_y) * 0.022f) * 0.2f)
+
+                /* Pre-compute curve offsets for each segment boundary.
+                 * These accumulate in screen-space pixels so far segments
+                 * appear shifted laterally, creating a curved road illusion. */
+                #define ROAD_SEGS 50
+                float curve_offsets[ROAD_SEGS + 1];
+                {
+                    int ci;
+                    curve_offsets[0] = 0.0f;
+                    for (ci = 0; ci < ROAD_SEGS; ci++) {
+                        float ct0 = (float)ci / ROAD_SEGS;
+                        float ct1 = (float)(ci + 1) / ROAD_SEGS;
+                        float cd0 = 2.0f + ct0 * ct0 * VIEW_DIST;
+                        float cd1 = 2.0f + ct1 * ct1 * VIEW_DIST;
+                        float cwy = py + (cd0 + cd1) * 0.5f;
+                        float curve = ROAD_CURVE(cwy);
+                        float scale = FOCAL / ((cd0 + cd1) * 0.5f);
+                        curve_offsets[ci + 1] = curve_offsets[ci] + curve * scale * 20.0f;
+                    }
+                }
+
+                /* Store road curve at player position for physics (centripetal force) */
+                {
+                    float player_curve = ROAD_CURVE(py);
+                    *(volatile float*)((uintptr_t)0x5FFD10 + g_xbox_mem_offset) = player_curve;
+                }
+
                 /* Set render state */
                 g_d3d_device->lpVtbl->SetVertexShader(g_d3d_device,
                     D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
@@ -1301,9 +1333,47 @@ void game_frame_pump(void)
                         D3DPT_TRIANGLELIST, 2, sky, sizeof(RHW_VERT));
                 }
 
+                /* ── Horizon scenery (mountain silhouettes) ─────────── */
+                {
+                    /* Simple mountain range: triangles along the horizon.
+                     * Heights vary by a sine pattern offset by player position
+                     * so they appear to slowly shift as you drive. */
+                    #define MTN_COUNT 12
+                    DWORD mtn_col = 0xFF304060; /* dark blue-grey */
+                    RHW_VERT mtn_verts[MTN_COUNT * 3];
+                    int mi;
+                    for (mi = 0; mi < MTN_COUNT; mi++) {
+                        float base_x = (float)mi / MTN_COUNT * SW - 30.0f;
+                        float width = SW / MTN_COUNT * 1.4f;
+                        /* Height varies with a pseudo-random pattern */
+                        float h = 20.0f + 35.0f * sinf((float)mi * 2.3f + py * 0.0002f);
+                        float peak_x = base_x + width * 0.5f + 10.0f * sinf((float)mi * 1.7f);
+                        mtn_verts[mi * 3 + 0] = (RHW_VERT){base_x, HORIZON, 0.98f, 1.0f, mtn_col};
+                        mtn_verts[mi * 3 + 1] = (RHW_VERT){peak_x, HORIZON - h, 0.98f, 1.0f, mtn_col};
+                        mtn_verts[mi * 3 + 2] = (RHW_VERT){base_x + width, HORIZON, 0.98f, 1.0f, mtn_col};
+                    }
+                    g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                        D3DPT_TRIANGLELIST, MTN_COUNT, mtn_verts, sizeof(RHW_VERT));
+                    #undef MTN_COUNT
+                }
+
+                /* ── Ground plane (grass on both sides of road) ─────── */
+                {
+                    DWORD grass_col = 0xFF1A3318; /* dark green */
+                    RHW_VERT grass[6] = {
+                        {0.0f, HORIZON, 0.95f, 1.0f, grass_col},
+                        {SW,   HORIZON, 0.95f, 1.0f, grass_col},
+                        {0.0f, SH,      0.95f, 1.0f, grass_col},
+                        {SW,   HORIZON, 0.95f, 1.0f, grass_col},
+                        {SW,   SH,      0.95f, 1.0f, grass_col},
+                        {0.0f, SH,      0.95f, 1.0f, grass_col},
+                    };
+                    g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                        D3DPT_TRIANGLELIST, 2, grass, sizeof(RHW_VERT));
+                }
+
                 /* ── Road segments (perspective trapezoids) ──────────── */
                 {
-                    #define ROAD_SEGS 50
                     /* Build all road segment vertices in one array for batched draw */
                     RHW_VERT road_verts[ROAD_SEGS * 6];
                     int vi = 0;
@@ -1321,9 +1391,12 @@ void game_frame_pump(void)
                         if (y0 < HORIZON || y1 > SH) continue;
                         if (y0 > SH) y0 = SH;
 
-                        /* Road edges at near and far */
-                        float lx0 = PROJ_X(-ROAD_HW, d0), rx0 = PROJ_X(ROAD_HW, d0);
-                        float lx1 = PROJ_X(-ROAD_HW, d1), rx1 = PROJ_X(ROAD_HW, d1);
+                        /* Road edges with curve offset */
+                        float co0 = curve_offsets[si], co1 = curve_offsets[si + 1];
+                        float lx0 = PROJ_X(-ROAD_HW, d0) + co0;
+                        float rx0 = PROJ_X(ROAD_HW, d0) + co0;
+                        float lx1 = PROJ_X(-ROAD_HW, d1) + co1;
+                        float rx1 = PROJ_X(ROAD_HW, d1) + co1;
 
                         /* Alternating road color based on world distance (rumble strips) */
                         float world_d = py + (d0 + d1) * 0.5f;
@@ -1357,16 +1430,18 @@ void game_frame_pump(void)
                             if (y0 < HORIZON || y1 > SH) continue;
                             if (y0 > SH) y0 = SH;
 
+                            float co0 = curve_offsets[si], co1 = curve_offsets[si + 1];
                             float scale0 = PROJ_SCALE(d0);
                             float scale1 = PROJ_SCALE(d1);
-                            float ew0 = 0.6f * scale0, ew1 = 0.6f * scale1; /* edge line width */
+                            float ew0 = 0.6f * scale0, ew1 = 0.6f * scale1;
 
                             float world_d = py + (d0 + d1) * 0.5f;
                             int stripe = ((int)(world_d / 3.0f)) & 1;
                             DWORD edge_col = stripe ? 0xFFCC2222 : 0xFFCCCCCC;
 
                             /* Left edge line */
-                            float le0 = PROJ_X(-ROAD_HW, d0), le1 = PROJ_X(-ROAD_HW, d1);
+                            float le0 = PROJ_X(-ROAD_HW, d0) + co0;
+                            float le1 = PROJ_X(-ROAD_HW, d1) + co1;
                             line_verts[lvi++] = (RHW_VERT){le0-ew0, y0, 0.8f, 1.0f, edge_col};
                             line_verts[lvi++] = (RHW_VERT){le0+ew0, y0, 0.8f, 1.0f, edge_col};
                             line_verts[lvi++] = (RHW_VERT){le1-ew1, y1, 0.8f, 1.0f, edge_col};
@@ -1375,7 +1450,8 @@ void game_frame_pump(void)
                             line_verts[lvi++] = (RHW_VERT){le1-ew1, y1, 0.8f, 1.0f, edge_col};
 
                             /* Right edge line */
-                            float re0 = PROJ_X(ROAD_HW, d0), re1 = PROJ_X(ROAD_HW, d1);
+                            float re0 = PROJ_X(ROAD_HW, d0) + co0;
+                            float re1 = PROJ_X(ROAD_HW, d1) + co1;
                             line_verts[lvi++] = (RHW_VERT){re0-ew0, y0, 0.8f, 1.0f, edge_col};
                             line_verts[lvi++] = (RHW_VERT){re0+ew0, y0, 0.8f, 1.0f, edge_col};
                             line_verts[lvi++] = (RHW_VERT){re1-ew1, y1, 0.8f, 1.0f, edge_col};
@@ -1388,9 +1464,10 @@ void game_frame_pump(void)
                             float phase = fmodf(seg_world, 7.0f);
                             if (phase < 0) phase += 7.0f;
                             if (phase < 3.5f) {
-                                DWORD dash_col = 0xFFDDDD44; /* yellow */
+                                DWORD dash_col = 0xFFDDDD44;
                                 float dw0 = 0.3f * scale0, dw1 = 0.3f * scale1;
-                                float cx0 = PROJ_X(0.0f, d0), cx1 = PROJ_X(0.0f, d1);
+                                float cx0 = PROJ_X(0.0f, d0) + co0;
+                                float cx1 = PROJ_X(0.0f, d1) + co1;
                                 line_verts[lvi++] = (RHW_VERT){cx0-dw0, y0, 0.7f, 1.0f, dash_col};
                                 line_verts[lvi++] = (RHW_VERT){cx0+dw0, y0, 0.7f, 1.0f, dash_col};
                                 line_verts[lvi++] = (RHW_VERT){cx1-dw1, y1, 0.7f, 1.0f, dash_col};
@@ -1404,7 +1481,6 @@ void game_frame_pump(void)
                                 D3DPT_TRIANGLELIST, lvi / 3, line_verts, sizeof(RHW_VERT));
                         }
                     }
-                    #undef ROAD_SEGS
                 }
 
                 /* ── Traffic obstacles (perspective projected) ───────── */
@@ -1424,8 +1500,24 @@ void game_frame_pump(void)
                         float dist = oy - py;
                         if (dist < 1.0f || dist > VIEW_DIST) continue;
 
+                        /* Interpolate curve offset for this distance.
+                         * Find which road segment this distance falls in and lerp. */
+                        float obs_co = 0.0f;
+                        {
+                            /* Inverse of d = 2 + t*t*VIEW_DIST → t = sqrt((d-2)/VIEW_DIST) */
+                            float t_obs = 0.0f;
+                            if (dist > 2.0f)
+                                t_obs = sqrtf((dist - 2.0f) / VIEW_DIST);
+                            if (t_obs > 1.0f) t_obs = 1.0f;
+                            float seg_f = t_obs * ROAD_SEGS;
+                            int seg_i = (int)seg_f;
+                            if (seg_i >= ROAD_SEGS) seg_i = ROAD_SEGS - 1;
+                            float frac = seg_f - (float)seg_i;
+                            obs_co = curve_offsets[seg_i] * (1.0f - frac) + curve_offsets[seg_i + 1] * frac;
+                        }
+
                         /* Project to screen */
-                        float sx = PROJ_X(ox, dist);
+                        float sx = PROJ_X(ox, dist) + obs_co;
                         float sy = PROJ_Y(dist);
                         float scale = PROJ_SCALE(dist);
 
@@ -1645,6 +1737,8 @@ void game_frame_pump(void)
                     }
                 }
 
+                #undef ROAD_SEGS
+                #undef ROAD_CURVE
                 #undef PROJ_X
                 #undef PROJ_Y
                 #undef PROJ_SCALE
