@@ -34,32 +34,54 @@ The goal is to translate the original x86 Xbox code into a native Windows execut
 - Addresses are always shown as hex with 0x prefix (e.g., 0x001D2807)
 - Xbox kernel function names use their original Xbox names with `xbox_` prefix when reimplemented
 
-## Current Work State (Session 17)
+## Current Work State (Session 18)
 
-### Status: Physics force computation FIXED
-Game boots, loads, runs gameplay loop in state 4 with ~18 ticks/sec. Car velocity now responds to input via overridden sub_000636D0. Two issues were resolved:
+### Status: Car physics model + visual driving demo WORKING
+Game boots, loads, runs gameplay loop in state 4. Car has proper heading/speed physics with drag deceleration and speed-dependent steering. Top-down D3D8 rendering shows rotated car, road, and speed HUD.
 
-1. **Physics body pointer was NULL**: MEM32(esi+0x1B4)=0 because game's physics world init doesn't run. Fixed by allocating fake physics body at Xbox address 0x5FFF00.
-2. **Scale factors were garbage**: Memory values at 0x557870/0x3B1C40/0x5592C8/0x3B1C38 contained denormalized floats (~2e-6), making forces effectively zero. Fixed by using hardcoded sensible scales (0.001 sensitivity, 1.0 multiplier).
+### Physics Model (sub_000636D0 + sub_000110E0)
+- **Heading angle** stored at fake physics body +0x18 (radians, 0=north, CW positive)
+- **Scalar speed** at +0x1C (units/s, max 50, drag coefficient 0.8)
+- W/S: forward/reverse acceleration along heading direction
+- A/D: steering rotation (rate scales with speed - can't turn when stopped)
+- Drag decelerates car when not pressing gas
+- Position integrated in sub_000110E0: pos += speed * heading_dir * dt
 
-### Verified Working
-- Keyboard W/A/S/D → throttle/steering accumulators → sub_000636D0 → velocity at 0x5FFF00+8/0xC
-- force = raw_input * 0.001 * 1.0 (e.g., W key: 255 * 0.001 = 0.255 units/tick)
-- Window title displays live velocity from fake physics body
-- Boost state machine preserved (currently in state 6, boost flag active)
+### D3D8 Rendering (main.c)
+- Top-down camera follows car position (world-to-screen transform)
+- Car: rotated rectangle with red hood triangle showing front
+- Road: dark asphalt strip, white edge lines, yellow center dashes (scroll)
+- HUD: speed bar (green forward, red reverse) in bottom-left
+- Fixed FVF input layout for D3D11 (dummy elements for missing semantics)
+- Fixed D3DCOLOR format (R8G8B8A8_UNORM + BGRA→RGBA shader swizzle)
+
+### Fake Physics Body Layout (0x5FFF00)
+- +0x08: forward acceleration (set by sub_000636D0)
+- +0x0C: turn rate (set by sub_000636D0)
+- +0x10: pos_x (world, set by sub_000110E0)
+- +0x14: pos_y (world, set by sub_000110E0)
+- +0x18: heading (radians)
+- +0x1C: speed (scalar, units/s)
+
+### Gameplay Features
+- Road edge collision: car bounces off walls at ±14 units, loses half speed
+- Traffic obstacles: 8 AI cars in random lanes, varying speeds (3-10 u/s)
+- Takedown mechanic: hitting obstacle = speed boost + takedown counter
+- Takedown flash: white screen flash (0.5s fade-out) on hit
+- Takedown HUD: red pip counter in top-right corner
+- Speed bar: green (forward) / red (reverse) in bottom-left
+- D3D8 alpha blending for flash overlay
 
 ### Next Steps
-1. Verify with interactive keyboard/gamepad input (press W to see velocity change)
-2. Investigate position integration: does velocity at 0x5FFF00 actually move the car entity?
-3. The game's position update code needs to read from MEM32(esi+0x1B4) → our fake body
-4. Consider hooking the position update to display car movement on screen
-5. Long-term: fix the real physics world initialization so the proper physics body is created
+1. Add 3D perspective rendering (camera behind car)
+2. Add more gameplay mechanics (boost meter, crash physics)
+3. Long-term: fix the real physics world initialization
+4. Long-term: hook into RenderWare scene graph for actual 3D rendering
 
 ### Key Input Addresses
 - Accumulators: 0x4D652C (throttle), 0x4D6530 (steering) - written by game_frame_pump()
-- Physics vel: MEM32(0x5FFF00+8) (X), MEM32(0x5FFF00+0xC) (Y) - fake physics body
 - Car object: 0x557880 (esi in sub_000636D0), +0x1B4 → velocity ptr (= 0x5FFF00)
-- Boost: MEM8(0x4A4B90) flag, MEM32(0x557880+0x1E4) state (currently 6)
+- Boost: MEM8(0x4A4B90) flag, MEM32(0x557880+0x1E4) state
 - Button events: 0x4A1C74-0x4A1C79 (processed by sub_00013F10)
 
 ### Gen File Patches (must re-apply after regen)
