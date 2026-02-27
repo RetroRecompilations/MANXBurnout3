@@ -1658,14 +1658,16 @@ void sub_000110E0(void)
             MEMF(phys_ptr + 0x1C) = speed;
 
             /* ── Traffic obstacles ──────────────────────────────────── */
-            /* Obstacle array at 0x5FFE00: 8 slots × 16 bytes each.
+            /* Obstacle array at 0x5FFE00: 12 slots × 16 bytes each.
              * Layout per slot: +0 pos_x (float), +4 pos_y (float),
-             *                  +8 speed (float), +C flags (uint32_t: bit 0=active)
-             * Obstacles spawn ahead of the player and move forward slowly.
-             * Player hitting an obstacle = TAKEDOWN (speed boost + score). */
+             *   +8 speed (float, negative=oncoming), +C flags (uint32_t)
+             * Flags: bit 0=active, bit 1=oncoming
+             * Slots 0-7: same-direction traffic (positive speed)
+             * Slots 8-11: oncoming traffic (negative speed, left lanes) */
             {
                 #define OBS_BASE   0x5FFE00
-                #define OBS_COUNT  8
+                #define OBS_COUNT  12
+                #define OBS_SAME   8
                 #define OBS_SIZE   16
                 #define OBS_ADDR(i, off) (OBS_BASE + (i) * OBS_SIZE + (off))
                 static int _obs_init = 0;
@@ -1676,10 +1678,7 @@ void sub_000110E0(void)
                 /* Simple LCG PRNG for obstacle placement */
                 #define OBS_RAND() (_obs_seed = _obs_seed * 1103515245 + 12345, (_obs_seed >> 16) & 0x7FFF)
 
-                /* Difficulty scaling: obstacle spawn distance decreases,
-                 * obstacle speed variation increases with distance traveled.
-                 * At 0m: spawn gap 80-140, speeds 3-10
-                 * At 5000m: spawn gap 40-80, speeds 3-18 */
+                /* Difficulty scaling */
                 float difficulty = new_py * 0.0001f;
                 if (difficulty > 1.0f) difficulty = 1.0f;
                 if (difficulty < 0.0f) difficulty = 0.0f;
@@ -1693,35 +1692,55 @@ void sub_000110E0(void)
                 /* Initialize obstacles on first call */
                 if (!_obs_init) {
                     _obs_init = 1;
-                    for (oi = 0; oi < OBS_COUNT; oi++) {
+                    /* Same-direction traffic (slots 0-7) */
+                    for (oi = 0; oi < OBS_SAME; oi++) {
                         float lane = ((float)(OBS_RAND() % 5) - 2.0f) * 5.0f;
                         float ahead = 30.0f + (float)(OBS_RAND() % 80);
-                        MEMF(OBS_ADDR(oi, 0)) = lane;           /* pos_x */
-                        MEMF(OBS_ADDR(oi, 4)) = new_py + ahead; /* pos_y */
-                        MEMF(OBS_ADDR(oi, 8)) = 3.0f + (float)(OBS_RAND() % 5); /* speed */
-                        MEM32(OBS_ADDR(oi, 0xC)) = 1;           /* active */
+                        MEMF(OBS_ADDR(oi, 0)) = lane;
+                        MEMF(OBS_ADDR(oi, 4)) = new_py + ahead;
+                        MEMF(OBS_ADDR(oi, 8)) = 3.0f + (float)(OBS_RAND() % 5);
+                        MEM32(OBS_ADDR(oi, 0xC)) = 1; /* active, same-dir */
+                    }
+                    /* Oncoming traffic (slots 8-11): left lanes, negative speed */
+                    for (oi = OBS_SAME; oi < OBS_COUNT; oi++) {
+                        float lane = -5.0f - (float)(OBS_RAND() % 3) * 3.0f; /* -5, -8, -11 */
+                        float ahead = 60.0f + (float)(OBS_RAND() % 100);
+                        MEMF(OBS_ADDR(oi, 0)) = lane;
+                        MEMF(OBS_ADDR(oi, 4)) = new_py + ahead;
+                        MEMF(OBS_ADDR(oi, 8)) = -(10.0f + (float)(OBS_RAND() % 8)); /* negative = toward player */
+                        MEM32(OBS_ADDR(oi, 0xC)) = 3; /* active + oncoming */
                     }
                 }
 
                 /* Update and collide each obstacle */
                 for (oi = 0; oi < OBS_COUNT; oi++) {
-                    if (MEM32(OBS_ADDR(oi, 0xC)) == 0) continue; /* inactive */
+                    uint32_t flags = MEM32(OBS_ADDR(oi, 0xC));
+                    if ((flags & 1) == 0) continue; /* inactive */
+                    int is_oncoming = (flags & 2) != 0;
 
                     float ox = MEMF(OBS_ADDR(oi, 0));
                     float oy = MEMF(OBS_ADDR(oi, 4));
                     float os = MEMF(OBS_ADDR(oi, 8));
 
-                    /* Move obstacle forward at its own speed */
+                    /* Move obstacle at its own speed */
                     oy += os * dt;
                     MEMF(OBS_ADDR(oi, 4)) = oy;
 
-                    /* Recycle if too far behind player */
-                    if (oy < new_py - 60.0f) {
-                        float lane = ((float)(OBS_RAND() % 5) - 2.0f) * 5.0f;
-                        float ahead = spawn_base + (float)(OBS_RAND() % (int)(spawn_range + 1.0f));
-                        MEMF(OBS_ADDR(oi, 0)) = lane;
-                        MEMF(OBS_ADDR(oi, 4)) = new_py + ahead;
-                        MEMF(OBS_ADDR(oi, 8)) = 3.0f + (float)(OBS_RAND() % (int)(speed_range + 1.0f));
+                    /* Recycle if too far behind (or ahead for oncoming that passed) */
+                    if (oy < new_py - 60.0f || (is_oncoming && oy < new_py - 30.0f)) {
+                        if (is_oncoming) {
+                            float lane = -5.0f - (float)(OBS_RAND() % 3) * 3.0f;
+                            float ahead = spawn_base + 40.0f + (float)(OBS_RAND() % (int)(spawn_range + 1.0f));
+                            MEMF(OBS_ADDR(oi, 0)) = lane;
+                            MEMF(OBS_ADDR(oi, 4)) = new_py + ahead;
+                            MEMF(OBS_ADDR(oi, 8)) = -(10.0f + (float)(OBS_RAND() % (int)(speed_range + 1.0f)));
+                        } else {
+                            float lane = ((float)(OBS_RAND() % 5) - 2.0f) * 5.0f;
+                            float ahead = spawn_base + (float)(OBS_RAND() % (int)(spawn_range + 1.0f));
+                            MEMF(OBS_ADDR(oi, 0)) = lane;
+                            MEMF(OBS_ADDR(oi, 4)) = new_py + ahead;
+                            MEMF(OBS_ADDR(oi, 8)) = 3.0f + (float)(OBS_RAND() % (int)(speed_range + 1.0f));
+                        }
                         continue;
                     }
 
@@ -1731,42 +1750,49 @@ void sub_000110E0(void)
                     float abs_rx = rel_x < 0 ? -rel_x : rel_x;
                     float abs_ry = rel_y < 0 ? -rel_y : rel_y;
                     if (abs_rx < 3.0f && abs_ry < 4.5f) {
-                        /* TAKEDOWN! */
+                        /* TAKEDOWN! Oncoming = bigger bonus */
                         _takedown_count++;
-                        /* Respawn obstacle far ahead (difficulty-scaled) */
-                        float lane = ((float)(OBS_RAND() % 5) - 2.0f) * 5.0f;
-                        MEMF(OBS_ADDR(oi, 0)) = lane;
-                        MEMF(OBS_ADDR(oi, 4)) = new_py + spawn_base + 20.0f + (float)(OBS_RAND() % (int)(spawn_range + 1.0f));
-                        MEMF(OBS_ADDR(oi, 8)) = 3.0f + (float)(OBS_RAND() % (int)(speed_range + 1.0f));
+                        /* Respawn */
+                        if (is_oncoming) {
+                            float lane = -5.0f - (float)(OBS_RAND() % 3) * 3.0f;
+                            MEMF(OBS_ADDR(oi, 0)) = lane;
+                            MEMF(OBS_ADDR(oi, 4)) = new_py + spawn_base + 60.0f + (float)(OBS_RAND() % (int)(spawn_range + 1.0f));
+                            MEMF(OBS_ADDR(oi, 8)) = -(10.0f + (float)(OBS_RAND() % (int)(speed_range + 1.0f)));
+                        } else {
+                            float lane = ((float)(OBS_RAND() % 5) - 2.0f) * 5.0f;
+                            MEMF(OBS_ADDR(oi, 0)) = lane;
+                            MEMF(OBS_ADDR(oi, 4)) = new_py + spawn_base + 20.0f + (float)(OBS_RAND() % (int)(spawn_range + 1.0f));
+                            MEMF(OBS_ADDR(oi, 8)) = 3.0f + (float)(OBS_RAND() % (int)(speed_range + 1.0f));
+                        }
 
-                        /* Speed boost on takedown */
-                        speed += 5.0f;
+                        /* Speed boost: bigger for oncoming */
+                        speed += is_oncoming ? 8.0f : 5.0f;
                         if (speed > 50.0f) speed = 50.0f;
                         MEMF(phys_ptr + 0x1C) = speed;
 
-                        /* Store takedown count and flash timer for HUD */
                         MEM32(0x5FFD00) = _takedown_count;
-                        MEMF(0x5FFD04) = 0.5f; /* flash timer */
+                        MEMF(0x5FFD04) = is_oncoming ? 0.7f : 0.5f; /* bigger flash */
 
-                        /* Boost meter: +25 on takedown */
+                        /* Boost meter: +35 oncoming, +25 normal */
                         float boost = MEMF(0x5FFD08);
-                        boost += 25.0f;
+                        boost += is_oncoming ? 35.0f : 25.0f;
                         if (boost > 100.0f) boost = 100.0f;
                         MEMF(0x5FFD08) = boost;
                     }
-                    /* Near-miss detection: within 5 world units lateral
-                     * but outside collision range, and obstacle is ahead */
+                    /* Near-miss detection */
                     else if (abs_rx < 5.0f && abs_ry < 6.0f && abs_ry > 2.0f
                              && speed > 5.0f) {
-                        /* Near miss! +5 boost */
                         float boost = MEMF(0x5FFD08);
-                        boost += 5.0f * dt * 10.0f; /* gradual fill while passing */
+                        /* Oncoming near-miss fills faster */
+                        float fill = is_oncoming ? 8.0f : 5.0f;
+                        boost += fill * dt * 10.0f;
                         if (boost > 100.0f) boost = 100.0f;
                         MEMF(0x5FFD08) = boost;
                     }
                 }
                 #undef OBS_BASE
                 #undef OBS_COUNT
+                #undef OBS_SAME
                 #undef OBS_SIZE
                 #undef OBS_ADDR
                 #undef OBS_RAND

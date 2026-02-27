@@ -1280,23 +1280,30 @@ void game_frame_pump(void)
                 #define ROAD_CURVE(world_y) \
                     (sinf((world_y) * 0.008f) * 0.5f + sinf((world_y) * 0.022f) * 0.2f)
 
-                /* Pre-compute curve offsets for each segment boundary.
+                /* Road hill function: sine waves for gentle ups and downs.
+                 * Returns a vertical offset (positive = uphill). */
+                #define ROAD_HILL(world_y) \
+                    (sinf((world_y) * 0.005f) * 0.3f + sinf((world_y) * 0.013f) * 0.15f)
+
+                /* Pre-compute curve and hill offsets for each segment boundary.
                  * These accumulate in screen-space pixels so far segments
-                 * appear shifted laterally, creating a curved road illusion. */
+                 * appear shifted, creating curved and hilly road illusion. */
                 #define ROAD_SEGS 50
                 float curve_offsets[ROAD_SEGS + 1];
+                float hill_offsets[ROAD_SEGS + 1];
                 {
                     int ci;
                     curve_offsets[0] = 0.0f;
+                    hill_offsets[0] = 0.0f;
                     for (ci = 0; ci < ROAD_SEGS; ci++) {
                         float ct0 = (float)ci / ROAD_SEGS;
                         float ct1 = (float)(ci + 1) / ROAD_SEGS;
                         float cd0 = 2.0f + ct0 * ct0 * VIEW_DIST;
                         float cd1 = 2.0f + ct1 * ct1 * VIEW_DIST;
                         float cwy = py + (cd0 + cd1) * 0.5f;
-                        float curve = ROAD_CURVE(cwy);
                         float scale = FOCAL / ((cd0 + cd1) * 0.5f);
-                        curve_offsets[ci + 1] = curve_offsets[ci] + curve * scale * 20.0f;
+                        curve_offsets[ci + 1] = curve_offsets[ci] + ROAD_CURVE(cwy) * scale * 20.0f;
+                        hill_offsets[ci + 1] = hill_offsets[ci] + ROAD_HILL(cwy) * scale * 15.0f;
                     }
                 }
 
@@ -1385,10 +1392,11 @@ void game_frame_pump(void)
                         float d0 = 2.0f + t0 * t0 * VIEW_DIST;
                         float d1 = 2.0f + t1 * t1 * VIEW_DIST;
 
-                        /* Screen Y for near and far edges */
-                        float y0 = PROJ_Y(d0);
-                        float y1 = PROJ_Y(d1);
-                        if (y0 < HORIZON || y1 > SH) continue;
+                        /* Screen Y for near and far edges, with hill offset */
+                        float ho0 = hill_offsets[si], ho1 = hill_offsets[si + 1];
+                        float y0 = PROJ_Y(d0) - ho0;
+                        float y1 = PROJ_Y(d1) - ho1;
+                        if (y0 < HORIZON - 30.0f || y1 > SH) continue;
                         if (y0 > SH) y0 = SH;
 
                         /* Road edges with curve offset */
@@ -1425,9 +1433,10 @@ void game_frame_pump(void)
                             float t1 = (float)(si + 1) / ROAD_SEGS;
                             float d0 = 2.0f + t0 * t0 * VIEW_DIST;
                             float d1 = 2.0f + t1 * t1 * VIEW_DIST;
-                            float y0 = PROJ_Y(d0);
-                            float y1 = PROJ_Y(d1);
-                            if (y0 < HORIZON || y1 > SH) continue;
+                            float ho0 = hill_offsets[si], ho1 = hill_offsets[si + 1];
+                            float y0 = PROJ_Y(d0) - ho0;
+                            float y1 = PROJ_Y(d1) - ho1;
+                            if (y0 < HORIZON - 30.0f || y1 > SH) continue;
                             if (y0 > SH) y0 = SH;
 
                             float co0 = curve_offsets[si], co1 = curve_offsets[si + 1];
@@ -1486,13 +1495,16 @@ void game_frame_pump(void)
                 /* ── Traffic obstacles (perspective projected) ───────── */
                 {
                     #define OBS_BASE   0x5FFE00
-                    #define OBS_COUNT  8
+                    #define OBS_COUNT  12
                     #define OBS_SIZE   16
                     #define OBS_ADDR(i, off) (OBS_BASE + (i) * OBS_SIZE + (off))
+                    /* Same-dir: warm colors, Oncoming: cool/bright colors */
                     DWORD obs_colors[4] = { 0xFFFF6633, 0xFF33CCFF, 0xFFFFCC33, 0xFF66FF66 };
+                    DWORD onc_colors[4] = { 0xFFFF2244, 0xFFDD44FF, 0xFFFF8800, 0xFFFF4466 };
                     int oi;
                     for (oi = 0; oi < OBS_COUNT; oi++) {
-                        if (_R_MEM32(OBS_ADDR(oi, 0xC)) == 0) continue;
+                        uint32_t flags = _R_MEM32(OBS_ADDR(oi, 0xC));
+                        if ((flags & 1) == 0) continue;
                         float ox = _R_MEMF(OBS_ADDR(oi, 0));
                         float oy = _R_MEMF(OBS_ADDR(oi, 4));
 
@@ -1500,9 +1512,8 @@ void game_frame_pump(void)
                         float dist = oy - py;
                         if (dist < 1.0f || dist > VIEW_DIST) continue;
 
-                        /* Interpolate curve offset for this distance.
-                         * Find which road segment this distance falls in and lerp. */
-                        float obs_co = 0.0f;
+                        /* Interpolate curve and hill offsets for this distance. */
+                        float obs_co = 0.0f, obs_ho = 0.0f;
                         {
                             /* Inverse of d = 2 + t*t*VIEW_DIST → t = sqrt((d-2)/VIEW_DIST) */
                             float t_obs = 0.0f;
@@ -1514,19 +1525,21 @@ void game_frame_pump(void)
                             if (seg_i >= ROAD_SEGS) seg_i = ROAD_SEGS - 1;
                             float frac = seg_f - (float)seg_i;
                             obs_co = curve_offsets[seg_i] * (1.0f - frac) + curve_offsets[seg_i + 1] * frac;
+                            obs_ho = hill_offsets[seg_i] * (1.0f - frac) + hill_offsets[seg_i + 1] * frac;
                         }
 
                         /* Project to screen */
                         float sx = PROJ_X(ox, dist) + obs_co;
-                        float sy = PROJ_Y(dist);
+                        float sy = PROJ_Y(dist) - obs_ho;
                         float scale = PROJ_SCALE(dist);
 
                         /* Cull off-screen */
                         if (sx < -40.0f || sx > SW+40.0f || sy < HORIZON || sy > SH) continue;
 
                         /* Car rectangle scaled by perspective */
+                        int is_oncoming = (flags & 2) != 0;
                         float ohw = 2.0f * scale, ohh = 3.0f * scale;
-                        DWORD oc = obs_colors[oi & 3];
+                        DWORD oc = is_oncoming ? onc_colors[oi & 3] : obs_colors[oi & 3];
                         /* Car body */
                         RHW_VERT obs[6] = {
                             {sx-ohw, sy-ohh, 0.4f, 1.0f, oc},
@@ -1551,6 +1564,31 @@ void game_frame_pump(void)
                         };
                         g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
                             D3DPT_TRIANGLELIST, 2, ws, sizeof(RHW_VERT));
+                        /* Headlights on oncoming cars */
+                        if (is_oncoming) {
+                            DWORD hl = 0xFFFFFF88; /* bright yellow-white */
+                            float hlw = ohw * 0.25f, hlh = ohh * 0.15f;
+                            RHW_VERT hl_l[6] = {
+                                {sx-ohw*0.6f-hlw, sy-hlh, 0.33f, 1.0f, hl},
+                                {sx-ohw*0.6f+hlw, sy-hlh, 0.33f, 1.0f, hl},
+                                {sx-ohw*0.6f-hlw, sy+hlh, 0.33f, 1.0f, hl},
+                                {sx-ohw*0.6f+hlw, sy-hlh, 0.33f, 1.0f, hl},
+                                {sx-ohw*0.6f+hlw, sy+hlh, 0.33f, 1.0f, hl},
+                                {sx-ohw*0.6f-hlw, sy+hlh, 0.33f, 1.0f, hl},
+                            };
+                            RHW_VERT hl_r[6] = {
+                                {sx+ohw*0.6f-hlw, sy-hlh, 0.33f, 1.0f, hl},
+                                {sx+ohw*0.6f+hlw, sy-hlh, 0.33f, 1.0f, hl},
+                                {sx+ohw*0.6f-hlw, sy+hlh, 0.33f, 1.0f, hl},
+                                {sx+ohw*0.6f+hlw, sy-hlh, 0.33f, 1.0f, hl},
+                                {sx+ohw*0.6f+hlw, sy+hlh, 0.33f, 1.0f, hl},
+                                {sx+ohw*0.6f-hlw, sy+hlh, 0.33f, 1.0f, hl},
+                            };
+                            g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                D3DPT_TRIANGLELIST, 2, hl_l, sizeof(RHW_VERT));
+                            g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                D3DPT_TRIANGLELIST, 2, hl_r, sizeof(RHW_VERT));
+                        }
                     }
                     #undef OBS_BASE
                     #undef OBS_COUNT
@@ -1812,6 +1850,7 @@ void game_frame_pump(void)
 
                 #undef ROAD_SEGS
                 #undef ROAD_CURVE
+                #undef ROAD_HILL
                 #undef PROJ_X
                 #undef PROJ_Y
                 #undef PROJ_SCALE
