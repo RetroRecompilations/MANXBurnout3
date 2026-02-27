@@ -1232,60 +1232,118 @@ void game_frame_pump(void)
         #undef XINP_MEM8
     }
 
-    /* Render frame */
+    /* Render frame with car indicator */
     if (g_d3d_device) {
         g_d3d_device->lpVtbl->BeginScene(g_d3d_device);
         g_d3d_device->lpVtbl->Clear(g_d3d_device, 0, NULL,
             D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER,
-            0xFF001030, /* Dark blue */
+            0xFF102040, /* Dark blue-grey */
             1.0f, 0);
+
+        /* Draw car indicator using D3D8 pre-transformed vertices.
+         * Reads velocity/position from fake physics body at 0x5FFF00. */
+        {
+            extern ptrdiff_t g_xbox_mem_offset;
+            #define _R_MEMF(a) (*(volatile float*)((uintptr_t)(a) + g_xbox_mem_offset))
+            #define _R_MEM32(a) (*(volatile uint32_t*)((uintptr_t)(a) + g_xbox_mem_offset))
+            uint32_t _phys = _R_MEM32(0x557880 + 0x1B4);
+            if (_phys > 0x100 && _phys < 0x4000000) {
+                float vx = _R_MEMF(_phys + 8);
+                float vy = _R_MEMF(_phys + 0xC);
+                float px = _R_MEMF(_phys + 0x10);
+                float py = _R_MEMF(_phys + 0x14);
+
+                /* Map position to screen: center at (320,240), 2 px/unit */
+                float cx = 320.0f + px * 2.0f;
+                float cy = 240.0f - py * 2.0f;
+                if (cx < 15.0f) cx = 15.0f;
+                if (cx > 625.0f) cx = 625.0f;
+                if (cy < 15.0f) cy = 15.0f;
+                if (cy > 465.0f) cy = 465.0f;
+
+                /* XYZRHW + DIFFUSE vertex: {x, y, z, rhw, color} */
+                typedef struct { float x, y, z, rhw; DWORD color; } RHW_VERT;
+
+                /* Set render state for flat colored quads */
+                g_d3d_device->lpVtbl->SetVertexShader(g_d3d_device,
+                    D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+                g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                    D3DRS_ZENABLE, 0);
+                g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                    D3DRS_LIGHTING, 0);
+                g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                    D3DRS_CULLMODE, 1 /* D3DCULL_NONE */);
+                g_d3d_device->lpVtbl->SetTexture(g_d3d_device, 0, NULL);
+
+                /* Car body: white rectangle (2 triangles) */
+                {
+                    float hw = 14.0f, hh = 8.0f;
+                    DWORD car_col = 0xFFFFFFFF; /* white */
+                    RHW_VERT car_verts[6] = {
+                        {cx-hw, cy-hh, 0.5f, 1.0f, car_col},
+                        {cx+hw, cy-hh, 0.5f, 1.0f, car_col},
+                        {cx-hw, cy+hh, 0.5f, 1.0f, car_col},
+                        {cx+hw, cy-hh, 0.5f, 1.0f, car_col},
+                        {cx+hw, cy+hh, 0.5f, 1.0f, car_col},
+                        {cx-hw, cy+hh, 0.5f, 1.0f, car_col},
+                    };
+                    g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                        D3DPT_TRIANGLELIST, 2, car_verts, sizeof(RHW_VERT));
+                }
+
+                /* Velocity indicator: colored line (thin quad) */
+                if (vx != 0.0f || vy != 0.0f) {
+                    float vlen = sqrtf(vx * vx + vy * vy);
+                    float ndx = vx / vlen, ndy = -vy / vlen;
+                    float len = vlen * 25.0f;
+                    if (len > 80.0f) len = 80.0f;
+                    float ex = cx + ndx * len, ey = cy + ndy * len;
+                    /* Perpendicular for line width */
+                    float px0 = -ndy * 1.5f, py0 = ndx * 1.5f;
+                    DWORD vel_col = 0xFFFF3333; /* red */
+                    RHW_VERT vel_verts[6] = {
+                        {cx+px0,  cy+py0,  0.5f, 1.0f, vel_col},
+                        {cx-px0,  cy-py0,  0.5f, 1.0f, vel_col},
+                        {ex+px0,  ey+py0,  0.5f, 1.0f, vel_col},
+                        {cx-px0,  cy-py0,  0.5f, 1.0f, vel_col},
+                        {ex-px0,  ey-py0,  0.5f, 1.0f, vel_col},
+                        {ex+px0,  ey+py0,  0.5f, 1.0f, vel_col},
+                    };
+                    g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                        D3DPT_TRIANGLELIST, 2, vel_verts, sizeof(RHW_VERT));
+                }
+
+                /* Road lines: horizontal dashes that scroll with position */
+                {
+                    DWORD line_col = 0xFF404060; /* muted blue-grey */
+                    float scroll_x = fmodf(px * 2.0f, 40.0f);
+                    int i;
+                    for (i = 0; i < 16; i++) {
+                        float lx = (float)(i * 40) - scroll_x;
+                        if (lx < 0.0f) lx += 640.0f;
+                        if (lx > 640.0f) lx -= 640.0f;
+                        RHW_VERT dash[6] = {
+                            {lx, 238.0f, 0.9f, 1.0f, line_col},
+                            {lx+20.0f, 238.0f, 0.9f, 1.0f, line_col},
+                            {lx, 242.0f, 0.9f, 1.0f, line_col},
+                            {lx+20.0f, 238.0f, 0.9f, 1.0f, line_col},
+                            {lx+20.0f, 242.0f, 0.9f, 1.0f, line_col},
+                            {lx, 242.0f, 0.9f, 1.0f, line_col},
+                        };
+                        g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                            D3DPT_TRIANGLELIST, 2, dash, sizeof(RHW_VERT));
+                    }
+                }
+            }
+            #undef _R_MEMF
+            #undef _R_MEM32
+        }
+
         g_d3d_device->lpVtbl->EndScene(g_d3d_device);
         g_d3d_device->lpVtbl->Present(g_d3d_device, NULL, NULL, NULL, NULL);
         {
             extern volatile uint32_t g_present_count;
             g_present_count++;
-        }
-
-        /* Draw a simple car indicator using GDI overlay.
-         * Reads position from the fake physics body at 0x5FFF00+0x10/0x14
-         * and renders a colored rectangle on screen. */
-        if (g_hwnd) {
-            extern ptrdiff_t g_xbox_mem_offset;
-            #define _GDI_MEMF(a) (*(volatile float*)((uintptr_t)(a) + g_xbox_mem_offset))
-            uint32_t _phys = *(volatile uint32_t*)((uintptr_t)(0x557880 + 0x1B4) + g_xbox_mem_offset);
-            if (_phys > 0x100 && _phys < 0x4000000) {
-                float vx = _GDI_MEMF(_phys + 8);
-                float vy = _GDI_MEMF(_phys + 0xC);
-                float px = _GDI_MEMF(_phys + 0x10);
-                float py = _GDI_MEMF(_phys + 0x14);
-                /* Map position to screen: center at (320,240), 1 unit = 2 pixels */
-                int cx = 320 + (int)(px * 2.0f);
-                int cy = 240 - (int)(py * 2.0f);
-                /* Clamp to screen bounds */
-                if (cx < 15) cx = 15;
-                if (cx > 625) cx = 625;
-                if (cy < 15) cy = 15;
-                if (cy > 465) cy = 465;
-                HDC hdc = GetDC(g_hwnd);
-                if (hdc) {
-                    /* Car body: white rectangle */
-                    HBRUSH car_brush = CreateSolidBrush(RGB(255, 255, 255));
-                    RECT car_rc = { cx - 12, cy - 6, cx + 12, cy + 6 };
-                    FillRect(hdc, &car_rc, car_brush);
-                    DeleteObject(car_brush);
-                    /* Velocity indicator: red line from center in velocity direction */
-                    if (vx != 0.0f || vy != 0.0f) {
-                        HPEN vel_pen = CreatePen(PS_SOLID, 2, RGB(255, 50, 50));
-                        HPEN old_pen = (HPEN)SelectObject(hdc, vel_pen);
-                        MoveToEx(hdc, cx, cy, NULL);
-                        LineTo(hdc, cx + (int)(vx * 20.0f), cy - (int)(vy * 20.0f));
-                        SelectObject(hdc, old_pen);
-                        DeleteObject(vel_pen);
-                    }
-                    ReleaseDC(g_hwnd, hdc);
-                }
-            }
-            #undef _GDI_MEMF
         }
     }
 
