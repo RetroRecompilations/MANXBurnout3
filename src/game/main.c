@@ -1670,8 +1670,8 @@ void game_frame_pump(void)
 
                         /* Deterministic object type from world Y position */
                         int world_idx = (int)((py + pd) / obj_spacing);
-                        int obj_type = ((world_idx * 2654435761u) >> 16) % 4;
-                        /* 0=post, 1=tree, 2=tree(tall), 3=building */
+                        int obj_type = ((world_idx * 2654435761u) >> 16) % 6;
+                        /* 0=post, 1=tree, 2=tree(tall), 3=building, 4=sign, 5=billboard */
 
                         int side;
                         for (side = 0; side < 2; side++) {
@@ -1720,7 +1720,7 @@ void game_frame_pump(void)
                                 };
                                 g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
                                     D3DPT_TRIANGLELIST, 1, cn, sizeof(RHW_VERT));
-                            } else {
+                            } else if (obj_type == 3) {
                                 /* Building: colored rectangle */
                                 float bw = 2.5f * sc, bh = 6.0f * sc;
                                 if (bw < 1.0f) bw = 1.0f;
@@ -1750,6 +1750,202 @@ void game_frame_pump(void)
                                 };
                                 g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
                                     D3DPT_TRIANGLELIST, 2, wv, sizeof(RHW_VERT));
+                            } else if (obj_type == 4) {
+                                /* Road sign: thin post with small square sign on top */
+                                float pw = 0.3f * sc, ph = 5.0f * sc;
+                                float sw_s = 1.8f * sc, sh_s = 1.5f * sc;
+                                if (pw < 0.3f) pw = 0.3f;
+                                DWORD post_c = 0xFF888888;
+                                /* Post */
+                                RHW_VERT sp[6] = {
+                                    {sx_obj-pw, sy_base-ph+sh_s, 0.5f, 1.0f, post_c},
+                                    {sx_obj+pw, sy_base-ph+sh_s, 0.5f, 1.0f, post_c},
+                                    {sx_obj-pw, sy_base,         0.5f, 1.0f, post_c},
+                                    {sx_obj+pw, sy_base-ph+sh_s, 0.5f, 1.0f, post_c},
+                                    {sx_obj+pw, sy_base,         0.5f, 1.0f, post_c},
+                                    {sx_obj-pw, sy_base,         0.5f, 1.0f, post_c},
+                                };
+                                g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                    D3DPT_TRIANGLELIST, 2, sp, sizeof(RHW_VERT));
+                                /* Sign face (blue with white border) */
+                                DWORD sign_c = 0xFF2244AA;
+                                RHW_VERT sf[6] = {
+                                    {sx_obj-sw_s, sy_base-ph,     0.48f, 1.0f, sign_c},
+                                    {sx_obj+sw_s, sy_base-ph,     0.48f, 1.0f, sign_c},
+                                    {sx_obj-sw_s, sy_base-ph+sh_s,0.48f, 1.0f, sign_c},
+                                    {sx_obj+sw_s, sy_base-ph,     0.48f, 1.0f, sign_c},
+                                    {sx_obj+sw_s, sy_base-ph+sh_s,0.48f, 1.0f, sign_c},
+                                    {sx_obj-sw_s, sy_base-ph+sh_s,0.48f, 1.0f, sign_c},
+                                };
+                                g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                    D3DPT_TRIANGLELIST, 2, sf, sizeof(RHW_VERT));
+                                /* White arrow on sign */
+                                DWORD arrow_c = 0xFFFFFFFF;
+                                float aw = sw_s * 0.3f;
+                                float ay = sy_base - ph + sh_s * 0.5f;
+                                RHW_VERT arrow[3] = {
+                                    {sx_obj - aw, ay + aw*0.5f, 0.47f, 1.0f, arrow_c},
+                                    {sx_obj - aw, ay - aw*0.5f, 0.47f, 1.0f, arrow_c},
+                                    {sx_obj + aw, ay,           0.47f, 1.0f, arrow_c},
+                                };
+                                g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                    D3DPT_TRIANGLELIST, 1, arrow, sizeof(RHW_VERT));
+                            } else if (obj_type == 5) {
+                                /* Billboard: tall wide panel on two posts */
+                                float bw = 3.5f * sc, bh = 2.5f * sc;
+                                float bph = 4.0f * sc;
+                                float bpw = 0.3f * sc;
+                                if (bpw < 0.3f) bpw = 0.3f;
+                                DWORD bp_c = 0xFF666666;
+                                /* Left post */
+                                RHW_VERT bp_l[6] = {
+                                    {sx_obj-bw+bpw, sy_base-bph+bh, 0.5f, 1.0f, bp_c},
+                                    {sx_obj-bw+bpw*3, sy_base-bph+bh, 0.5f, 1.0f, bp_c},
+                                    {sx_obj-bw+bpw, sy_base,         0.5f, 1.0f, bp_c},
+                                    {sx_obj-bw+bpw*3, sy_base-bph+bh, 0.5f, 1.0f, bp_c},
+                                    {sx_obj-bw+bpw*3, sy_base,         0.5f, 1.0f, bp_c},
+                                    {sx_obj-bw+bpw, sy_base,         0.5f, 1.0f, bp_c},
+                                };
+                                /* Right post */
+                                RHW_VERT bp_r[6] = {
+                                    {sx_obj+bw-bpw*3, sy_base-bph+bh, 0.5f, 1.0f, bp_c},
+                                    {sx_obj+bw-bpw, sy_base-bph+bh, 0.5f, 1.0f, bp_c},
+                                    {sx_obj+bw-bpw*3, sy_base,         0.5f, 1.0f, bp_c},
+                                    {sx_obj+bw-bpw, sy_base-bph+bh, 0.5f, 1.0f, bp_c},
+                                    {sx_obj+bw-bpw, sy_base,         0.5f, 1.0f, bp_c},
+                                    {sx_obj+bw-bpw*3, sy_base,         0.5f, 1.0f, bp_c},
+                                };
+                                g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                    D3DPT_TRIANGLELIST, 2, bp_l, sizeof(RHW_VERT));
+                                g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                    D3DPT_TRIANGLELIST, 2, bp_r, sizeof(RHW_VERT));
+                                /* Billboard face: colored panel */
+                                DWORD bb_colors[4] = {0xFF884422, 0xFF226644, 0xFF443388, 0xFF886622};
+                                DWORD bb_c = bb_colors[world_idx & 3];
+                                RHW_VERT bb[6] = {
+                                    {sx_obj-bw, sy_base-bph,    0.48f, 1.0f, bb_c},
+                                    {sx_obj+bw, sy_base-bph,    0.48f, 1.0f, bb_c},
+                                    {sx_obj-bw, sy_base-bph+bh, 0.48f, 1.0f, bb_c},
+                                    {sx_obj+bw, sy_base-bph,    0.48f, 1.0f, bb_c},
+                                    {sx_obj+bw, sy_base-bph+bh, 0.48f, 1.0f, bb_c},
+                                    {sx_obj-bw, sy_base-bph+bh, 0.48f, 1.0f, bb_c},
+                                };
+                                g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                    D3DPT_TRIANGLELIST, 2, bb, sizeof(RHW_VERT));
+                                /* White text stripe across billboard */
+                                DWORD txt_c = 0xFFDDDDDD;
+                                float tw_h = bh * 0.2f;
+                                float ty_b = sy_base - bph + bh * 0.4f;
+                                RHW_VERT txt[6] = {
+                                    {sx_obj-bw*0.8f, ty_b,      0.47f, 1.0f, txt_c},
+                                    {sx_obj+bw*0.8f, ty_b,      0.47f, 1.0f, txt_c},
+                                    {sx_obj-bw*0.8f, ty_b+tw_h, 0.47f, 1.0f, txt_c},
+                                    {sx_obj+bw*0.8f, ty_b,      0.47f, 1.0f, txt_c},
+                                    {sx_obj+bw*0.8f, ty_b+tw_h, 0.47f, 1.0f, txt_c},
+                                    {sx_obj-bw*0.8f, ty_b+tw_h, 0.47f, 1.0f, txt_c},
+                                };
+                                g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                    D3DPT_TRIANGLELIST, 2, txt, sizeof(RHW_VERT));
+                            }
+                        }
+                    }
+                }
+
+                /* ── Tunnel sections (periodic dark overhead) ───────── */
+                {
+                    /* Tunnel every 2000 world units, lasting 200 units.
+                     * When player is inside a tunnel segment, render dark
+                     * ceiling and walls for segments within the tunnel zone. */
+                    float tunnel_period = 2000.0f;
+                    float tunnel_len = 200.0f;
+                    float tunnel_phase = fmodf(py, tunnel_period);
+                    if (tunnel_phase < 0.0f) tunnel_phase += tunnel_period;
+                    int in_tunnel = (tunnel_phase > tunnel_period - tunnel_len);
+
+                    if (in_tunnel) {
+                        /* Render ceiling and walls for road segments inside the tunnel */
+                        int ti;
+                        for (ti = 0; ti < ROAD_SEGS; ti++) {
+                            float t0 = (float)ti / ROAD_SEGS;
+                            float t1 = (float)(ti + 1) / ROAD_SEGS;
+                            float d0 = 2.0f + t0 * t0 * VIEW_DIST;
+                            float d1 = 2.0f + t1 * t1 * VIEW_DIST;
+                            /* Check if this segment's world Y is inside the tunnel */
+                            float seg_wy = py + (d0 + d1) * 0.5f;
+                            float seg_tp = fmodf(seg_wy, tunnel_period);
+                            if (seg_tp < 0.0f) seg_tp += tunnel_period;
+                            if (seg_tp <= tunnel_period - tunnel_len) continue;
+
+                            float ho0 = hill_offsets[ti], ho1 = hill_offsets[ti + 1];
+                            float co0 = curve_offsets[ti], co1 = curve_offsets[ti + 1];
+                            float y0 = PROJ_Y(d0) - ho0;
+                            float y1 = PROJ_Y(d1) - ho1;
+                            if (y0 < HORIZON - 30.0f || y1 > SH) continue;
+                            if (y0 > SH) y0 = SH;
+
+                            float lx0 = PROJ_X(-ROAD_HW - 2.0f, d0) + co0;
+                            float rx0 = PROJ_X(ROAD_HW + 2.0f, d0) + co0;
+                            float lx1 = PROJ_X(-ROAD_HW - 2.0f, d1) + co1;
+                            float rx1 = PROJ_X(ROAD_HW + 2.0f, d1) + co1;
+
+                            /* Ceiling height above road level */
+                            float ceil_h0 = 8.0f * PROJ_SCALE(d0);
+                            float ceil_h1 = 8.0f * PROJ_SCALE(d1);
+
+                            DWORD tun_dark = 0xFF181822;
+                            DWORD tun_wall = 0xFF252535;
+
+                            /* Ceiling */
+                            RHW_VERT ceil_v[6] = {
+                                {lx0, y0 - ceil_h0, 0.42f, 1.0f, tun_dark},
+                                {rx0, y0 - ceil_h0, 0.42f, 1.0f, tun_dark},
+                                {lx1, y1 - ceil_h1, 0.42f, 1.0f, tun_dark},
+                                {rx0, y0 - ceil_h0, 0.42f, 1.0f, tun_dark},
+                                {rx1, y1 - ceil_h1, 0.42f, 1.0f, tun_dark},
+                                {lx1, y1 - ceil_h1, 0.42f, 1.0f, tun_dark},
+                            };
+                            g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                D3DPT_TRIANGLELIST, 2, ceil_v, sizeof(RHW_VERT));
+
+                            /* Left wall */
+                            RHW_VERT lwall[6] = {
+                                {lx0, y0 - ceil_h0, 0.43f, 1.0f, tun_wall},
+                                {lx0, y0,           0.43f, 1.0f, tun_wall},
+                                {lx1, y1 - ceil_h1, 0.43f, 1.0f, tun_wall},
+                                {lx0, y0,           0.43f, 1.0f, tun_wall},
+                                {lx1, y1,           0.43f, 1.0f, tun_wall},
+                                {lx1, y1 - ceil_h1, 0.43f, 1.0f, tun_wall},
+                            };
+                            g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                D3DPT_TRIANGLELIST, 2, lwall, sizeof(RHW_VERT));
+
+                            /* Right wall */
+                            RHW_VERT rwall[6] = {
+                                {rx0, y0 - ceil_h0, 0.43f, 1.0f, tun_wall},
+                                {rx0, y0,           0.43f, 1.0f, tun_wall},
+                                {rx1, y1 - ceil_h1, 0.43f, 1.0f, tun_wall},
+                                {rx0, y0,           0.43f, 1.0f, tun_wall},
+                                {rx1, y1,           0.43f, 1.0f, tun_wall},
+                                {rx1, y1 - ceil_h1, 0.43f, 1.0f, tun_wall},
+                            };
+                            g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                D3DPT_TRIANGLELIST, 2, rwall, sizeof(RHW_VERT));
+
+                            /* Tunnel lights: orange strip on ceiling every few segments */
+                            if ((ti & 3) == 0) {
+                                float lw = 0.5f * PROJ_SCALE(d0);
+                                float lamp_x = PROJ_X(0.0f, d0) + co0;
+                                DWORD lamp_c = 0xFFFFAA44;
+                                RHW_VERT lamp[6] = {
+                                    {lamp_x - lw * 3.0f, y0 - ceil_h0,        0.41f, 1.0f, lamp_c},
+                                    {lamp_x + lw * 3.0f, y0 - ceil_h0,        0.41f, 1.0f, lamp_c},
+                                    {lamp_x - lw * 3.0f, y0 - ceil_h0 + lw,   0.41f, 1.0f, lamp_c},
+                                    {lamp_x + lw * 3.0f, y0 - ceil_h0,        0.41f, 1.0f, lamp_c},
+                                    {lamp_x + lw * 3.0f, y0 - ceil_h0 + lw,   0.41f, 1.0f, lamp_c},
+                                    {lamp_x - lw * 3.0f, y0 - ceil_h0 + lw,   0.41f, 1.0f, lamp_c},
+                                };
+                                g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                    D3DPT_TRIANGLELIST, 2, lamp, sizeof(RHW_VERT));
                             }
                         }
                     }
@@ -2083,6 +2279,74 @@ void game_frame_pump(void)
                             };
                             g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
                                 D3DPT_TRIANGLELIST, 2, sline, sizeof(RHW_VERT));
+                        }
+                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                            D3DRS_ALPHABLENDENABLE, 0);
+                    }
+                }
+
+                /* ── Rain effect (periodic weather) ──────────────────── */
+                {
+                    /* Rain cycles every 6000 world units: clear 0-4000, rain 4000-6000 */
+                    float weather_cycle = fmodf(py / 6000.0f, 1.0f);
+                    if (weather_cycle < 0.0f) weather_cycle += 1.0f;
+                    float rain_intensity = 0.0f;
+                    if (weather_cycle > 0.67f) {
+                        /* Ramp in 0.67-0.75, full 0.75-0.92, ramp out 0.92-1.0 */
+                        if (weather_cycle < 0.75f)
+                            rain_intensity = (weather_cycle - 0.67f) / 0.08f;
+                        else if (weather_cycle > 0.92f)
+                            rain_intensity = 1.0f - (weather_cycle - 0.92f) / 0.08f;
+                        else
+                            rain_intensity = 1.0f;
+                    }
+                    if (rain_intensity > 0.01f) {
+                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                            D3DRS_ALPHABLENDENABLE, 1);
+                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                            19, 5);
+                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                            20, 6);
+                        /* Rain drops: diagonal streaks falling */
+                        static uint32_t _rain_seed = 55555;
+                        int rain_count = (int)(rain_intensity * 30.0f);
+                        int ri;
+                        for (ri = 0; ri < rain_count; ri++) {
+                            _rain_seed = _rain_seed * 1103515245 + 12345;
+                            float rx = (float)((_rain_seed >> 16) & 0x3FF) - 40.0f;
+                            _rain_seed = _rain_seed * 1103515245 + 12345;
+                            float ry = (float)((_rain_seed >> 16) & 0x1FF) - 20.0f;
+                            float rlen = 12.0f + (float)((_rain_seed >> 8) & 0xF);
+                            int ra = (int)(rain_intensity * 120.0f);
+                            if (ra > 120) ra = 120;
+                            DWORD rc = ((DWORD)ra << 24) | 0x00AABBDD;
+                            DWORD rc_t = 0x00AABBDD; /* transparent end */
+                            /* Diagonal streak: top-left to bottom-right */
+                            RHW_VERT drop[6] = {
+                                {rx,        ry,        0.03f, 1.0f, rc},
+                                {rx + 1.0f, ry,        0.03f, 1.0f, rc},
+                                {rx + 4.0f, ry + rlen, 0.03f, 1.0f, rc_t},
+                                {rx + 1.0f, ry,        0.03f, 1.0f, rc},
+                                {rx + 5.0f, ry + rlen, 0.03f, 1.0f, rc_t},
+                                {rx + 4.0f, ry + rlen, 0.03f, 1.0f, rc_t},
+                            };
+                            g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                D3DPT_TRIANGLELIST, 2, drop, sizeof(RHW_VERT));
+                        }
+                        /* Grey rain overlay on screen (fog effect) */
+                        {
+                            int fog_a = (int)(rain_intensity * 40.0f);
+                            DWORD fog_c = ((DWORD)fog_a << 24) | 0x00667788;
+                            RHW_VERT fog[6] = {
+                                {0.0f, 0.0f, 0.025f, 1.0f, fog_c},
+                                {SW,   0.0f, 0.025f, 1.0f, fog_c},
+                                {0.0f, SH,   0.025f, 1.0f, fog_c},
+                                {SW,   0.0f, 0.025f, 1.0f, fog_c},
+                                {SW,   SH,   0.025f, 1.0f, fog_c},
+                                {0.0f, SH,   0.025f, 1.0f, fog_c},
+                            };
+                            g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                D3DPT_TRIANGLELIST, 2, fog, sizeof(RHW_VERT));
                         }
                         g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
                             D3DRS_ALPHABLENDENABLE, 0);
