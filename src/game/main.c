@@ -2443,6 +2443,60 @@ void game_frame_pump(void)
                     }
                 }
 
+                /* ── Score display (top-left HUD) ───────────────────── */
+                {
+                    uint32_t score = _R_MEM32(0x5FFD24);
+                    float mult = _R_MEMF(0x5FFD28);
+                    if (mult < 1.0f) mult = 1.0f;
+                    /* Score background bar */
+                    DWORD sbg = 0xC0101020;
+                    g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                        D3DRS_ALPHABLENDENABLE, 1);
+                    g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                        19, 5);
+                    g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                        20, 6);
+                    RHW_VERT s_bg[6] = {
+                        {10.0f, 10.0f, 0.02f, 1.0f, sbg},
+                        {170.0f, 10.0f, 0.02f, 1.0f, sbg},
+                        {10.0f, 42.0f, 0.02f, 1.0f, sbg},
+                        {170.0f, 10.0f, 0.02f, 1.0f, sbg},
+                        {170.0f, 42.0f, 0.02f, 1.0f, sbg},
+                        {10.0f, 42.0f, 0.02f, 1.0f, sbg},
+                    };
+                    g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                        D3DPT_TRIANGLELIST, 2, s_bg, sizeof(RHW_VERT));
+                    /* Multiplier indicator: colored bar at bottom.
+                     * Width scales with multiplier (1x-8x), color shifts. */
+                    if (mult > 1.0f) {
+                        float m_pct = (mult - 1.0f) / 7.0f;
+                        if (m_pct > 1.0f) m_pct = 1.0f;
+                        float m_w = m_pct * 150.0f;
+                        /* Color: green at 1x→ yellow at 4x → red at 8x */
+                        DWORD m_col;
+                        if (mult < 4.0f) {
+                            int r = (int)((mult - 1.0f) / 3.0f * 255.0f);
+                            m_col = 0xC000FF00 | ((DWORD)r << 16);
+                        } else {
+                            int g = (int)((1.0f - (mult - 4.0f) / 4.0f) * 255.0f);
+                            if (g < 0) g = 0;
+                            m_col = 0xC0FF0000 | ((DWORD)g << 8);
+                        }
+                        RHW_VERT m_bar[6] = {
+                            {14.0f,      38.0f, 0.015f, 1.0f, m_col},
+                            {14.0f+m_w,  38.0f, 0.015f, 1.0f, m_col},
+                            {14.0f,      42.0f, 0.015f, 1.0f, m_col},
+                            {14.0f+m_w,  38.0f, 0.015f, 1.0f, m_col},
+                            {14.0f+m_w,  42.0f, 0.015f, 1.0f, m_col},
+                            {14.0f,      42.0f, 0.015f, 1.0f, m_col},
+                        };
+                        g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                            D3DPT_TRIANGLELIST, 2, m_bar, sizeof(RHW_VERT));
+                    }
+                    g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                        D3DRS_ALPHABLENDENABLE, 0);
+                }
+
                 /* ── Checkpoint banner (green flash on milestone) ────── */
                 {
                     float cp_flash = _R_MEMF(0x5FFD20);
@@ -2565,9 +2619,12 @@ void game_frame_pump(void)
             uint32_t takedowns = XMEM32(0x5FFD00);
             float boost = *(volatile float*)((uintptr_t)0x5FFD08 + g_xbox_mem_offset);
             uint32_t dist_m = XMEM32(0x5FFD14);
+            uint32_t score = XMEM32(0x5FFD24);
+            float mult = XMEMF(0x5FFD28);
+            if (mult < 1.0f) mult = 1.0f;
             snprintf(title, sizeof(title),
-                "Burnout 3 | spd=%.0f dist=%um TD=%u boost=%.0f%%",
-                spd, dist_m, takedowns, boost);
+                "Burnout 3 | spd=%.0f dist=%um TD=%u boost=%.0f%% score=%u x%.1f",
+                spd, dist_m, takedowns, boost, score, mult);
             #undef XMEM32
             #undef XMEMF
             SetWindowTextA(g_hwnd, title);

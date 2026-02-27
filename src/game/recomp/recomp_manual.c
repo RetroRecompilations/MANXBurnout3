@@ -1726,10 +1726,9 @@ void sub_000110E0(void)
                     oy += os * dt;
                     MEMF(OBS_ADDR(oi, 4)) = oy;
 
-                    /* Same-dir traffic: occasional lane changes.
-                     * Use a simple sine drift based on world position to create
-                     * smooth, deterministic lane-change behavior. Each car gets
-                     * a unique phase from its slot index. */
+                    /* Same-dir traffic: lane changes + braking AI.
+                     * Sine drift for smooth lane-change behavior.
+                     * Brake when player approaches from behind in same lane. */
                     if (!is_oncoming) {
                         float drift_phase = oy * 0.03f + (float)oi * 1.57f;
                         float drift = sinf(drift_phase) * 2.0f * dt;
@@ -1738,6 +1737,18 @@ void sub_000110E0(void)
                         if (ox > 12.0f) ox = 12.0f;
                         if (ox < -12.0f) ox = -12.0f;
                         MEMF(OBS_ADDR(oi, 0)) = ox;
+
+                        /* Brake if player is approaching from behind */
+                        float dx_lane = new_px - ox;
+                        float dy_behind = oy - new_py;
+                        if (dx_lane > -4.0f && dx_lane < 4.0f &&
+                            dy_behind > 0.0f && dy_behind < 20.0f &&
+                            speed > os + 2.0f) {
+                            /* Slow down gradually */
+                            os -= 8.0f * dt;
+                            if (os < 1.0f) os = 1.0f;
+                            MEMF(OBS_ADDR(oi, 8)) = os;
+                        }
                     }
 
                     /* Recycle if too far behind (or ahead for oncoming that passed) */
@@ -1766,11 +1777,14 @@ void sub_000110E0(void)
                     if (abs_rx < 3.0f && abs_ry < 4.5f) {
                         if (is_oncoming) {
                             /* CRASH! Head-on with oncoming = devastating.
-                             * Lose most speed, red screen shake, no boost. */
+                             * Lose most speed, red screen shake, no boost.
+                             * Reset multiplier. */
                             speed *= 0.15f; /* lose 85% speed */
                             MEMF(phys_ptr + 0x1C) = speed;
                             MEMF(0x5FFD18) = 1.0f; /* screen shake timer */
                             MEMF(0x5FFD04) = 0.8f; /* red flash */
+                            MEMF(0x5FFD28) = 1.0f; /* reset multiplier */
+                            MEMF(0x5FFD2C) = 0.0f; /* reset combo timer */
                             /* Respawn oncoming car */
                             float lane = -5.0f - (float)(OBS_RAND() % 3) * 3.0f;
                             MEMF(OBS_ADDR(oi, 0)) = lane;
@@ -1795,6 +1809,19 @@ void sub_000110E0(void)
                             boost += 25.0f;
                             if (boost > 100.0f) boost = 100.0f;
                             MEMF(0x5FFD08) = boost;
+
+                            /* Score: takedown = 500 * multiplier */
+                            {
+                                float mult = MEMF(0x5FFD28);
+                                if (mult < 1.0f) mult = 1.0f;
+                                uint32_t score = MEM32(0x5FFD24);
+                                score += (uint32_t)(500.0f * mult);
+                                MEM32(0x5FFD24) = score;
+                                mult += 0.5f;
+                                if (mult > 8.0f) mult = 8.0f;
+                                MEMF(0x5FFD28) = mult;
+                                MEMF(0x5FFD2C) = 3.0f; /* combo timer */
+                            }
                         }
                     }
                     /* Near-miss detection */
@@ -1806,6 +1833,20 @@ void sub_000110E0(void)
                         boost += fill * dt * 10.0f;
                         if (boost > 100.0f) boost = 100.0f;
                         MEMF(0x5FFD08) = boost;
+
+                        /* Score: near-miss = 50 * multiplier (oncoming = 100) */
+                        {
+                            float mult = MEMF(0x5FFD28);
+                            if (mult < 1.0f) mult = 1.0f;
+                            uint32_t score = MEM32(0x5FFD24);
+                            float pts = is_oncoming ? 100.0f : 50.0f;
+                            score += (uint32_t)(pts * mult * dt * 5.0f);
+                            MEM32(0x5FFD24) = score;
+                            mult += 0.1f * dt;
+                            if (mult > 8.0f) mult = 8.0f;
+                            MEMF(0x5FFD28) = mult;
+                            MEMF(0x5FFD2C) = 3.0f; /* combo timer */
+                        }
                     }
                 }
                 #undef OBS_BASE
@@ -1846,6 +1887,14 @@ void sub_000110E0(void)
                     boost += 15.0f;
                     if (boost > 100.0f) boost = 100.0f;
                     MEMF(0x5FFD08) = boost;
+                    /* Score: checkpoint = 1000 * multiplier */
+                    {
+                        float mult = MEMF(0x5FFD28);
+                        if (mult < 1.0f) mult = 1.0f;
+                        uint32_t score = MEM32(0x5FFD24);
+                        score += (uint32_t)(1000.0f * mult);
+                        MEM32(0x5FFD24) = score;
+                    }
                 }
             }
 
@@ -1868,6 +1917,21 @@ void sub_000110E0(void)
                     cp_flash -= dt;
                     if (cp_flash < 0.0f) cp_flash = 0.0f;
                     MEMF(0x5FFD20) = cp_flash;
+                }
+                /* Combo/multiplier decay */
+                float combo_timer = MEMF(0x5FFD2C);
+                if (combo_timer > 0.0f) {
+                    combo_timer -= dt;
+                    if (combo_timer < 0.0f) combo_timer = 0.0f;
+                    MEMF(0x5FFD2C) = combo_timer;
+                } else {
+                    /* When combo expires, decay multiplier toward 1.0 */
+                    float mult = MEMF(0x5FFD28);
+                    if (mult > 1.0f) {
+                        mult -= 0.5f * dt;
+                        if (mult < 1.0f) mult = 1.0f;
+                        MEMF(0x5FFD28) = mult;
+                    }
                 }
             }
         }
