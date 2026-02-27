@@ -1616,6 +1616,79 @@ void game_frame_pump(void)
                         D3DPT_TRIANGLELIST, 2, tail_l, sizeof(RHW_VERT));
                     g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
                         D3DPT_TRIANGLELIST, 2, tail_r, sizeof(RHW_VERT));
+
+                    /* Boost exhaust flames (when actively boosting) */
+                    {
+                        float boost_val = _R_MEMF(0x5FFD08);
+                        uint32_t boost_btn = _R_MEM32(0x5FFD0C);
+                        if (boost_btn && boost_val > 0.0f && speed > 5.0f) {
+                            /* Animated flame length using a pseudo-random flicker */
+                            static uint32_t _flame_seed = 7777;
+                            _flame_seed = _flame_seed * 1103515245 + 12345;
+                            float flicker = 0.7f + 0.3f * ((float)((_flame_seed >> 16) & 0xFF) / 255.0f);
+                            float flame_len = 18.0f * flicker;
+                            /* Left exhaust flame */
+                            DWORD f_inner = 0xFFFFFF44; /* bright yellow */
+                            DWORD f_outer = 0xFFFF4400; /* orange-red at tip */
+                            float fx_l = car_cx - car_hw * 0.4f;
+                            float fx_r = car_cx + car_hw * 0.4f;
+                            float fy_top = car_cy + car_hh;
+                            RHW_VERT flame_l[3] = {
+                                {fx_l - 3.0f, fy_top, 0.08f, 1.0f, f_inner},
+                                {fx_l + 3.0f, fy_top, 0.08f, 1.0f, f_inner},
+                                {fx_l, fy_top + flame_len, 0.08f, 1.0f, f_outer},
+                            };
+                            RHW_VERT flame_r[3] = {
+                                {fx_r - 3.0f, fy_top, 0.08f, 1.0f, f_inner},
+                                {fx_r + 3.0f, fy_top, 0.08f, 1.0f, f_inner},
+                                {fx_r, fy_top + flame_len, 0.08f, 1.0f, f_outer},
+                            };
+                            g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                D3DPT_TRIANGLELIST, 1, flame_l, sizeof(RHW_VERT));
+                            g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                D3DPT_TRIANGLELIST, 1, flame_r, sizeof(RHW_VERT));
+                        }
+                    }
+                }
+
+                /* ── Speed lines (at high speed or when boosting) ────── */
+                {
+                    float abs_spd = speed < 0 ? -speed : speed;
+                    if (abs_spd > 25.0f) {
+                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                            D3DRS_ALPHABLENDENABLE, 1);
+                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                            19, 5); /* D3DRS_SRCBLEND = D3DBLEND_SRCALPHA */
+                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                            20, 6); /* D3DRS_DESTBLEND = D3DBLEND_INVSRCALPHA */
+                        /* Draw several speed lines streaking from center outward */
+                        static uint32_t _line_seed = 42;
+                        int li;
+                        for (li = 0; li < 8; li++) {
+                            _line_seed = _line_seed * 1103515245 + 12345;
+                            float lx = (float)((_line_seed >> 16) & 0x1FF) + 70.0f;
+                            _line_seed = _line_seed * 1103515245 + 12345;
+                            float ly = HORIZON + (float)((_line_seed >> 16) & 0xFF);
+                            float line_len = (abs_spd - 25.0f) * 1.5f;
+                            if (line_len > 60.0f) line_len = 60.0f;
+                            /* Alpha proportional to speed */
+                            int alpha = (int)((abs_spd - 25.0f) * 4.0f);
+                            if (alpha > 160) alpha = 160;
+                            DWORD lc = ((DWORD)alpha << 24) | 0x00CCDDFF;
+                            RHW_VERT sline[6] = {
+                                {lx, ly,            0.06f, 1.0f, lc},
+                                {lx + 1.5f, ly,     0.06f, 1.0f, lc},
+                                {lx, ly + line_len, 0.06f, 1.0f, 0x00CCDDFF},
+                                {lx + 1.5f, ly,     0.06f, 1.0f, lc},
+                                {lx + 1.5f, ly + line_len, 0.06f, 1.0f, 0x00CCDDFF},
+                                {lx, ly + line_len, 0.06f, 1.0f, 0x00CCDDFF},
+                            };
+                            g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                D3DPT_TRIANGLELIST, 2, sline, sizeof(RHW_VERT));
+                        }
+                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                            D3DRS_ALPHABLENDENABLE, 0);
+                    }
                 }
 
                 /* ── Speed bar (bottom-left HUD) ─────────────────────── */
