@@ -1726,6 +1726,20 @@ void sub_000110E0(void)
                     oy += os * dt;
                     MEMF(OBS_ADDR(oi, 4)) = oy;
 
+                    /* Same-dir traffic: occasional lane changes.
+                     * Use a simple sine drift based on world position to create
+                     * smooth, deterministic lane-change behavior. Each car gets
+                     * a unique phase from its slot index. */
+                    if (!is_oncoming) {
+                        float drift_phase = oy * 0.03f + (float)oi * 1.57f;
+                        float drift = sinf(drift_phase) * 2.0f * dt;
+                        ox += drift;
+                        /* Clamp to road bounds */
+                        if (ox > 12.0f) ox = 12.0f;
+                        if (ox < -12.0f) ox = -12.0f;
+                        MEMF(OBS_ADDR(oi, 0)) = ox;
+                    }
+
                     /* Recycle if too far behind (or ahead for oncoming that passed) */
                     if (oy < new_py - 60.0f || (is_oncoming && oy < new_py - 30.0f)) {
                         if (is_oncoming) {
