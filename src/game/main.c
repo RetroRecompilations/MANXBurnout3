@@ -1446,7 +1446,7 @@ void game_frame_pump(void)
 
                     /* Edge lines and center dashes (drawn over road) */
                     {
-                        RHW_VERT line_verts[ROAD_SEGS * 18]; /* 3 lines × 6 verts per seg */
+                        RHW_VERT line_verts[ROAD_SEGS * 30]; /* 5 lines × 6 verts per seg */
                         int lvi = 0;
                         for (si = 0; si < ROAD_SEGS; si++) {
                             float t0 = (float)si / ROAD_SEGS;
@@ -1488,7 +1488,7 @@ void game_frame_pump(void)
                             line_verts[lvi++] = (RHW_VERT){re1+ew1, y1, 0.8f, 1.0f, edge_col};
                             line_verts[lvi++] = (RHW_VERT){re1-ew1, y1, 0.8f, 1.0f, edge_col};
 
-                            /* Center dash */
+                            /* Center dash (yellow - divides traffic directions) */
                             float seg_world = py + (d0 + d1) * 0.5f;
                             float phase = fmodf(seg_world, 7.0f);
                             if (phase < 0) phase += 7.0f;
@@ -1504,6 +1504,34 @@ void game_frame_pump(void)
                                 line_verts[lvi++] = (RHW_VERT){cx1+dw1, y1, 0.7f, 1.0f, dash_col};
                                 line_verts[lvi++] = (RHW_VERT){cx1-dw1, y1, 0.7f, 1.0f, dash_col};
                             }
+
+                            /* Lane dashes (white - divides lanes within each side) */
+                            {
+                                float lane_phase = fmodf(seg_world, 5.0f);
+                                if (lane_phase < 0) lane_phase += 5.0f;
+                                if (lane_phase < 2.5f) {
+                                    DWORD lc = 0xFF888899;
+                                    float lw0 = 0.2f * scale0, lw1 = 0.2f * scale1;
+                                    /* Right-side lane divider at +ROAD_HW/2 */
+                                    float rl0 = PROJ_X(ROAD_HW * 0.5f, d0) + co0;
+                                    float rl1 = PROJ_X(ROAD_HW * 0.5f, d1) + co1;
+                                    line_verts[lvi++] = (RHW_VERT){rl0-lw0, y0, 0.75f, 1.0f, lc};
+                                    line_verts[lvi++] = (RHW_VERT){rl0+lw0, y0, 0.75f, 1.0f, lc};
+                                    line_verts[lvi++] = (RHW_VERT){rl1-lw1, y1, 0.75f, 1.0f, lc};
+                                    line_verts[lvi++] = (RHW_VERT){rl0+lw0, y0, 0.75f, 1.0f, lc};
+                                    line_verts[lvi++] = (RHW_VERT){rl1+lw1, y1, 0.75f, 1.0f, lc};
+                                    line_verts[lvi++] = (RHW_VERT){rl1-lw1, y1, 0.75f, 1.0f, lc};
+                                    /* Left-side lane divider at -ROAD_HW/2 */
+                                    float ll0 = PROJ_X(-ROAD_HW * 0.5f, d0) + co0;
+                                    float ll1 = PROJ_X(-ROAD_HW * 0.5f, d1) + co1;
+                                    line_verts[lvi++] = (RHW_VERT){ll0-lw0, y0, 0.75f, 1.0f, lc};
+                                    line_verts[lvi++] = (RHW_VERT){ll0+lw0, y0, 0.75f, 1.0f, lc};
+                                    line_verts[lvi++] = (RHW_VERT){ll1-lw1, y1, 0.75f, 1.0f, lc};
+                                    line_verts[lvi++] = (RHW_VERT){ll0+lw0, y0, 0.75f, 1.0f, lc};
+                                    line_verts[lvi++] = (RHW_VERT){ll1+lw1, y1, 0.75f, 1.0f, lc};
+                                    line_verts[lvi++] = (RHW_VERT){ll1-lw1, y1, 0.75f, 1.0f, lc};
+                                }
+                            }
                         }
                         if (lvi > 0) {
                             g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
@@ -1512,18 +1540,18 @@ void game_frame_pump(void)
                     }
                 }
 
-                /* ── Roadside objects (posts along edges) ─────────────── */
+                /* ── Roadside scenery (trees, posts, buildings) ────────── */
                 {
-                    /* Posts appear every ~20 world units along the road edges.
-                     * They use the curve/hill offsets for correct placement. */
-                    float post_spacing = 20.0f;
-                    float first_post = post_spacing - fmodf(py, post_spacing);
-                    if (first_post < 0.0f) first_post += post_spacing;
+                    /* Objects appear every ~18 world units along road edges.
+                     * Type is deterministic based on world position hash. */
+                    float obj_spacing = 18.0f;
+                    float first_obj = obj_spacing - fmodf(py, obj_spacing);
+                    if (first_obj < 0.0f) first_obj += obj_spacing;
                     float pd;
-                    for (pd = first_post; pd < VIEW_DIST; pd += post_spacing) {
+                    for (pd = first_obj; pd < VIEW_DIST; pd += obj_spacing) {
                         float post_y = PROJ_Y(pd);
-                        float post_scale = PROJ_SCALE(pd);
-                        if (post_y < HORIZON - 20.0f || post_y > SH || post_scale < 0.01f) continue;
+                        float sc = PROJ_SCALE(pd);
+                        if (post_y < HORIZON - 30.0f || post_y > SH || sc < 0.01f) continue;
 
                         /* Interpolate curve/hill offsets */
                         float t_p = 0.0f;
@@ -1535,38 +1563,92 @@ void game_frame_pump(void)
                         float frac = seg_f - (float)seg_i;
                         float pco = curve_offsets[seg_i] * (1.0f - frac) + curve_offsets[seg_i + 1] * frac;
                         float pho = hill_offsets[seg_i] * (1.0f - frac) + hill_offsets[seg_i + 1] * frac;
+                        float sy_base = post_y - pho;
 
-                        float post_sy = post_y - pho;
-                        float pw = 0.3f * post_scale; /* post width */
-                        float ph = 4.0f * post_scale; /* post height */
-                        if (pw < 0.5f) pw = 0.5f;
+                        /* Deterministic object type from world Y position */
+                        int world_idx = (int)((py + pd) / obj_spacing);
+                        int obj_type = ((world_idx * 2654435761u) >> 16) % 4;
+                        /* 0=post, 1=tree, 2=tree(tall), 3=building */
 
-                        /* Left-side post */
-                        float lpx = PROJ_X(-ROAD_HW - 2.0f, pd) + pco;
-                        DWORD post_col = 0xFFAAAAAA;
-                        RHW_VERT lpost[6] = {
-                            {lpx-pw, post_sy-ph, 0.5f, 1.0f, post_col},
-                            {lpx+pw, post_sy-ph, 0.5f, 1.0f, post_col},
-                            {lpx-pw, post_sy,    0.5f, 1.0f, post_col},
-                            {lpx+pw, post_sy-ph, 0.5f, 1.0f, post_col},
-                            {lpx+pw, post_sy,    0.5f, 1.0f, post_col},
-                            {lpx-pw, post_sy,    0.5f, 1.0f, post_col},
-                        };
-                        g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
-                            D3DPT_TRIANGLELIST, 2, lpost, sizeof(RHW_VERT));
+                        int side;
+                        for (side = 0; side < 2; side++) {
+                            float wx = side ? (ROAD_HW + 3.0f) : (-ROAD_HW - 3.0f);
+                            float sx_obj = PROJ_X(wx, pd) + pco;
 
-                        /* Right-side post */
-                        float rpx = PROJ_X(ROAD_HW + 2.0f, pd) + pco;
-                        RHW_VERT rpost[6] = {
-                            {rpx-pw, post_sy-ph, 0.5f, 1.0f, post_col},
-                            {rpx+pw, post_sy-ph, 0.5f, 1.0f, post_col},
-                            {rpx-pw, post_sy,    0.5f, 1.0f, post_col},
-                            {rpx+pw, post_sy-ph, 0.5f, 1.0f, post_col},
-                            {rpx+pw, post_sy,    0.5f, 1.0f, post_col},
-                            {rpx-pw, post_sy,    0.5f, 1.0f, post_col},
-                        };
-                        g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
-                            D3DPT_TRIANGLELIST, 2, rpost, sizeof(RHW_VERT));
+                            if (obj_type == 0) {
+                                /* Grey post / guardrail */
+                                float pw = 0.4f * sc, ph = 3.5f * sc;
+                                if (pw < 0.5f) pw = 0.5f;
+                                DWORD c = 0xFFAAAAAA;
+                                RHW_VERT v[6] = {
+                                    {sx_obj-pw, sy_base-ph, 0.5f, 1.0f, c},
+                                    {sx_obj+pw, sy_base-ph, 0.5f, 1.0f, c},
+                                    {sx_obj-pw, sy_base,    0.5f, 1.0f, c},
+                                    {sx_obj+pw, sy_base-ph, 0.5f, 1.0f, c},
+                                    {sx_obj+pw, sy_base,    0.5f, 1.0f, c},
+                                    {sx_obj-pw, sy_base,    0.5f, 1.0f, c},
+                                };
+                                g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                    D3DPT_TRIANGLELIST, 2, v, sizeof(RHW_VERT));
+                            } else if (obj_type == 1 || obj_type == 2) {
+                                /* Tree: brown trunk + green triangle canopy */
+                                float tw = 0.4f * sc, th = (obj_type == 2 ? 8.0f : 5.0f) * sc;
+                                float cw = (obj_type == 2 ? 3.5f : 2.5f) * sc;
+                                float ch = (obj_type == 2 ? 5.0f : 3.5f) * sc;
+                                if (tw < 0.4f) tw = 0.4f;
+                                DWORD trunk_c = 0xFF443322;
+                                DWORD leaf_c = (world_idx & 1) ? 0xFF227733 : 0xFF2D8844;
+                                /* Trunk */
+                                RHW_VERT tr[6] = {
+                                    {sx_obj-tw, sy_base-th+ch, 0.5f, 1.0f, trunk_c},
+                                    {sx_obj+tw, sy_base-th+ch, 0.5f, 1.0f, trunk_c},
+                                    {sx_obj-tw, sy_base,       0.5f, 1.0f, trunk_c},
+                                    {sx_obj+tw, sy_base-th+ch, 0.5f, 1.0f, trunk_c},
+                                    {sx_obj+tw, sy_base,       0.5f, 1.0f, trunk_c},
+                                    {sx_obj-tw, sy_base,       0.5f, 1.0f, trunk_c},
+                                };
+                                g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                    D3DPT_TRIANGLELIST, 2, tr, sizeof(RHW_VERT));
+                                /* Canopy (triangle) */
+                                RHW_VERT cn[3] = {
+                                    {sx_obj-cw, sy_base-th+ch, 0.48f, 1.0f, leaf_c},
+                                    {sx_obj+cw, sy_base-th+ch, 0.48f, 1.0f, leaf_c},
+                                    {sx_obj,    sy_base-th,    0.48f, 1.0f, leaf_c},
+                                };
+                                g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                    D3DPT_TRIANGLELIST, 1, cn, sizeof(RHW_VERT));
+                            } else {
+                                /* Building: colored rectangle */
+                                float bw = 2.5f * sc, bh = 6.0f * sc;
+                                if (bw < 1.0f) bw = 1.0f;
+                                DWORD bld_colors[4] = {0xFF556677, 0xFF665544, 0xFF554466, 0xFF446655};
+                                DWORD bc = bld_colors[world_idx & 3];
+                                RHW_VERT bv[6] = {
+                                    {sx_obj-bw, sy_base-bh, 0.5f, 1.0f, bc},
+                                    {sx_obj+bw, sy_base-bh, 0.5f, 1.0f, bc},
+                                    {sx_obj-bw, sy_base,    0.5f, 1.0f, bc},
+                                    {sx_obj+bw, sy_base-bh, 0.5f, 1.0f, bc},
+                                    {sx_obj+bw, sy_base,    0.5f, 1.0f, bc},
+                                    {sx_obj-bw, sy_base,    0.5f, 1.0f, bc},
+                                };
+                                g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                    D3DPT_TRIANGLELIST, 2, bv, sizeof(RHW_VERT));
+                                /* Window row */
+                                DWORD win_c = 0xFFAABBDD;
+                                float ww = bw * 0.6f, wh = bh * 0.15f;
+                                float wy = sy_base - bh * 0.6f;
+                                RHW_VERT wv[6] = {
+                                    {sx_obj-ww, wy-wh, 0.49f, 1.0f, win_c},
+                                    {sx_obj+ww, wy-wh, 0.49f, 1.0f, win_c},
+                                    {sx_obj-ww, wy+wh, 0.49f, 1.0f, win_c},
+                                    {sx_obj+ww, wy-wh, 0.49f, 1.0f, win_c},
+                                    {sx_obj+ww, wy+wh, 0.49f, 1.0f, win_c},
+                                    {sx_obj-ww, wy+wh, 0.49f, 1.0f, win_c},
+                                };
+                                g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                    D3DPT_TRIANGLELIST, 2, wv, sizeof(RHW_VERT));
+                            }
+                        }
                     }
                 }
 
