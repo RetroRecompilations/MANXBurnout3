@@ -1547,6 +1547,50 @@ void game_frame_pump(void)
                             D3DPT_TRIANGLELIST, vi / 3, road_verts, sizeof(RHW_VERT));
                     }
 
+                    /* Rain puddles on road surface */
+                    {
+                        float wcyc = fmodf(py / 6000.0f, 1.0f);
+                        if (wcyc < 0.0f) wcyc += 1.0f;
+                        if (wcyc > 0.70f && wcyc < 0.98f) {
+                            g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                                D3DRS_ALPHABLENDENABLE, 1);
+                            g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                                19, 5);
+                            g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                                20, 6);
+                            /* Scatter puddles on road using deterministic hash */
+                            int puddle_si;
+                            for (puddle_si = 0; puddle_si < ROAD_SEGS; puddle_si += 3) {
+                                float pt0 = (float)puddle_si / ROAD_SEGS;
+                                float pd0 = 2.0f + pt0 * pt0 * VIEW_DIST;
+                                float pwy = py + pd0;
+                                uint32_t ph = (uint32_t)((int)(pwy / 8.0f)) * 2654435761u;
+                                if ((ph & 7) > 2) continue; /* ~37% of segments have puddle */
+                                float pho = hill_offsets[puddle_si];
+                                float pco = curve_offsets[puddle_si];
+                                float ps = PROJ_SCALE(pd0);
+                                float plat = (float)((int)((ph >> 8) & 0x1F) - 15) * 0.5f;
+                                float ppx = PROJ_X(plat, pd0) + pco;
+                                float ppy = PROJ_Y(pd0) - pho;
+                                float ppw = 3.0f * ps, pph = 1.0f * ps;
+                                if (ppw < 2.0f || ppy < HORIZON || ppy > SH) continue;
+                                DWORD puddle_c = 0x305577AA; /* semi-transparent blue-grey */
+                                RHW_VERT pud[6] = {
+                                    {ppx-ppw, ppy-pph, 0.85f, 1.0f, puddle_c},
+                                    {ppx+ppw, ppy-pph, 0.85f, 1.0f, puddle_c},
+                                    {ppx-ppw, ppy+pph, 0.85f, 1.0f, puddle_c},
+                                    {ppx+ppw, ppy-pph, 0.85f, 1.0f, puddle_c},
+                                    {ppx+ppw, ppy+pph, 0.85f, 1.0f, puddle_c},
+                                    {ppx-ppw, ppy+pph, 0.85f, 1.0f, puddle_c},
+                                };
+                                g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                    D3DPT_TRIANGLELIST, 2, pud, sizeof(RHW_VERT));
+                            }
+                            g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                                D3DRS_ALPHABLENDENABLE, 0);
+                        }
+                    }
+
                     /* Edge lines and center dashes (drawn over road) */
                     {
                         RHW_VERT line_verts[ROAD_SEGS * 30]; /* 5 lines × 6 verts per seg */
@@ -2285,6 +2329,55 @@ void game_frame_pump(void)
                     }
                 }
 
+                /* ── Wall sparks (on wall collision) ────────────────── */
+                {
+                    float spark_t = _R_MEMF(0x5FFD30);
+                    if (spark_t > 0.0f) {
+                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                            D3DRS_ALPHABLENDENABLE, 1);
+                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                            19, 5);
+                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                            20, 6);
+                        uint32_t spark_side = _R_MEM32(0x5FFD34);
+                        float spark_base_x = spark_side ? (CX + 24.0f) : (CX - 24.0f);
+                        float spark_base_y = SH - 70.0f;
+                        /* Emit 12 spark particles from wall contact point */
+                        static uint32_t _spark_seed = 33333;
+                        int si_sp;
+                        for (si_sp = 0; si_sp < 12; si_sp++) {
+                            _spark_seed = _spark_seed * 1103515245 + 12345;
+                            float dx_sp = ((float)((_spark_seed >> 16) & 0xFF) / 128.0f - 1.0f) *
+                                          (spark_side ? 1.0f : -1.0f) * 30.0f;
+                            _spark_seed = _spark_seed * 1103515245 + 12345;
+                            float dy_sp = ((float)((_spark_seed >> 16) & 0xFF) / 255.0f) * -40.0f;
+                            /* Animate outward based on remaining timer */
+                            float progress = 1.0f - spark_t / 0.4f;
+                            float spx = spark_base_x + dx_sp * progress;
+                            float spy = spark_base_y + dy_sp * progress;
+                            int spa = (int)(spark_t / 0.4f * 200.0f);
+                            if (spa > 200) spa = 200;
+                            /* Color: yellow to orange */
+                            _spark_seed = _spark_seed * 1103515245 + 12345;
+                            DWORD sp_rgb = ((_spark_seed >> 20) & 1) ? 0x00FFAA22 : 0x00FFDD44;
+                            DWORD sp_c = ((DWORD)spa << 24) | sp_rgb;
+                            float ssz = 1.0f + spark_t * 2.0f;
+                            RHW_VERT spv[6] = {
+                                {spx-ssz, spy-ssz, 0.03f, 1.0f, sp_c},
+                                {spx+ssz, spy-ssz, 0.03f, 1.0f, sp_c},
+                                {spx-ssz, spy+ssz, 0.03f, 1.0f, sp_c},
+                                {spx+ssz, spy-ssz, 0.03f, 1.0f, sp_c},
+                                {spx+ssz, spy+ssz, 0.03f, 1.0f, sp_c},
+                                {spx-ssz, spy+ssz, 0.03f, 1.0f, sp_c},
+                            };
+                            g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                D3DPT_TRIANGLELIST, 2, spv, sizeof(RHW_VERT));
+                        }
+                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                            D3DRS_ALPHABLENDENABLE, 0);
+                    }
+                }
+
                 /* ── Rain effect (periodic weather) ──────────────────── */
                 {
                     /* Rain cycles every 6000 world units: clear 0-4000, rain 4000-6000 */
@@ -2571,6 +2664,162 @@ void game_frame_pump(void)
                             D3DPT_TRIANGLELIST, 2, flash_verts, sizeof(RHW_VERT));
                         g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
                             D3DRS_ALPHABLENDENABLE, 0);
+                    }
+                }
+
+                /* ── Rear-view mirror (top center) ──────────────────── */
+                {
+                    /* Mirror viewport: small rectangle at top center */
+                    float mv_x = CX - 60.0f, mv_y = 6.0f;
+                    float mv_w = 120.0f, mv_h = 40.0f;
+
+                    /* Mirror border */
+                    DWORD bdr = 0xFF888888;
+                    float bd = 2.0f;
+                    RHW_VERT bdr_v[24] = {
+                        /* Top */
+                        {mv_x-bd, mv_y-bd, 0.005f, 1.0f, bdr},
+                        {mv_x+mv_w+bd, mv_y-bd, 0.005f, 1.0f, bdr},
+                        {mv_x-bd, mv_y, 0.005f, 1.0f, bdr},
+                        {mv_x+mv_w+bd, mv_y-bd, 0.005f, 1.0f, bdr},
+                        {mv_x+mv_w+bd, mv_y, 0.005f, 1.0f, bdr},
+                        {mv_x-bd, mv_y, 0.005f, 1.0f, bdr},
+                        /* Bottom */
+                        {mv_x-bd, mv_y+mv_h, 0.005f, 1.0f, bdr},
+                        {mv_x+mv_w+bd, mv_y+mv_h, 0.005f, 1.0f, bdr},
+                        {mv_x-bd, mv_y+mv_h+bd, 0.005f, 1.0f, bdr},
+                        {mv_x+mv_w+bd, mv_y+mv_h, 0.005f, 1.0f, bdr},
+                        {mv_x+mv_w+bd, mv_y+mv_h+bd, 0.005f, 1.0f, bdr},
+                        {mv_x-bd, mv_y+mv_h+bd, 0.005f, 1.0f, bdr},
+                        /* Left */
+                        {mv_x-bd, mv_y, 0.005f, 1.0f, bdr},
+                        {mv_x, mv_y, 0.005f, 1.0f, bdr},
+                        {mv_x-bd, mv_y+mv_h, 0.005f, 1.0f, bdr},
+                        {mv_x, mv_y, 0.005f, 1.0f, bdr},
+                        {mv_x, mv_y+mv_h, 0.005f, 1.0f, bdr},
+                        {mv_x-bd, mv_y+mv_h, 0.005f, 1.0f, bdr},
+                        /* Right */
+                        {mv_x+mv_w, mv_y, 0.005f, 1.0f, bdr},
+                        {mv_x+mv_w+bd, mv_y, 0.005f, 1.0f, bdr},
+                        {mv_x+mv_w, mv_y+mv_h, 0.005f, 1.0f, bdr},
+                        {mv_x+mv_w+bd, mv_y, 0.005f, 1.0f, bdr},
+                        {mv_x+mv_w+bd, mv_y+mv_h, 0.005f, 1.0f, bdr},
+                        {mv_x+mv_w, mv_y+mv_h, 0.005f, 1.0f, bdr},
+                    };
+                    g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                        D3DPT_TRIANGLELIST, 8, bdr_v, sizeof(RHW_VERT));
+
+                    /* Mirror background (road behind) */
+                    DWORD mv_road = 0xFF222233;
+                    DWORD mv_sky = tod_sky_bot;
+                    float mv_hz = mv_y + mv_h * 0.4f; /* horizon in mirror */
+                    RHW_VERT mv_bg[12] = {
+                        /* Sky */
+                        {mv_x, mv_y, 0.004f, 1.0f, mv_sky},
+                        {mv_x+mv_w, mv_y, 0.004f, 1.0f, mv_sky},
+                        {mv_x, mv_hz, 0.004f, 1.0f, mv_sky},
+                        {mv_x+mv_w, mv_y, 0.004f, 1.0f, mv_sky},
+                        {mv_x+mv_w, mv_hz, 0.004f, 1.0f, mv_sky},
+                        {mv_x, mv_hz, 0.004f, 1.0f, mv_sky},
+                        /* Road */
+                        {mv_x, mv_hz, 0.004f, 1.0f, mv_road},
+                        {mv_x+mv_w, mv_hz, 0.004f, 1.0f, mv_road},
+                        {mv_x, mv_y+mv_h, 0.004f, 1.0f, mv_road},
+                        {mv_x+mv_w, mv_hz, 0.004f, 1.0f, mv_road},
+                        {mv_x+mv_w, mv_y+mv_h, 0.004f, 1.0f, mv_road},
+                        {mv_x, mv_y+mv_h, 0.004f, 1.0f, mv_road},
+                    };
+                    g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                        D3DPT_TRIANGLELIST, 4, mv_bg, sizeof(RHW_VERT));
+
+                    /* Road edges in mirror (perspective lines converging to center) */
+                    float mv_cx = mv_x + mv_w * 0.5f;
+                    float mv_rw_near = mv_w * 0.45f; /* road half-width at bottom */
+                    float mv_rw_far = mv_w * 0.08f;  /* road half-width at horizon */
+                    DWORD el_c = 0xFFCCCCCC;
+                    RHW_VERT mv_edges[12] = {
+                        /* Left edge */
+                        {mv_cx - mv_rw_near - 1.0f, mv_y+mv_h, 0.003f, 1.0f, el_c},
+                        {mv_cx - mv_rw_near + 1.0f, mv_y+mv_h, 0.003f, 1.0f, el_c},
+                        {mv_cx - mv_rw_far,  mv_hz, 0.003f, 1.0f, el_c},
+                        {mv_cx - mv_rw_near + 1.0f, mv_y+mv_h, 0.003f, 1.0f, el_c},
+                        {mv_cx - mv_rw_far + 1.0f,  mv_hz, 0.003f, 1.0f, el_c},
+                        {mv_cx - mv_rw_far,  mv_hz, 0.003f, 1.0f, el_c},
+                        /* Right edge */
+                        {mv_cx + mv_rw_near - 1.0f, mv_y+mv_h, 0.003f, 1.0f, el_c},
+                        {mv_cx + mv_rw_near + 1.0f, mv_y+mv_h, 0.003f, 1.0f, el_c},
+                        {mv_cx + mv_rw_far - 1.0f,  mv_hz, 0.003f, 1.0f, el_c},
+                        {mv_cx + mv_rw_near + 1.0f, mv_y+mv_h, 0.003f, 1.0f, el_c},
+                        {mv_cx + mv_rw_far,  mv_hz, 0.003f, 1.0f, el_c},
+                        {mv_cx + mv_rw_far - 1.0f,  mv_hz, 0.003f, 1.0f, el_c},
+                    };
+                    g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                        D3DPT_TRIANGLELIST, 4, mv_edges, sizeof(RHW_VERT));
+
+                    /* Render traffic cars behind player in mirror */
+                    {
+                        #define MV_OBS_BASE 0x5FFE00
+                        #define MV_OBS_COUNT 12
+                        #define MV_OBS_SIZE 16
+                        int moi;
+                        for (moi = 0; moi < MV_OBS_COUNT; moi++) {
+                            uint32_t mflags = _R_MEM32(MV_OBS_BASE + moi * MV_OBS_SIZE + 0xC);
+                            if ((mflags & 1) == 0) continue;
+                            float mox = _R_MEMF(MV_OBS_BASE + moi * MV_OBS_SIZE);
+                            float moy = _R_MEMF(MV_OBS_BASE + moi * MV_OBS_SIZE + 4);
+                            /* Distance behind player (negative = behind) */
+                            float behind = py - moy;
+                            if (behind < 1.0f || behind > 60.0f) continue;
+                            /* Project into mirror viewport */
+                            float md = behind;
+                            float mt = 1.0f - (md / 60.0f); /* 0=far, 1=near */
+                            float mv_sx = mv_cx + (mox - px) * mt * 2.0f;
+                            float mv_sy = mv_hz + (mv_y + mv_h - mv_hz) * mt;
+                            float msz = 2.0f + mt * 4.0f; /* car size */
+                            /* Clamp to mirror bounds */
+                            if (mv_sx < mv_x || mv_sx > mv_x + mv_w) continue;
+                            if (mv_sy < mv_hz || mv_sy > mv_y + mv_h) continue;
+                            int is_onc = (mflags & 2) != 0;
+                            DWORD mc = is_onc ? 0xFFFF4444 : 0xFFFFCC44;
+                            RHW_VERT mcv[6] = {
+                                {mv_sx - msz, mv_sy - msz*0.7f, 0.002f, 1.0f, mc},
+                                {mv_sx + msz, mv_sy - msz*0.7f, 0.002f, 1.0f, mc},
+                                {mv_sx - msz, mv_sy + msz*0.7f, 0.002f, 1.0f, mc},
+                                {mv_sx + msz, mv_sy - msz*0.7f, 0.002f, 1.0f, mc},
+                                {mv_sx + msz, mv_sy + msz*0.7f, 0.002f, 1.0f, mc},
+                                {mv_sx - msz, mv_sy + msz*0.7f, 0.002f, 1.0f, mc},
+                            };
+                            g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                D3DPT_TRIANGLELIST, 2, mcv, sizeof(RHW_VERT));
+                            /* Headlights on cars behind (they face toward us) */
+                            if (!is_onc) {
+                                DWORD hl_c = 0xFFFFFF88;
+                                float hlsz = msz * 0.3f;
+                                RHW_VERT hl_l[6] = {
+                                    {mv_sx-msz*0.5f-hlsz, mv_sy-hlsz, 0.001f, 1.0f, hl_c},
+                                    {mv_sx-msz*0.5f+hlsz, mv_sy-hlsz, 0.001f, 1.0f, hl_c},
+                                    {mv_sx-msz*0.5f-hlsz, mv_sy+hlsz, 0.001f, 1.0f, hl_c},
+                                    {mv_sx-msz*0.5f+hlsz, mv_sy-hlsz, 0.001f, 1.0f, hl_c},
+                                    {mv_sx-msz*0.5f+hlsz, mv_sy+hlsz, 0.001f, 1.0f, hl_c},
+                                    {mv_sx-msz*0.5f-hlsz, mv_sy+hlsz, 0.001f, 1.0f, hl_c},
+                                };
+                                RHW_VERT hl_r[6] = {
+                                    {mv_sx+msz*0.5f-hlsz, mv_sy-hlsz, 0.001f, 1.0f, hl_c},
+                                    {mv_sx+msz*0.5f+hlsz, mv_sy-hlsz, 0.001f, 1.0f, hl_c},
+                                    {mv_sx+msz*0.5f-hlsz, mv_sy+hlsz, 0.001f, 1.0f, hl_c},
+                                    {mv_sx+msz*0.5f+hlsz, mv_sy-hlsz, 0.001f, 1.0f, hl_c},
+                                    {mv_sx+msz*0.5f+hlsz, mv_sy+hlsz, 0.001f, 1.0f, hl_c},
+                                    {mv_sx+msz*0.5f-hlsz, mv_sy+hlsz, 0.001f, 1.0f, hl_c},
+                                };
+                                g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                    D3DPT_TRIANGLELIST, 2, hl_l, sizeof(RHW_VERT));
+                                g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                    D3DPT_TRIANGLELIST, 2, hl_r, sizeof(RHW_VERT));
+                            }
+                        }
+                        #undef MV_OBS_BASE
+                        #undef MV_OBS_COUNT
+                        #undef MV_OBS_SIZE
                     }
                 }
 

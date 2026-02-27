@@ -1640,13 +1640,21 @@ void sub_000110E0(void)
                 float road_edge = 14.0f;
                 if (new_px > road_edge) {
                     new_px = road_edge;
-                    /* Reflect heading away from right wall */
                     heading = -heading;
-                    speed *= 0.5f;  /* lose half speed on wall hit */
+                    speed *= 0.5f;
+                    MEMF(0x5FFD30) = 0.4f; /* spark timer */
+                    MEM32(0x5FFD34) = 1; /* spark side: 1=right */
+                    /* Reset multiplier on wall hit */
+                    MEMF(0x5FFD28) = 1.0f;
+                    MEMF(0x5FFD2C) = 0.0f;
                 } else if (new_px < -road_edge) {
                     new_px = -road_edge;
                     heading = -heading;
                     speed *= 0.5f;
+                    MEMF(0x5FFD30) = 0.4f; /* spark timer */
+                    MEM32(0x5FFD34) = 0; /* spark side: 0=left */
+                    MEMF(0x5FFD28) = 1.0f;
+                    MEMF(0x5FFD2C) = 0.0f;
                 }
             }
 
@@ -1917,6 +1925,13 @@ void sub_000110E0(void)
                     cp_flash -= dt;
                     if (cp_flash < 0.0f) cp_flash = 0.0f;
                     MEMF(0x5FFD20) = cp_flash;
+                }
+                /* Spark timer */
+                float spark = MEMF(0x5FFD30);
+                if (spark > 0.0f) {
+                    spark -= dt;
+                    if (spark < 0.0f) spark = 0.0f;
+                    MEMF(0x5FFD30) = spark;
                 }
                 /* Combo/multiplier decay */
                 float combo_timer = MEMF(0x5FFD2C);
