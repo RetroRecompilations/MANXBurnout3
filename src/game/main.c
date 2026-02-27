@@ -1492,6 +1492,64 @@ void game_frame_pump(void)
                     }
                 }
 
+                /* ── Roadside objects (posts along edges) ─────────────── */
+                {
+                    /* Posts appear every ~20 world units along the road edges.
+                     * They use the curve/hill offsets for correct placement. */
+                    float post_spacing = 20.0f;
+                    float first_post = post_spacing - fmodf(py, post_spacing);
+                    if (first_post < 0.0f) first_post += post_spacing;
+                    float pd;
+                    for (pd = first_post; pd < VIEW_DIST; pd += post_spacing) {
+                        float post_y = PROJ_Y(pd);
+                        float post_scale = PROJ_SCALE(pd);
+                        if (post_y < HORIZON - 20.0f || post_y > SH || post_scale < 0.01f) continue;
+
+                        /* Interpolate curve/hill offsets */
+                        float t_p = 0.0f;
+                        if (pd > 2.0f) t_p = sqrtf((pd - 2.0f) / VIEW_DIST);
+                        if (t_p > 1.0f) t_p = 1.0f;
+                        float seg_f = t_p * ROAD_SEGS;
+                        int seg_i = (int)seg_f;
+                        if (seg_i >= ROAD_SEGS) seg_i = ROAD_SEGS - 1;
+                        float frac = seg_f - (float)seg_i;
+                        float pco = curve_offsets[seg_i] * (1.0f - frac) + curve_offsets[seg_i + 1] * frac;
+                        float pho = hill_offsets[seg_i] * (1.0f - frac) + hill_offsets[seg_i + 1] * frac;
+
+                        float post_sy = post_y - pho;
+                        float pw = 0.3f * post_scale; /* post width */
+                        float ph = 4.0f * post_scale; /* post height */
+                        if (pw < 0.5f) pw = 0.5f;
+
+                        /* Left-side post */
+                        float lpx = PROJ_X(-ROAD_HW - 2.0f, pd) + pco;
+                        DWORD post_col = 0xFFAAAAAA;
+                        RHW_VERT lpost[6] = {
+                            {lpx-pw, post_sy-ph, 0.5f, 1.0f, post_col},
+                            {lpx+pw, post_sy-ph, 0.5f, 1.0f, post_col},
+                            {lpx-pw, post_sy,    0.5f, 1.0f, post_col},
+                            {lpx+pw, post_sy-ph, 0.5f, 1.0f, post_col},
+                            {lpx+pw, post_sy,    0.5f, 1.0f, post_col},
+                            {lpx-pw, post_sy,    0.5f, 1.0f, post_col},
+                        };
+                        g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                            D3DPT_TRIANGLELIST, 2, lpost, sizeof(RHW_VERT));
+
+                        /* Right-side post */
+                        float rpx = PROJ_X(ROAD_HW + 2.0f, pd) + pco;
+                        RHW_VERT rpost[6] = {
+                            {rpx-pw, post_sy-ph, 0.5f, 1.0f, post_col},
+                            {rpx+pw, post_sy-ph, 0.5f, 1.0f, post_col},
+                            {rpx-pw, post_sy,    0.5f, 1.0f, post_col},
+                            {rpx+pw, post_sy-ph, 0.5f, 1.0f, post_col},
+                            {rpx+pw, post_sy,    0.5f, 1.0f, post_col},
+                            {rpx-pw, post_sy,    0.5f, 1.0f, post_col},
+                        };
+                        g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                            D3DPT_TRIANGLELIST, 2, rpost, sizeof(RHW_VERT));
+                    }
+                }
+
                 /* ── Traffic obstacles (perspective projected) ───────── */
                 {
                     #define OBS_BASE   0x5FFE00
@@ -1605,6 +1663,31 @@ void game_frame_pump(void)
                     car_cx += heading * 40.0f;
 
                     /* Car body */
+                    /* Car shadow (semi-transparent dark ellipse behind car) */
+                    {
+                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                            D3DRS_ALPHABLENDENABLE, 1);
+                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                            19, 5); /* SRCALPHA */
+                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                            20, 6); /* INVSRCALPHA */
+                        DWORD sh_col = 0x40000000; /* semi-transparent black */
+                        float shw = car_hw + 4.0f, shh = car_hh + 2.0f;
+                        float sh_y = car_cy + 4.0f; /* offset down slightly */
+                        RHW_VERT shadow[6] = {
+                            {car_cx-shw, sh_y-shh, 0.25f, 1.0f, sh_col},
+                            {car_cx+shw, sh_y-shh, 0.25f, 1.0f, sh_col},
+                            {car_cx-shw, sh_y+shh, 0.25f, 1.0f, sh_col},
+                            {car_cx+shw, sh_y-shh, 0.25f, 1.0f, sh_col},
+                            {car_cx+shw, sh_y+shh, 0.25f, 1.0f, sh_col},
+                            {car_cx-shw, sh_y+shh, 0.25f, 1.0f, sh_col},
+                        };
+                        g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                            D3DPT_TRIANGLELIST, 2, shadow, sizeof(RHW_VERT));
+                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                            D3DRS_ALPHABLENDENABLE, 0);
+                    }
+
                     DWORD body_col = 0xFFE0E0FF; /* pale blue-white */
                     RHW_VERT car_body[6] = {
                         {car_cx-car_hw, car_cy-car_hh, 0.2f, 1.0f, body_col},
