@@ -1240,31 +1240,35 @@ void game_frame_pump(void)
             0xFF102040, /* Dark blue-grey */
             1.0f, 0);
 
-        /* Draw car indicator using D3D8 pre-transformed vertices.
-         * Reads velocity/position from fake physics body at 0x5FFF00. */
+        /* Draw top-down driving view using D3D8 pre-transformed vertices.
+         * Camera follows car position. Car rotates with heading. */
         {
             extern ptrdiff_t g_xbox_mem_offset;
             #define _R_MEMF(a) (*(volatile float*)((uintptr_t)(a) + g_xbox_mem_offset))
             #define _R_MEM32(a) (*(volatile uint32_t*)((uintptr_t)(a) + g_xbox_mem_offset))
             uint32_t _phys = _R_MEM32(0x557880 + 0x1B4);
             if (_phys > 0x100 && _phys < 0x4000000) {
-                float vx = _R_MEMF(_phys + 8);
-                float vy = _R_MEMF(_phys + 0xC);
-                float px = _R_MEMF(_phys + 0x10);
-                float py = _R_MEMF(_phys + 0x14);
+                float px      = _R_MEMF(_phys + 0x10);
+                float py      = _R_MEMF(_phys + 0x14);
+                float heading = _R_MEMF(_phys + 0x18);
+                float speed   = _R_MEMF(_phys + 0x1C);
 
-                /* Map position to screen: center at (320,240), 2 px/unit */
-                float cx = 320.0f + px * 2.0f;
-                float cy = 240.0f - py * 2.0f;
-                if (cx < 15.0f) cx = 15.0f;
-                if (cx > 625.0f) cx = 625.0f;
-                if (cy < 15.0f) cy = 15.0f;
-                if (cy > 465.0f) cy = 465.0f;
+                /* Screen constants */
+                const float SCR_W = 640.0f, SCR_H = 480.0f;
+                const float SCR_CX = SCR_W * 0.5f, SCR_CY = SCR_H * 0.5f;
+                const float PX_PER_UNIT = 4.0f;  /* zoom level */
 
-                /* XYZRHW + DIFFUSE vertex: {x, y, z, rhw, color} */
+                /* World-to-screen: camera centered on car */
+                #define W2SX(wx) (SCR_CX + ((wx) - px) * PX_PER_UNIT)
+                #define W2SY(wy) (SCR_CY - ((wy) - py) * PX_PER_UNIT)
+
+                /* Trig for heading: sin/cos for rotating car and road features */
+                float sh = sinf(heading), ch = cosf(heading);
+
+                /* XYZRHW + DIFFUSE vertex */
                 typedef struct { float x, y, z, rhw; DWORD color; } RHW_VERT;
 
-                /* Set render state for flat colored quads */
+                /* Set render state for flat colored primitives */
                 g_d3d_device->lpVtbl->SetVertexShader(g_d3d_device,
                     D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
                 g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
@@ -1275,65 +1279,177 @@ void game_frame_pump(void)
                     D3DRS_CULLMODE, 1 /* D3DCULL_NONE */);
                 g_d3d_device->lpVtbl->SetTexture(g_d3d_device, 0, NULL);
 
-                /* Car body: white rectangle (2 triangles) */
+                /* ── Road surface: wide strip along Y axis ───────────── */
+                /* Draw as a tall rectangle (road width ~30 world units centered at x=0) */
                 {
-                    float hw = 14.0f, hh = 8.0f;
-                    DWORD car_col = 0xFFFFFFFF; /* white */
-                    RHW_VERT car_verts[6] = {
-                        {cx-hw, cy-hh, 0.5f, 1.0f, car_col},
-                        {cx+hw, cy-hh, 0.5f, 1.0f, car_col},
-                        {cx-hw, cy+hh, 0.5f, 1.0f, car_col},
-                        {cx+hw, cy-hh, 0.5f, 1.0f, car_col},
-                        {cx+hw, cy+hh, 0.5f, 1.0f, car_col},
-                        {cx-hw, cy+hh, 0.5f, 1.0f, car_col},
+                    DWORD road_col = 0xFF1A1A2A; /* dark asphalt */
+                    float road_hw = 15.0f; /* half-width in world units */
+                    /* Four corners of a very tall road strip */
+                    float rl = W2SX(-road_hw), rr = W2SX(road_hw);
+                    float rt = 0.0f, rb = SCR_H; /* fill full screen height */
+                    RHW_VERT road[6] = {
+                        {rl, rt, 0.9f, 1.0f, road_col},
+                        {rr, rt, 0.9f, 1.0f, road_col},
+                        {rl, rb, 0.9f, 1.0f, road_col},
+                        {rr, rt, 0.9f, 1.0f, road_col},
+                        {rr, rb, 0.9f, 1.0f, road_col},
+                        {rl, rb, 0.9f, 1.0f, road_col},
                     };
                     g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
-                        D3DPT_TRIANGLELIST, 2, car_verts, sizeof(RHW_VERT));
+                        D3DPT_TRIANGLELIST, 2, road, sizeof(RHW_VERT));
                 }
 
-                /* Velocity indicator: colored line (thin quad) */
-                if (vx != 0.0f || vy != 0.0f) {
-                    float vlen = sqrtf(vx * vx + vy * vy);
-                    float ndx = vx / vlen, ndy = -vy / vlen;
-                    float len = vlen * 25.0f;
-                    if (len > 80.0f) len = 80.0f;
-                    float ex = cx + ndx * len, ey = cy + ndy * len;
-                    /* Perpendicular for line width */
-                    float px0 = -ndy * 1.5f, py0 = ndx * 1.5f;
-                    DWORD vel_col = 0xFFFF3333; /* red */
-                    RHW_VERT vel_verts[6] = {
-                        {cx+px0,  cy+py0,  0.5f, 1.0f, vel_col},
-                        {cx-px0,  cy-py0,  0.5f, 1.0f, vel_col},
-                        {ex+px0,  ey+py0,  0.5f, 1.0f, vel_col},
-                        {cx-px0,  cy-py0,  0.5f, 1.0f, vel_col},
-                        {ex-px0,  ey-py0,  0.5f, 1.0f, vel_col},
-                        {ex+px0,  ey+py0,  0.5f, 1.0f, vel_col},
+                /* ── Road edge lines (left and right) ────────────────── */
+                {
+                    DWORD edge_col = 0xFFCCCCCC; /* white edge lines */
+                    float edge_w = 0.3f; /* line width in world units */
+                    float lx = -15.0f, rx = 15.0f;
+                    float sl = W2SX(lx), sr = W2SX(rx);
+                    float slw = edge_w * PX_PER_UNIT;
+                    /* Left edge */
+                    RHW_VERT ledge[6] = {
+                        {sl-slw, 0.0f, 0.8f, 1.0f, edge_col},
+                        {sl+slw, 0.0f, 0.8f, 1.0f, edge_col},
+                        {sl-slw, SCR_H, 0.8f, 1.0f, edge_col},
+                        {sl+slw, 0.0f, 0.8f, 1.0f, edge_col},
+                        {sl+slw, SCR_H, 0.8f, 1.0f, edge_col},
+                        {sl-slw, SCR_H, 0.8f, 1.0f, edge_col},
                     };
                     g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
-                        D3DPT_TRIANGLELIST, 2, vel_verts, sizeof(RHW_VERT));
+                        D3DPT_TRIANGLELIST, 2, ledge, sizeof(RHW_VERT));
+                    /* Right edge */
+                    RHW_VERT redge[6] = {
+                        {sr-slw, 0.0f, 0.8f, 1.0f, edge_col},
+                        {sr+slw, 0.0f, 0.8f, 1.0f, edge_col},
+                        {sr-slw, SCR_H, 0.8f, 1.0f, edge_col},
+                        {sr+slw, 0.0f, 0.8f, 1.0f, edge_col},
+                        {sr+slw, SCR_H, 0.8f, 1.0f, edge_col},
+                        {sr-slw, SCR_H, 0.8f, 1.0f, edge_col},
+                    };
+                    g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                        D3DPT_TRIANGLELIST, 2, redge, sizeof(RHW_VERT));
                 }
 
-                /* Road lines: horizontal dashes that scroll with position */
+                /* ── Center line dashes (scroll with car's Y position) ── */
                 {
-                    DWORD line_col = 0xFF404060; /* muted blue-grey */
-                    float scroll_x = fmodf(px * 2.0f, 40.0f);
+                    DWORD dash_col = 0xFFAAAA44; /* yellow center line */
+                    float dash_len = 3.0f;  /* world units */
+                    float gap_len  = 4.0f;  /* world units */
+                    float period   = dash_len + gap_len;
+                    float dash_hw  = 0.2f;  /* half-width in world units */
+                    float cx_s = W2SX(0.0f); /* center of road on screen */
+                    float dhw = dash_hw * PX_PER_UNIT;
+
+                    /* How far the camera sees (in world units) */
+                    float view_range = SCR_H / PX_PER_UNIT / 2.0f + period;
+                    float y_start = py - view_range;
+                    /* Snap to period boundary */
+                    y_start = floorf(y_start / period) * period;
                     int i;
-                    for (i = 0; i < 16; i++) {
-                        float lx = (float)(i * 40) - scroll_x;
-                        if (lx < 0.0f) lx += 640.0f;
-                        if (lx > 640.0f) lx -= 640.0f;
+                    for (i = 0; i < 24; i++) {
+                        float wy = y_start + i * period;
+                        float sy_top = W2SY(wy + dash_len);
+                        float sy_bot = W2SY(wy);
+                        /* Cull off-screen */
+                        if (sy_top > SCR_H || sy_bot < 0.0f) continue;
                         RHW_VERT dash[6] = {
-                            {lx, 238.0f, 0.9f, 1.0f, line_col},
-                            {lx+20.0f, 238.0f, 0.9f, 1.0f, line_col},
-                            {lx, 242.0f, 0.9f, 1.0f, line_col},
-                            {lx+20.0f, 238.0f, 0.9f, 1.0f, line_col},
-                            {lx+20.0f, 242.0f, 0.9f, 1.0f, line_col},
-                            {lx, 242.0f, 0.9f, 1.0f, line_col},
+                            {cx_s-dhw, sy_top, 0.7f, 1.0f, dash_col},
+                            {cx_s+dhw, sy_top, 0.7f, 1.0f, dash_col},
+                            {cx_s-dhw, sy_bot, 0.7f, 1.0f, dash_col},
+                            {cx_s+dhw, sy_top, 0.7f, 1.0f, dash_col},
+                            {cx_s+dhw, sy_bot, 0.7f, 1.0f, dash_col},
+                            {cx_s-dhw, sy_bot, 0.7f, 1.0f, dash_col},
                         };
                         g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
                             D3DPT_TRIANGLELIST, 2, dash, sizeof(RHW_VERT));
                     }
                 }
+
+                /* ── Car body: rotated rectangle ─────────────────────── */
+                {
+                    /* Car dimensions in world units */
+                    float car_len = 4.5f;  /* front-to-back */
+                    float car_wid = 2.0f;  /* side-to-side */
+                    float hl = car_len * 0.5f, hw = car_wid * 0.5f;
+                    /* Four corners rotated by heading, in screen coords.
+                     * Car "forward" is along heading direction.
+                     * heading=0 → facing up (north). */
+                    /* Forward and right vectors in world space */
+                    float fw_x = sh, fw_y = ch;   /* forward */
+                    float rt_x = ch, rt_y = -sh;  /* right */
+                    /* World-space corners (relative to car center) */
+                    float c0x = (-hw*rt_x + hl*fw_x), c0y = (-hw*rt_y + hl*fw_y); /* front-left */
+                    float c1x = ( hw*rt_x + hl*fw_x), c1y = ( hw*rt_y + hl*fw_y); /* front-right */
+                    float c2x = ( hw*rt_x - hl*fw_x), c2y = ( hw*rt_y - hl*fw_y); /* rear-right */
+                    float c3x = (-hw*rt_x - hl*fw_x), c3y = (-hw*rt_y - hl*fw_y); /* rear-left */
+                    /* Convert to screen (car is at camera center) */
+                    DWORD car_col = 0xFFE0E0FF; /* pale blue-white */
+                    RHW_VERT car[6] = {
+                        {SCR_CX + c0x*PX_PER_UNIT, SCR_CY - c0y*PX_PER_UNIT, 0.3f, 1.0f, car_col},
+                        {SCR_CX + c1x*PX_PER_UNIT, SCR_CY - c1y*PX_PER_UNIT, 0.3f, 1.0f, car_col},
+                        {SCR_CX + c3x*PX_PER_UNIT, SCR_CY - c3y*PX_PER_UNIT, 0.3f, 1.0f, car_col},
+                        {SCR_CX + c1x*PX_PER_UNIT, SCR_CY - c1y*PX_PER_UNIT, 0.3f, 1.0f, car_col},
+                        {SCR_CX + c2x*PX_PER_UNIT, SCR_CY - c2y*PX_PER_UNIT, 0.3f, 1.0f, car_col},
+                        {SCR_CX + c3x*PX_PER_UNIT, SCR_CY - c3y*PX_PER_UNIT, 0.3f, 1.0f, car_col},
+                    };
+                    g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                        D3DPT_TRIANGLELIST, 2, car, sizeof(RHW_VERT));
+
+                    /* Windshield indicator (front of car): red triangle */
+                    {
+                        DWORD hood_col = 0xFFFF4444; /* red */
+                        float fx = SCR_CX + (hl*fw_x)*PX_PER_UNIT;
+                        float fy = SCR_CY - (hl*fw_y)*PX_PER_UNIT;
+                        float lx = SCR_CX + (hl*0.6f*fw_x - hw*0.5f*rt_x)*PX_PER_UNIT;
+                        float ly = SCR_CY - (hl*0.6f*fw_y - hw*0.5f*rt_y)*PX_PER_UNIT;
+                        float rx2 = SCR_CX + (hl*0.6f*fw_x + hw*0.5f*rt_x)*PX_PER_UNIT;
+                        float ry2 = SCR_CY - (hl*0.6f*fw_y + hw*0.5f*rt_y)*PX_PER_UNIT;
+                        RHW_VERT hood[3] = {
+                            {fx,  fy,  0.2f, 1.0f, hood_col},
+                            {lx, ly, 0.2f, 1.0f, hood_col},
+                            {rx2, ry2, 0.2f, 1.0f, hood_col},
+                        };
+                        g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                            D3DPT_TRIANGLELIST, 1, hood, sizeof(RHW_VERT));
+                    }
+                }
+
+                /* ── Speed bar (bottom-left HUD) ─────────────────────── */
+                {
+                    float abs_spd = speed < 0 ? -speed : speed;
+                    float bar_pct = abs_spd / 50.0f;
+                    if (bar_pct > 1.0f) bar_pct = 1.0f;
+                    float bar_w = bar_pct * 150.0f;
+
+                    /* Background bar */
+                    DWORD bg_col = 0xFF202030;
+                    RHW_VERT bg_bar[6] = {
+                        {10.0f, SCR_H-30.0f, 0.1f, 1.0f, bg_col},
+                        {160.0f, SCR_H-30.0f, 0.1f, 1.0f, bg_col},
+                        {10.0f, SCR_H-18.0f, 0.1f, 1.0f, bg_col},
+                        {160.0f, SCR_H-30.0f, 0.1f, 1.0f, bg_col},
+                        {160.0f, SCR_H-18.0f, 0.1f, 1.0f, bg_col},
+                        {10.0f, SCR_H-18.0f, 0.1f, 1.0f, bg_col},
+                    };
+                    g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                        D3DPT_TRIANGLELIST, 2, bg_bar, sizeof(RHW_VERT));
+
+                    /* Speed fill */
+                    DWORD spd_col = (speed >= 0) ? 0xFF44FF44 : 0xFFFF4444; /* green fwd, red reverse */
+                    RHW_VERT spd_bar[6] = {
+                        {10.0f, SCR_H-30.0f, 0.05f, 1.0f, spd_col},
+                        {10.0f+bar_w, SCR_H-30.0f, 0.05f, 1.0f, spd_col},
+                        {10.0f, SCR_H-18.0f, 0.05f, 1.0f, spd_col},
+                        {10.0f+bar_w, SCR_H-30.0f, 0.05f, 1.0f, spd_col},
+                        {10.0f+bar_w, SCR_H-18.0f, 0.05f, 1.0f, spd_col},
+                        {10.0f, SCR_H-18.0f, 0.05f, 1.0f, spd_col},
+                    };
+                    g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                        D3DPT_TRIANGLELIST, 2, spd_bar, sizeof(RHW_VERT));
+                }
+
+                #undef W2SX
+                #undef W2SY
             }
             #undef _R_MEMF
             #undef _R_MEM32
@@ -1366,19 +1482,19 @@ void game_frame_pump(void)
             /* Car state: 0x557880 + 0x1E4 = state machine index */
             uint32_t car_state  = XMEM32(0x557880 + 0x1E4);
             char title[256];
-            /* Read physics velocity and position for display */
+            /* Read physics state for display */
             uint32_t phys_ptr = XMEM32(0x557880 + 0x1B4);
-            float vx = 0.0f, vy = 0.0f;
+            float spd = 0.0f, hdg = 0.0f;
             float px = 0.0f, py = 0.0f;
             if (phys_ptr > 0x100 && phys_ptr < 0x4000000) {
-                vx = XMEMF(phys_ptr + 8);
-                vy = XMEMF(phys_ptr + 0xC);
-                px = XMEMF(phys_ptr + 0x10);
-                py = XMEMF(phys_ptr + 0x14);
+                px  = XMEMF(phys_ptr + 0x10);
+                py  = XMEMF(phys_ptr + 0x14);
+                hdg = XMEMF(phys_ptr + 0x18);
+                spd = XMEMF(phys_ptr + 0x1C);
             }
             snprintf(title, sizeof(title),
-                "Burnout 3 | state=%u vel=(%.1f,%.1f) pos=(%.0f,%.0f) tick=%u",
-                game_state, vx, vy, px, py, g_tick_110e0_count);
+                "Burnout 3 | spd=%.1f hdg=%.0f° pos=(%.0f,%.0f) tick=%u",
+                spd, hdg * 57.2958f, px, py, g_tick_110e0_count);
             #undef XMEM32
             #undef XMEMF
             SetWindowTextA(g_hwnd, title);

@@ -1550,47 +1550,101 @@ void sub_000110E0(void)
      * in sub_00011240 (gen patch) since the async RW stream reader
      * hangs on NV2A GPU registers. */
 
-    /* Position integration: the game's physics engine (part of the stubbed
-     * RenderWare pipeline) normally handles pos += vel * dt. Since it's not
-     * running, we integrate manually. Velocity is at fake physics body
-     * 0x5FFF00+8/0xC, position stored at +0x10/+0x14.
-     * Only integrate during gameplay (state 4) to avoid garbage accumulation
-     * from uninitialized accumulators during loading. */
+    /* Car physics integration with heading, speed, and drag.
+     *
+     * Fake physics body layout (at phys_ptr = 0x5FFF00):
+     *   +0x08: forward acceleration (written by sub_000636D0)
+     *   +0x0C: turn rate (written by sub_000636D0)
+     *   +0x10: pos_x (world)
+     *   +0x14: pos_y (world)
+     *   +0x18: heading (radians, 0=up/north, CW positive)
+     *   +0x1C: speed (scalar forward speed, units/s)
+     *
+     * Only integrate during gameplay (state 4) to avoid garbage from
+     * uninitialized accumulators during loading states. */
     if (MEM32(0x4D53B8) == 4) {
         uint32_t phys_ptr = MEM32(0x557880 + 0x1B4);
         if (phys_ptr > 0x100 && phys_ptr < 0x3FFFFFF) {
-            /* Reset position/velocity on first gameplay frame to clear
-             * garbage from state transitions with uninitialized accumulators */
             static int _state4_init = 0;
             if (!_state4_init) {
                 _state4_init = 1;
-                MEMF(phys_ptr + 8) = 0.0f;
-                MEMF(phys_ptr + 0xC) = 0.0f;
-                MEMF(phys_ptr + 0x10) = 0.0f;
-                MEMF(phys_ptr + 0x14) = 0.0f;
+                MEMF(phys_ptr + 0x08) = 0.0f;  /* accel */
+                MEMF(phys_ptr + 0x0C) = 0.0f;  /* turn rate */
+                MEMF(phys_ptr + 0x10) = 0.0f;  /* pos_x */
+                MEMF(phys_ptr + 0x14) = 0.0f;  /* pos_y */
+                MEMF(phys_ptr + 0x18) = 0.0f;  /* heading (0 = north) */
+                MEMF(phys_ptr + 0x1C) = 0.0f;  /* speed */
             }
+
             float dt = MEMF(0x4AE1FC);
-            float vel_x = MEMF(phys_ptr + 8);
-            float vel_y = MEMF(phys_ptr + 0xC);
-            MEMF(phys_ptr + 0x10) += vel_x * dt;
-            MEMF(phys_ptr + 0x14) += vel_y * dt;
+            if (dt <= 0.0f || dt > 0.2f) dt = 0.016f; /* sanity clamp */
+
+            float accel     = MEMF(phys_ptr + 0x08);
+            float turn_rate = MEMF(phys_ptr + 0x0C);
+            float heading   = MEMF(phys_ptr + 0x18);
+            float speed     = MEMF(phys_ptr + 0x1C);
+
+            /* Apply acceleration */
+            speed += accel * dt;
+
+            /* Drag: proportional to speed, decelerates when not accelerating.
+             * drag_coeff = 0.8 means speed halves in ~0.87s with no input. */
+            float drag = 0.8f;
+            speed *= (1.0f - drag * dt);
+
+            /* Clamp speed: max ~50 units/s forward, allow small reverse */
+            if (speed > 50.0f) speed = 50.0f;
+            if (speed < -10.0f) speed = -10.0f;
+            /* Kill very small speeds to prevent creeping */
+            if (speed > -0.01f && speed < 0.01f) speed = 0.0f;
+
+            /* Steering: turn rate scales with speed (can't turn while stopped).
+             * At low speed, reduce turn. At high speed, slightly reduce too. */
+            {
+                float speed_factor;
+                float abs_spd = speed < 0 ? -speed : speed;
+                if (abs_spd < 0.5f)
+                    speed_factor = abs_spd * 2.0f; /* ramp 0→1 over 0..0.5 */
+                else if (abs_spd > 30.0f)
+                    speed_factor = 1.0f - (abs_spd - 30.0f) * 0.01f; /* slight reduction */
+                else
+                    speed_factor = 1.0f;
+                if (speed_factor < 0.0f) speed_factor = 0.0f;
+                if (speed_factor > 1.0f) speed_factor = 1.0f;
+                heading += turn_rate * speed_factor * dt;
+            }
+
+            /* Normalize heading to [-pi, pi] */
+            while (heading > 3.14159265f) heading -= 6.28318530f;
+            while (heading < -3.14159265f) heading += 6.28318530f;
+
+            /* Position integration: move along heading direction.
+             * heading=0 → north (pos_y increases), heading=pi/2 → east (pos_x increases) */
+            float dx = sinf(heading) * speed * dt;
+            float dy = cosf(heading) * speed * dt;
+            MEMF(phys_ptr + 0x10) += dx;
+            MEMF(phys_ptr + 0x14) += dy;
+
+            /* Store updated heading and speed */
+            MEMF(phys_ptr + 0x18) = heading;
+            MEMF(phys_ptr + 0x1C) = speed;
         }
     }
 
     /* Diagnostic: print state, timing, and simulation data */
     if (tick_count <= 20 || (tick_count % 500 == 0)) {
         uint32_t phys_ptr = MEM32(0x557880 + 0x1B4);
-        float vel_x = 0.0f, vel_y = 0.0f;
+        float spd = 0.0f, hdg = 0.0f;
         float pos_x = 0.0f, pos_y = 0.0f;
         if (phys_ptr > 0x100 && phys_ptr < 0x3FFFFFF) {
-            vel_x = MEMF(phys_ptr + 8);
-            vel_y = MEMF(phys_ptr + 0xC);
             pos_x = MEMF(phys_ptr + 0x10);
             pos_y = MEMF(phys_ptr + 0x14);
+            hdg   = MEMF(phys_ptr + 0x18);
+            spd   = MEMF(phys_ptr + 0x1C);
         }
-        fprintf(stderr, "  [TICK] #%u: game=%u dt=%.4f vel=(%.2f,%.2f) pos=(%.1f,%.1f) icalls=%llu\n",
+        fprintf(stderr, "  [TICK] #%u: game=%u dt=%.4f spd=%.2f hdg=%.1f° pos=(%.1f,%.1f) icalls=%llu\n",
                 tick_count, MEM32(0x4D53B8), MEMF(0x4AE1FC),
-                vel_x, vel_y, pos_x, pos_y,
+                spd, hdg * 57.2958f, pos_x, pos_y,
                 (unsigned long long)g_icall_count);
     }
 
@@ -2090,49 +2144,43 @@ void sub_000636D0(void)
         }
     }
 
-    /* ─── Part 1: Force computation with scale fallbacks ──────────── */
+    /* ─── Part 1: Force computation (car model) ──────────────────── */
+    /* Fake physics body layout at 0x5FFF00:
+     *   +0x08: forward acceleration (set here, read by integrator)
+     *   +0x0C: turn rate (set here, read by integrator)
+     *   +0x10: pos_x (world, set by integrator)
+     *   +0x14: pos_y (world, set by integrator)
+     *   +0x18: heading (radians, 0=up/north, CW positive)
+     *   +0x1C: speed (scalar forward speed)
+     */
     {
         int32_t raw_thr = (int32_t)MEM32(0x4D652C)
                         - (int32_t)MEM32(0x4D6B24)
                         - (int32_t)MEM32(0x4D6B20);
-        /* Scale factors: the game normally initializes these during car/track
-         * setup, but the init path doesn't fully run in our recompilation.
-         * Memory contains garbage (e.g., 2.44e-06). Override unconditionally
-         * with values that produce reasonable physics response.
-         *
-         * force = raw_input * sensitivity * multiplier
-         * With sensitivity=0.001 and multiplier=1.0:
-         *   W key (raw=255): force = 0.255 units/tick
-         *   Full gamepad (raw=2040): force = 2.04 units/tick
-         */
-        float s1 = 0.001f;  /* throttle sensitivity */
-        float s2 = 1.0f;    /* throttle force multiplier */
-        float throttle_f = (float)raw_thr * s1 * s2;
+        /* acceleration = raw_input * 0.001
+         *   W key (raw=1000): accel = 1.0 units/s^2
+         *   Gamepad (raw=2040): accel = 2.04 units/s^2 */
+        float accel_f = (float)raw_thr * 0.001f;
 
         int32_t raw_str = (int32_t)MEM32(0x4D6530)
                         - 2 * (int32_t)MEM32(0x4D6B28);
-        float s3 = 0.001f;  /* steering sensitivity */
-        float s4 = 1.0f;    /* steering force multiplier */
-        float steering_f = (float)raw_str * s3 * s4;
+        /* turn_rate = raw_input * 0.003 radians/s (scaled by speed in integrator)
+         *   A/D key (raw=1000): base turn rate = 3.0 rad/s */
+        float turn_f = (float)raw_str * 0.003f;
 
-        /* Write forces to velocity vector (bitcast float->u32, matching
-         * original movss/mov pattern at loc_00063757) */
-        union { float f; uint32_t u; } tf, sf;
-        tf.f = throttle_f;
-        sf.f = steering_f;
         uint32_t vel_ptr = MEM32(esi + 0x1B4);
-        MEM32(vel_ptr + 8) = tf.u;
-        MEM32(vel_ptr + 0xC) = sf.u;
+        MEMF(vel_ptr + 8) = accel_f;
+        MEMF(vel_ptr + 0xC) = turn_f;
 
         /* Debug: log when non-zero force is applied */
         {
             static int _wr_dbg = 0;
             _wr_dbg++;
             if (_wr_dbg == 1 ||
-                ((throttle_f != 0.0f || steering_f != 0.0f) && _wr_dbg % 60 == 0)) {
+                ((accel_f != 0.0f || turn_f != 0.0f) && _wr_dbg % 60 == 0)) {
                 fprintf(stderr,
-                    "  [PHY-WR] #%d vel_ptr=0x%08X force=(%.3f,%.3f)\n",
-                    _wr_dbg, vel_ptr, throttle_f, steering_f);
+                    "  [PHY-WR] #%d accel=%.3f turn=%.3f spd=%.2f hdg=%.2f\n",
+                    _wr_dbg, accel_f, turn_f, MEMF(vel_ptr + 0x1C), MEMF(vel_ptr + 0x18));
             }
         }
     }

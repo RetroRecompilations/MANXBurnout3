@@ -60,7 +60,7 @@ static const char g_vs_source[] =
     "    \n"
     "    // Diffuse color: use vertex color if present, else white\n"
     "    if (Flags & 2u)\n"
-    "        o.color = input.diffuse;\n"
+    "        o.color = input.diffuse.bgra; // D3DCOLOR is BGRA in memory, swizzle to RGBA\n"
     "    else\n"
     "        o.color = float4(1, 1, 1, 1);\n"
     "    \n"
@@ -179,7 +179,16 @@ static ID3D11InputLayout *get_or_create_layout(DWORD fvf)
             return g_layout_cache[i].layout;
     }
 
-    /* Build input element description from FVF */
+    /* Build input element description from FVF.
+     *
+     * The vertex shader declares all four inputs (POSITION, NORMAL,
+     * COLOR0, TEXCOORD0). D3D11 CreateInputLayout requires that any
+     * semantic the shader reads must be present in the layout.
+     * For missing FVF components, we add dummy elements at offset 0
+     * (they'll read overlapping data but the shader ignores them via
+     * the Flags constant buffer). */
+
+    /* POSITION (required - always present from XYZ or XYZRHW) */
     if (fvf & D3DFVF_XYZRHW) {
         elems[elem_count].SemanticName = "POSITION";
         elems[elem_count].SemanticIndex = 0;
@@ -202,6 +211,7 @@ static ID3D11InputLayout *get_or_create_layout(DWORD fvf)
         offset += 12;
     }
 
+    /* NORMAL */
     if (fvf & D3DFVF_NORMAL) {
         elems[elem_count].SemanticName = "NORMAL";
         elems[elem_count].SemanticIndex = 0;
@@ -212,18 +222,39 @@ static ID3D11InputLayout *get_or_create_layout(DWORD fvf)
         elems[elem_count].InstanceDataStepRate = 0;
         elem_count++;
         offset += 12;
+    } else {
+        /* Dummy NORMAL at offset 0 - shader ignores via Flags */
+        elems[elem_count].SemanticName = "NORMAL";
+        elems[elem_count].SemanticIndex = 0;
+        elems[elem_count].Format = DXGI_FORMAT_R32G32B32_FLOAT;
+        elems[elem_count].InputSlot = 0;
+        elems[elem_count].AlignedByteOffset = 0;
+        elems[elem_count].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+        elems[elem_count].InstanceDataStepRate = 0;
+        elem_count++;
     }
 
+    /* COLOR0 (Diffuse) */
     if (fvf & D3DFVF_DIFFUSE) {
         elems[elem_count].SemanticName = "COLOR";
         elems[elem_count].SemanticIndex = 0;
-        elems[elem_count].Format = DXGI_FORMAT_B8G8R8A8_UNORM;  /* D3DCOLOR is BGRA */
+        elems[elem_count].Format = DXGI_FORMAT_R8G8B8A8_UNORM;  /* D3DCOLOR bytes; shader swizzles BGRA→RGBA */
         elems[elem_count].InputSlot = 0;
         elems[elem_count].AlignedByteOffset = offset;
         elems[elem_count].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
         elems[elem_count].InstanceDataStepRate = 0;
         elem_count++;
         offset += 4;
+    } else {
+        /* Dummy COLOR at offset 0 - shader uses white default via Flags */
+        elems[elem_count].SemanticName = "COLOR";
+        elems[elem_count].SemanticIndex = 0;
+        elems[elem_count].Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        elems[elem_count].InputSlot = 0;
+        elems[elem_count].AlignedByteOffset = 0;
+        elems[elem_count].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+        elems[elem_count].InstanceDataStepRate = 0;
+        elem_count++;
     }
 
     if (fvf & D3DFVF_SPECULAR) {
@@ -231,19 +262,32 @@ static ID3D11InputLayout *get_or_create_layout(DWORD fvf)
         offset += 4;
     }
 
+    /* TEXCOORD0 */
     {
         UINT tex_count = (fvf & D3DFVF_TEXCOUNT_MASK) >> D3DFVF_TEXCOUNT_SHIFT;
-        UINT t;
-        for (t = 0; t < tex_count && elem_count < 8; t++) {
+        if (tex_count > 0) {
+            UINT t;
+            for (t = 0; t < tex_count && elem_count < 8; t++) {
+                elems[elem_count].SemanticName = "TEXCOORD";
+                elems[elem_count].SemanticIndex = t;
+                elems[elem_count].Format = DXGI_FORMAT_R32G32_FLOAT;
+                elems[elem_count].InputSlot = 0;
+                elems[elem_count].AlignedByteOffset = offset;
+                elems[elem_count].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+                elems[elem_count].InstanceDataStepRate = 0;
+                elem_count++;
+                offset += 8;
+            }
+        } else {
+            /* Dummy TEXCOORD0 at offset 0 - shader ignores via Flags */
             elems[elem_count].SemanticName = "TEXCOORD";
-            elems[elem_count].SemanticIndex = t;
+            elems[elem_count].SemanticIndex = 0;
             elems[elem_count].Format = DXGI_FORMAT_R32G32_FLOAT;
             elems[elem_count].InputSlot = 0;
-            elems[elem_count].AlignedByteOffset = offset;
+            elems[elem_count].AlignedByteOffset = 0;
             elems[elem_count].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
             elems[elem_count].InstanceDataStepRate = 0;
             elem_count++;
-            offset += 8;
         }
     }
 
@@ -262,7 +306,14 @@ static ID3D11InputLayout *get_or_create_layout(DWORD fvf)
         &layout);
 
     if (FAILED(hr)) {
-        fprintf(stderr, "D3D8: CreateInputLayout failed for FVF 0x%lX: 0x%08lX\n", fvf, hr);
+        fprintf(stderr, "D3D8: CreateInputLayout failed for FVF 0x%lX (%u elems): 0x%08lX\n",
+                fvf, elem_count, hr);
+        /* Cache the failure (NULL layout) to prevent repeated creation attempts */
+        if (g_layout_cache_count < MAX_LAYOUT_CACHE) {
+            g_layout_cache[g_layout_cache_count].fvf = fvf;
+            g_layout_cache[g_layout_cache_count].layout = NULL;
+            g_layout_cache_count++;
+        }
         return NULL;
     }
 
