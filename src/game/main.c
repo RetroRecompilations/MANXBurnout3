@@ -1448,6 +1448,66 @@ void game_frame_pump(void)
                         D3DPT_TRIANGLELIST, 2, spd_bar, sizeof(RHW_VERT));
                 }
 
+                /* ── Traffic obstacles ────────────────────────────────── */
+                {
+                    #define OBS_BASE   0x5FFE00
+                    #define OBS_COUNT  8
+                    #define OBS_SIZE   16
+                    #define OBS_ADDR(i, off) (OBS_BASE + (i) * OBS_SIZE + (off))
+                    DWORD obs_colors[4] = { 0xFFFF6633, 0xFF33CCFF, 0xFFFFCC33, 0xFF66FF66 };
+                    int oi;
+                    for (oi = 0; oi < OBS_COUNT; oi++) {
+                        if (_R_MEM32(OBS_ADDR(oi, 0xC)) == 0) continue;
+                        float ox = _R_MEMF(OBS_ADDR(oi, 0));
+                        float oy = _R_MEMF(OBS_ADDR(oi, 4));
+                        float sx = W2SX(ox);
+                        float sy = W2SY(oy);
+                        /* Cull off-screen */
+                        if (sx < -20.0f || sx > SCR_W+20.0f || sy < -20.0f || sy > SCR_H+20.0f) continue;
+                        /* Draw as colored rectangle (same size as player car) */
+                        float ohw = 2.0f * PX_PER_UNIT, ohh = 2.25f * PX_PER_UNIT;
+                        DWORD oc = obs_colors[oi & 3];
+                        RHW_VERT obs[6] = {
+                            {sx-ohw, sy-ohh, 0.4f, 1.0f, oc},
+                            {sx+ohw, sy-ohh, 0.4f, 1.0f, oc},
+                            {sx-ohw, sy+ohh, 0.4f, 1.0f, oc},
+                            {sx+ohw, sy-ohh, 0.4f, 1.0f, oc},
+                            {sx+ohw, sy+ohh, 0.4f, 1.0f, oc},
+                            {sx-ohw, sy+ohh, 0.4f, 1.0f, oc},
+                        };
+                        g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                            D3DPT_TRIANGLELIST, 2, obs, sizeof(RHW_VERT));
+                    }
+                    #undef OBS_BASE
+                    #undef OBS_COUNT
+                    #undef OBS_SIZE
+                    #undef OBS_ADDR
+                }
+
+                /* ── Takedown counter (top-right HUD) ────────────────── */
+                {
+                    uint32_t takedowns = _R_MEM32(0x5FFD00);
+                    if (takedowns > 0) {
+                        /* Draw takedown pips (small squares) */
+                        DWORD td_col = 0xFFFF3333; /* red */
+                        uint32_t ti;
+                        for (ti = 0; ti < takedowns && ti < 20; ti++) {
+                            float tx = SCR_W - 20.0f - (float)(ti % 10) * 14.0f;
+                            float ty = 10.0f + (float)(ti / 10) * 14.0f;
+                            RHW_VERT pip[6] = {
+                                {tx,      ty,      0.05f, 1.0f, td_col},
+                                {tx+10.0f, ty,      0.05f, 1.0f, td_col},
+                                {tx,      ty+10.0f, 0.05f, 1.0f, td_col},
+                                {tx+10.0f, ty,      0.05f, 1.0f, td_col},
+                                {tx+10.0f, ty+10.0f, 0.05f, 1.0f, td_col},
+                                {tx,      ty+10.0f, 0.05f, 1.0f, td_col},
+                            };
+                            g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                D3DPT_TRIANGLELIST, 2, pip, sizeof(RHW_VERT));
+                        }
+                    }
+                }
+
                 #undef W2SX
                 #undef W2SY
             }
@@ -1492,9 +1552,10 @@ void game_frame_pump(void)
                 hdg = XMEMF(phys_ptr + 0x18);
                 spd = XMEMF(phys_ptr + 0x1C);
             }
+            uint32_t takedowns = XMEM32(0x5FFD00);
             snprintf(title, sizeof(title),
-                "Burnout 3 | spd=%.1f hdg=%.0f° pos=(%.0f,%.0f) tick=%u",
-                spd, hdg * 57.2958f, px, py, g_tick_110e0_count);
+                "Burnout 3 | spd=%.1f hdg=%.0f° pos=(%.0f,%.0f) takedowns=%u",
+                spd, hdg * 57.2958f, px, py, takedowns);
             #undef XMEM32
             #undef XMEMF
             SetWindowTextA(g_hwnd, title);
