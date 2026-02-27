@@ -1550,17 +1550,47 @@ void sub_000110E0(void)
      * in sub_00011240 (gen patch) since the async RW stream reader
      * hangs on NV2A GPU registers. */
 
+    /* Position integration: the game's physics engine (part of the stubbed
+     * RenderWare pipeline) normally handles pos += vel * dt. Since it's not
+     * running, we integrate manually. Velocity is at fake physics body
+     * 0x5FFF00+8/0xC, position stored at +0x10/+0x14.
+     * Only integrate during gameplay (state 4) to avoid garbage accumulation
+     * from uninitialized accumulators during loading. */
+    if (MEM32(0x4D53B8) == 4) {
+        uint32_t phys_ptr = MEM32(0x557880 + 0x1B4);
+        if (phys_ptr > 0x100 && phys_ptr < 0x3FFFFFF) {
+            /* Reset position/velocity on first gameplay frame to clear
+             * garbage from state transitions with uninitialized accumulators */
+            static int _state4_init = 0;
+            if (!_state4_init) {
+                _state4_init = 1;
+                MEMF(phys_ptr + 8) = 0.0f;
+                MEMF(phys_ptr + 0xC) = 0.0f;
+                MEMF(phys_ptr + 0x10) = 0.0f;
+                MEMF(phys_ptr + 0x14) = 0.0f;
+            }
+            float dt = MEMF(0x4AE1FC);
+            float vel_x = MEMF(phys_ptr + 8);
+            float vel_y = MEMF(phys_ptr + 0xC);
+            MEMF(phys_ptr + 0x10) += vel_x * dt;
+            MEMF(phys_ptr + 0x14) += vel_y * dt;
+        }
+    }
+
     /* Diagnostic: print state, timing, and simulation data */
     if (tick_count <= 20 || (tick_count % 500 == 0)) {
         uint32_t phys_ptr = MEM32(0x557880 + 0x1B4);
         float vel_x = 0.0f, vel_y = 0.0f;
+        float pos_x = 0.0f, pos_y = 0.0f;
         if (phys_ptr > 0x100 && phys_ptr < 0x3FFFFFF) {
             vel_x = MEMF(phys_ptr + 8);
             vel_y = MEMF(phys_ptr + 0xC);
+            pos_x = MEMF(phys_ptr + 0x10);
+            pos_y = MEMF(phys_ptr + 0x14);
         }
-        fprintf(stderr, "  [TICK] #%u: game=%u dt=%.4f car=%u vel=(%.2f,%.2f) icalls=%llu\n",
+        fprintf(stderr, "  [TICK] #%u: game=%u dt=%.4f vel=(%.2f,%.2f) pos=(%.1f,%.1f) icalls=%llu\n",
                 tick_count, MEM32(0x4D53B8), MEMF(0x4AE1FC),
-                MEM32(0x557880 + 0x1E4), vel_x, vel_y,
+                vel_x, vel_y, pos_x, pos_y,
                 (unsigned long long)g_icall_count);
     }
 

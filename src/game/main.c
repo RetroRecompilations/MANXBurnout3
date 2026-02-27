@@ -1245,6 +1245,48 @@ void game_frame_pump(void)
             extern volatile uint32_t g_present_count;
             g_present_count++;
         }
+
+        /* Draw a simple car indicator using GDI overlay.
+         * Reads position from the fake physics body at 0x5FFF00+0x10/0x14
+         * and renders a colored rectangle on screen. */
+        if (g_hwnd) {
+            extern ptrdiff_t g_xbox_mem_offset;
+            #define _GDI_MEMF(a) (*(volatile float*)((uintptr_t)(a) + g_xbox_mem_offset))
+            uint32_t _phys = *(volatile uint32_t*)((uintptr_t)(0x557880 + 0x1B4) + g_xbox_mem_offset);
+            if (_phys > 0x100 && _phys < 0x4000000) {
+                float vx = _GDI_MEMF(_phys + 8);
+                float vy = _GDI_MEMF(_phys + 0xC);
+                float px = _GDI_MEMF(_phys + 0x10);
+                float py = _GDI_MEMF(_phys + 0x14);
+                /* Map position to screen: center at (320,240), 1 unit = 2 pixels */
+                int cx = 320 + (int)(px * 2.0f);
+                int cy = 240 - (int)(py * 2.0f);
+                /* Clamp to screen bounds */
+                if (cx < 15) cx = 15;
+                if (cx > 625) cx = 625;
+                if (cy < 15) cy = 15;
+                if (cy > 465) cy = 465;
+                HDC hdc = GetDC(g_hwnd);
+                if (hdc) {
+                    /* Car body: white rectangle */
+                    HBRUSH car_brush = CreateSolidBrush(RGB(255, 255, 255));
+                    RECT car_rc = { cx - 12, cy - 6, cx + 12, cy + 6 };
+                    FillRect(hdc, &car_rc, car_brush);
+                    DeleteObject(car_brush);
+                    /* Velocity indicator: red line from center in velocity direction */
+                    if (vx != 0.0f || vy != 0.0f) {
+                        HPEN vel_pen = CreatePen(PS_SOLID, 2, RGB(255, 50, 50));
+                        HPEN old_pen = (HPEN)SelectObject(hdc, vel_pen);
+                        MoveToEx(hdc, cx, cy, NULL);
+                        LineTo(hdc, cx + (int)(vx * 20.0f), cy - (int)(vy * 20.0f));
+                        SelectObject(hdc, old_pen);
+                        DeleteObject(vel_pen);
+                    }
+                    ReleaseDC(g_hwnd, hdc);
+                }
+            }
+            #undef _GDI_MEMF
+        }
     }
 
     /* Update window title with game state (every 30 frames) */
@@ -1266,17 +1308,19 @@ void game_frame_pump(void)
             /* Car state: 0x557880 + 0x1E4 = state machine index */
             uint32_t car_state  = XMEM32(0x557880 + 0x1E4);
             char title[256];
-            /* Read physics velocity for display */
+            /* Read physics velocity and position for display */
             uint32_t phys_ptr = XMEM32(0x557880 + 0x1B4);
             float vx = 0.0f, vy = 0.0f;
-            if (phys_ptr > 0x10000 && phys_ptr < 0x4000000) {
+            float px = 0.0f, py = 0.0f;
+            if (phys_ptr > 0x100 && phys_ptr < 0x4000000) {
                 vx = XMEMF(phys_ptr + 8);
                 vy = XMEMF(phys_ptr + 0xC);
+                px = XMEMF(phys_ptr + 0x10);
+                py = XMEMF(phys_ptr + 0x14);
             }
             snprintf(title, sizeof(title),
-                "Burnout 3 | state=%u car=%u tick=%u dt=%.3f vel=(%.1f,%.1f) icalls=%llu",
-                game_state, car_state, g_tick_110e0_count,
-                delta_time, vx, vy, (unsigned long long)g_icall_count);
+                "Burnout 3 | state=%u vel=(%.1f,%.1f) pos=(%.0f,%.0f) tick=%u",
+                game_state, vx, vy, px, py, g_tick_110e0_count);
             #undef XMEM32
             #undef XMEMF
             SetWindowTextA(g_hwnd, title);
