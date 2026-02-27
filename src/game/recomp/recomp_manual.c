@@ -145,6 +145,9 @@ void sub_001C66F0(void);
 /* Game state notification dispatch (recursion-guarded) */
 void sub_00022660(void);
 
+/* Car physics force computation (overridden - scale factor fallbacks) */
+void sub_000636D0(void);
+
 
 /* ── Manual dispatch table ────────────────────────────────────────────
  *
@@ -268,6 +271,8 @@ static const struct {
     { 0x00135040u, (recomp_func_t)sub_00135040 },
     /* Resource slot polling (version-check bypass) */
     { 0x00018BB0u, (recomp_func_t)sub_00018BB0 },
+    /* Car physics force computation (scale factor fallbacks) */
+    { 0x000636D0u, (recomp_func_t)sub_000636D0 },
 };
 #define NUM_MANUAL_FUNCS (sizeof(g_manual_funcs) / sizeof(g_manual_funcs[0]))
 
@@ -1549,7 +1554,7 @@ void sub_000110E0(void)
     if (tick_count <= 20 || (tick_count % 500 == 0)) {
         uint32_t phys_ptr = MEM32(0x557880 + 0x1B4);
         float vel_x = 0.0f, vel_y = 0.0f;
-        if (phys_ptr > 0x10000 && phys_ptr < 0x800000) {
+        if (phys_ptr > 0x100 && phys_ptr < 0x3FFFFFF) {
             vel_x = MEMF(phys_ptr + 8);
             vel_y = MEMF(phys_ptr + 0xC);
         }
@@ -1989,5 +1994,336 @@ void sub_00022660(void)
  */
 void sub_0003D9E0(void)
 {
+    esp += 4; return; /* pop dummy return address */
+}
+
+/**
+ * sub_000636D0 - Car physics force computation (OVERRIDE)
+ *
+ * Original: 0x000636D0 - 0x00063A68 (920 bytes, 216 insns)
+ * CC: cdecl, 0 params, returns int_or_void
+ *
+ * Computes throttle/steering forces from input accumulators and writes
+ * them to the car's velocity vector. Also manages the boost state
+ * machine and physics callbacks when boost is active.
+ *
+ * Override reason: Scale factors at 0x557870, 0x3B1C40, 0x5592C8,
+ * 0x3B1C38 are zero/denormalized because the game's car/track init
+ * doesn't fully initialize them in our recompilation. We fall back
+ * to hardcoded scales when they're near-zero.
+ *
+ * Register input: esi = car object pointer (0x557880, set by caller)
+ */
+void sub_000636D0(void)
+{
+    uint32_t saved_ebx = ebx;
+    uint32_t saved_edi = edi;
+    float delta_time = MEMF(0x4AE1FC);
+    uint8_t boost_end_flag = 0;
+
+    /* Debug: log first call and periodically */
+    {
+        static int _dbg = 0;
+        _dbg++;
+        if (_dbg == 1 || (_dbg % 1000 == 0)) {
+            fprintf(stderr, "  [PHY] #%d esi=0x%08X vel_ptr=0x%08X boost=%d\n",
+                    _dbg, esi, MEM32(esi + 0x1B4), MEM8(0x4A4B90));
+        }
+    }
+
+    /* ─── Part 0: Ensure physics body exists ─────────────────────── */
+    /* The car's physics velocity pointer (esi+0x1B4) is NULL because
+     * the game's physics world init path doesn't fully run in our
+     * recompilation. Allocate a fake physics body in unused Xbox memory
+     * so forces have somewhere to write. Address 0x5FFF00 is in free
+     * BSS space past the image end (~0x5A4000). */
+    {
+        uint32_t vel_ptr_check = MEM32(esi + 0x1B4);
+        if (vel_ptr_check == 0 || vel_ptr_check > 0x3FFFFFF) {
+            static int _init_once = 0;
+            if (!_init_once) {
+                _init_once = 1;
+                /* Zero out fake physics body (32 bytes) */
+                MEM32(0x5FFF00 + 0) = 0;
+                MEM32(0x5FFF00 + 4) = 0;
+                MEM32(0x5FFF00 + 8) = 0;  /* vel.x */
+                MEM32(0x5FFF00 + 0xC) = 0; /* vel.y */
+                MEM32(0x5FFF00 + 0x10) = 0;
+                MEM32(0x5FFF00 + 0x14) = 0;
+                MEM32(0x5FFF00 + 0x18) = 0;
+                MEM32(0x5FFF00 + 0x1C) = 0;
+                fprintf(stderr,
+                    "  [PHY] Allocated fake physics body at 0x5FFF00 "
+                    "(old vel_ptr=0x%08X)\n", vel_ptr_check);
+            }
+            MEM32(esi + 0x1B4) = 0x5FFF00;
+        }
+    }
+
+    /* ─── Part 1: Force computation with scale fallbacks ──────────── */
+    {
+        int32_t raw_thr = (int32_t)MEM32(0x4D652C)
+                        - (int32_t)MEM32(0x4D6B24)
+                        - (int32_t)MEM32(0x4D6B20);
+        /* Scale factors: the game normally initializes these during car/track
+         * setup, but the init path doesn't fully run in our recompilation.
+         * Memory contains garbage (e.g., 2.44e-06). Override unconditionally
+         * with values that produce reasonable physics response.
+         *
+         * force = raw_input * sensitivity * multiplier
+         * With sensitivity=0.001 and multiplier=1.0:
+         *   W key (raw=255): force = 0.255 units/tick
+         *   Full gamepad (raw=2040): force = 2.04 units/tick
+         */
+        float s1 = 0.001f;  /* throttle sensitivity */
+        float s2 = 1.0f;    /* throttle force multiplier */
+        float throttle_f = (float)raw_thr * s1 * s2;
+
+        int32_t raw_str = (int32_t)MEM32(0x4D6530)
+                        - 2 * (int32_t)MEM32(0x4D6B28);
+        float s3 = 0.001f;  /* steering sensitivity */
+        float s4 = 1.0f;    /* steering force multiplier */
+        float steering_f = (float)raw_str * s3 * s4;
+
+        /* Write forces to velocity vector (bitcast float->u32, matching
+         * original movss/mov pattern at loc_00063757) */
+        union { float f; uint32_t u; } tf, sf;
+        tf.f = throttle_f;
+        sf.f = steering_f;
+        uint32_t vel_ptr = MEM32(esi + 0x1B4);
+        MEM32(vel_ptr + 8) = tf.u;
+        MEM32(vel_ptr + 0xC) = sf.u;
+
+        /* Debug: log when non-zero force is applied */
+        {
+            static int _wr_dbg = 0;
+            _wr_dbg++;
+            if (_wr_dbg == 1 ||
+                ((throttle_f != 0.0f || steering_f != 0.0f) && _wr_dbg % 60 == 0)) {
+                fprintf(stderr,
+                    "  [PHY-WR] #%d vel_ptr=0x%08X force=(%.3f,%.3f)\n",
+                    _wr_dbg, vel_ptr, throttle_f, steering_f);
+            }
+        }
+    }
+
+    /* ─── Part 2: Boost state machine (only when boost active) ───── */
+    if (MEM8(0x4A4B90) == 0)
+        goto phy_epilogue;
+
+    {
+        uint32_t state = MEM32(esi + 0x1E4);
+        switch (state) {
+        case 0: { /* Ramp-up */
+            float timer = MEMF(esi + 0x1DC);
+            float threshold = MEMF(0x3B16E8);
+            if (timer >= threshold) {
+                MEM32(esi + 0x1E4) = 2;
+                MEMF(esi + 0x1DC) = 0.0f;
+                MEMF(esi + 0x1E0) = 0.0f;
+            } else {
+                float new_t = delta_time + timer;
+                MEMF(esi + 0x1DC) = new_t;
+                if (new_t >= threshold)
+                    MEMF(esi + 0x1E0) = MEMF(0x3B168C);
+                else
+                    MEMF(esi + 0x1E0) = new_t * MEMF(0x557854);
+            }
+            break;
+        }
+        case 1: { /* Sustain */
+            float timer = MEMF(esi + 0x1DC);
+            float threshold = MEMF(0x557838);
+            if (timer >= threshold) {
+                MEM32(esi + 0x1E4) = 5;
+            } else {
+                float new_t = delta_time + timer;
+                MEMF(esi + 0x1DC) = new_t;
+                if (new_t >= threshold)
+                    MEMF(esi + 0x1E0) = MEMF(0x3B168C);
+                else
+                    MEMF(esi + 0x1E0) = new_t * MEMF(0x557868);
+            }
+            break;
+        }
+        case 2: { /* Decay (variant A) */
+            float timer = MEMF(esi + 0x1DC);
+            if (timer <= 0.0f) {
+                if (MEM8(esi + 0x19FF) != 0) {
+                    MEMF(esi + 0x1DC) = MEMF(0x3B16E8);
+                    MEMF(esi + 0x1E0) = MEMF(0x3B168C);
+                    MEM32(esi + 0x1E4) = 1;
+                    MEM8(esi + 0x19FF) = 0;
+                } else {
+                    MEMF(esi + 0x1DC) = 0.0f;
+                    boost_end_flag = 1;
+                }
+            } else {
+                float new_t = timer - delta_time;
+                MEMF(esi + 0x1DC) = new_t;
+                if (new_t <= 0.0f)
+                    MEMF(esi + 0x1E0) = 0.0f;
+                else
+                    MEMF(esi + 0x1E0) = new_t * MEMF(0x557868);
+            }
+            break;
+        }
+        case 3: { /* Decay (variant B) */
+            float timer = MEMF(esi + 0x1DC);
+            if (timer <= 0.0f) {
+                MEMF(esi + 0x1DC) = 0.0f;
+                boost_end_flag = 1;
+            } else {
+                float new_t = timer - delta_time;
+                MEMF(esi + 0x1DC) = new_t;
+                if (new_t <= 0.0f)
+                    MEMF(esi + 0x1E0) = 0.0f;
+                else
+                    MEMF(esi + 0x1E0) = new_t * MEMF(0x557854);
+            }
+            break;
+        }
+        default:
+            break;
+        }
+
+        /* ─── Part 3: Post-boost callbacks ────────────────────────── */
+        /* Check if boost ended and call sub_00063670 if conditions met */
+        if (MEM8(esi + 0x19FD) == 0) {
+            uint32_t mode = MEM32(0x4D4244);
+            if ((mode == 0x17 || mode == 0x18 || mode == 1)
+                && boost_end_flag) {
+                eax = esi;
+                PUSH32(esp, 0); sub_00063670();
+            }
+        }
+
+        /* Compute callback args: edx=count, eax=param */
+        edx = MEM32(esi + 0x1E8);
+        if ((int32_t)edx >= 3)
+            eax = 0;
+        else
+            eax = MEM32(esi + 0x1EC);
+
+        /* Callback through 0x567174 vtable (ICALL_SAFE guards failure) */
+        {
+            uint32_t cb = MEM32(0x567174);
+            if (cb != 0) {
+                edi = MEM32(cb);
+                uint32_t _icall_esp = g_esp;
+                PUSH32(esp, eax);
+                PUSH32(esp, edx);
+                edx = MEM32(0x567178);
+                PUSH32(esp, edx);
+                PUSH32(esp, 5);
+                PUSH32(esp, 0);
+                RECOMP_ICALL_SAFE(MEM32(edi), _icall_esp);
+            }
+        }
+    }
+
+    /* loc_0006394D: Physics object callback */
+    {
+        uint32_t fptr = MEM32(esi + 0x1F0);
+        if (fptr != 0) {
+            /* ICALL through vtable at esi+0x1F0 */
+            eax = MEM32(fptr);
+            {
+                uint32_t _icall_esp = g_esp;
+                PUSH32(esp, 0);
+                RECOMP_ICALL_SAFE(MEM32(eax), _icall_esp);
+            }
+
+            /* Walk linked list at esi+0x1D8 */
+            edi = MEM32(esi + 0x1D8);
+            if (edi != 0) {
+                union { float f; uint32_t u; } dt_u;
+                dt_u.f = delta_time;
+                ebx = dt_u.u; /* delta_time as uint32_t for arg passing */
+                while (edi != 0) {
+                    if (MEM8(edi + 0xA) != 0) {
+                        edx = MEM32(edi);
+                        ecx = edi;
+                        uint32_t _icall_esp = g_esp;
+                        PUSH32(esp, ebx);
+                        PUSH32(esp, 0);
+                        RECOMP_ICALL_SAFE(MEM32(edx), _icall_esp);
+                    }
+                    edi = MEM32(edi + 4);
+                }
+            }
+        } else {
+            /* No physics object: check sound/feedback flag */
+            if (MEM8(0x555D5A) != 0) {
+                union { float f; uint32_t u; } dt_u;
+                dt_u.f = delta_time;
+                eax = dt_u.u;
+                PUSH32(esp, eax);
+                ecx = 0x555D50;
+                PUSH32(esp, 0); sub_000C2DF0();
+            }
+        }
+    }
+
+    /* loc_00063996: Timer/counter update */
+    edx = 0x4AE20C;
+    PUSH32(esp, 0); sub_00017750();
+
+    /* loc_000639A0: State transition logic */
+    if (LO8(eax) != 0) goto phy_epilogue;
+    if (MEM32(esi + 0x1F0) == 0x559F8C) goto phy_epilogue;
+    if (MEM32(0x4D53B4) == 4) goto phy_epilogue;
+
+    {
+        /* Original checks 0x5A3759 for flags, 0x555D5A for sound state.
+         * Note: original asm tests 0x5A3759 then overwrites al with 0x555D5A
+         * but branches on the FLAGS from 0x5A3759 (not 0x555D5A). */
+        uint8_t flag_5A = MEM8(0x5A3759);
+        uint8_t flag_5D = MEM8(0x555D5A);
+
+        if (flag_5D != 0) {
+            /* loc_00063A1F: 0x555D5A is set */
+            if (flag_5D != 0) goto phy_epilogue; /* always taken */
+            MEM8(0x555D5A) = 1;
+            MEM8(0x555D5B) = 0;
+        } else {
+            /* loc_000639CB */
+            if (flag_5A == 0) {
+                /* loc_000639CF: neither flag set */
+                MEM8(0x555D5A) = 1;
+                MEM8(0x555D5B) = 0;
+            }
+            /* loc_000639DD: check game mode */
+            if (MEM32(0x4D537C) != 0xFFFFFFFFu) goto phy_epilogue;
+            if (MEM32(esi + 0x1F0) != 0) goto phy_epilogue;
+
+            /* loc_000639F6: compute and store controller connected flag */
+            {
+                int32_t idx = (int32_t)(int8_t)MEM8(0x4AED45);
+                uint32_t slot_addr = (uint32_t)(idx * 0x188) + 0x4AE728;
+                uint32_t slot = MEM32(slot_addr);
+                edi = MEM32(slot + 0x11C);
+                MEM32(0x4D5380) = (edi != 0xFFFFFFFFu) ? 1 : 0;
+            }
+        }
+    }
+
+phy_epilogue:
+    /* loc_00063A31: Flag management and cleanup */
+    if (MEM8(esi + 0x19FD) != 0) {
+        if (MEM32(esi + 0x1F0) == 0) {
+            /* Call sub_000146E0 with notification constants */
+            edi = 0;
+            PUSH32(esp, 0x94413FA7u);
+            PUSH32(esp, 0x37AAA797);
+            PUSH32(esp, 0x567170);
+            PUSH32(esp, 0); sub_000146E0();
+        }
+        MEM8(esi + 0x19FD) = 0;
+    }
+
+    /* Restore callee-saved registers */
+    ebx = saved_ebx;
+    edi = saved_edi;
     esp += 4; return; /* pop dummy return address */
 }
