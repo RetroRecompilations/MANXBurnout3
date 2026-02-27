@@ -1268,6 +1268,54 @@ void game_frame_pump(void)
                 const float ROAD_HW = 15.0f;       /* road half-width */
                 const float VIEW_DIST = 200.0f;     /* max draw distance */
 
+                /* Time-of-day: cycles through dawn→day→sunset→night based on distance.
+                 * Full cycle every 3000 world units (~60 seconds at speed 50). */
+                DWORD tod_sky_top, tod_sky_bot, tod_road_a, tod_road_b, tod_grass, tod_mtn;
+                {
+                    float cycle = fmodf(py / 3000.0f, 1.0f);
+                    if (cycle < 0.0f) cycle += 1.0f;
+                    /* Lerp helper: interpolate ARGB color channels */
+                    #define LERP_COL(a, b, t) ( \
+                        (((DWORD)(((float)(((a)>>24)&0xFF))*(1.0f-(t)) + ((float)(((b)>>24)&0xFF))*(t))) << 24) | \
+                        (((DWORD)(((float)(((a)>>16)&0xFF))*(1.0f-(t)) + ((float)(((b)>>16)&0xFF))*(t))) << 16) | \
+                        (((DWORD)(((float)(((a)>>8)&0xFF))*(1.0f-(t)) + ((float)(((b)>>8)&0xFF))*(t))) << 8) | \
+                        (((DWORD)(((float)((a)&0xFF))*(1.0f-(t)) + ((float)((b)&0xFF))*(t)))) )
+                    if (cycle < 0.25f) {
+                        /* Dawn → Day (0.0 - 0.25) */
+                        float t = cycle / 0.25f;
+                        tod_sky_top = LERP_COL(0xFF2A1040, 0xFF1020A0, t);
+                        tod_sky_bot = LERP_COL(0xFFDD6633, 0xFF6090D0, t);
+                        tod_grass   = LERP_COL(0xFF1A2810, 0xFF1A3318, t);
+                        tod_mtn     = LERP_COL(0xFF3A2040, 0xFF304060, t);
+                    } else if (cycle < 0.5f) {
+                        /* Day → Sunset (0.25 - 0.5) */
+                        float t = (cycle - 0.25f) / 0.25f;
+                        tod_sky_top = LERP_COL(0xFF1020A0, 0xFF602080, t);
+                        tod_sky_bot = LERP_COL(0xFF6090D0, 0xFFFF6622, t);
+                        tod_grass   = LERP_COL(0xFF1A3318, 0xFF2A2810, t);
+                        tod_mtn     = LERP_COL(0xFF304060, 0xFF503040, t);
+                    } else if (cycle < 0.75f) {
+                        /* Sunset → Night (0.5 - 0.75) */
+                        float t = (cycle - 0.5f) / 0.25f;
+                        tod_sky_top = LERP_COL(0xFF602080, 0xFF080818, t);
+                        tod_sky_bot = LERP_COL(0xFFFF6622, 0xFF101830, t);
+                        tod_grass   = LERP_COL(0xFF2A2810, 0xFF0A1508, t);
+                        tod_mtn     = LERP_COL(0xFF503040, 0xFF101828, t);
+                    } else {
+                        /* Night → Dawn (0.75 - 1.0) */
+                        float t = (cycle - 0.75f) / 0.25f;
+                        tod_sky_top = LERP_COL(0xFF080818, 0xFF2A1040, t);
+                        tod_sky_bot = LERP_COL(0xFF101830, 0xFFDD6633, t);
+                        tod_grass   = LERP_COL(0xFF0A1508, 0xFF1A2810, t);
+                        tod_mtn     = LERP_COL(0xFF101828, 0xFF3A2040, t);
+                    }
+                    /* Road colors darken at night */
+                    float night = (cycle > 0.5f) ? (cycle < 0.75f ? (cycle - 0.5f) / 0.25f : 1.0f - (cycle - 0.75f) / 0.25f) : 0.0f;
+                    tod_road_a = LERP_COL(0xFF222233, 0xFF111118, night);
+                    tod_road_b = LERP_COL(0xFF1A1A2A, 0xFF0A0A14, night);
+                    #undef LERP_COL
+                }
+
                 /* XYZRHW + DIFFUSE vertex */
                 typedef struct { float x, y, z, rhw; DWORD color; } RHW_VERT;
 
@@ -1346,8 +1394,8 @@ void game_frame_pump(void)
 
                 /* ── Sky gradient ────────────────────────────────────── */
                 {
-                    DWORD sky_top = 0xFF1020A0; /* deep blue */
-                    DWORD sky_bot = 0xFF6090D0; /* light blue at horizon */
+                    DWORD sky_top = tod_sky_top;
+                    DWORD sky_bot = tod_sky_bot;
                     RHW_VERT sky[6] = {
                         {0.0f, 0.0f, 0.99f, 1.0f, sky_top},
                         {SW,   0.0f, 0.99f, 1.0f, sky_top},
@@ -1366,7 +1414,7 @@ void game_frame_pump(void)
                      * Heights vary by a sine pattern offset by player position
                      * so they appear to slowly shift as you drive. */
                     #define MTN_COUNT 12
-                    DWORD mtn_col = 0xFF304060; /* dark blue-grey */
+                    DWORD mtn_col_v = tod_mtn; /* from time-of-day */
                     RHW_VERT mtn_verts[MTN_COUNT * 3];
                     int mi;
                     for (mi = 0; mi < MTN_COUNT; mi++) {
@@ -1375,9 +1423,9 @@ void game_frame_pump(void)
                         /* Height varies with a pseudo-random pattern */
                         float h = 20.0f + 35.0f * sinf((float)mi * 2.3f + py * 0.0002f);
                         float peak_x = base_x + width * 0.5f + 10.0f * sinf((float)mi * 1.7f);
-                        mtn_verts[mi * 3 + 0] = (RHW_VERT){base_x, HORIZON, 0.98f, 1.0f, mtn_col};
-                        mtn_verts[mi * 3 + 1] = (RHW_VERT){peak_x, HORIZON - h, 0.98f, 1.0f, mtn_col};
-                        mtn_verts[mi * 3 + 2] = (RHW_VERT){base_x + width, HORIZON, 0.98f, 1.0f, mtn_col};
+                        mtn_verts[mi * 3 + 0] = (RHW_VERT){base_x, HORIZON, 0.98f, 1.0f, mtn_col_v};
+                        mtn_verts[mi * 3 + 1] = (RHW_VERT){peak_x, HORIZON - h, 0.98f, 1.0f, mtn_col_v};
+                        mtn_verts[mi * 3 + 2] = (RHW_VERT){base_x + width, HORIZON, 0.98f, 1.0f, mtn_col_v};
                     }
                     g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
                         D3DPT_TRIANGLELIST, MTN_COUNT, mtn_verts, sizeof(RHW_VERT));
@@ -1386,14 +1434,14 @@ void game_frame_pump(void)
 
                 /* ── Ground plane (grass on both sides of road) ─────── */
                 {
-                    DWORD grass_col = 0xFF1A3318; /* dark green */
+                    DWORD grass_col_v = tod_grass; /* from time-of-day */
                     RHW_VERT grass[6] = {
-                        {0.0f, HORIZON, 0.95f, 1.0f, grass_col},
-                        {SW,   HORIZON, 0.95f, 1.0f, grass_col},
-                        {0.0f, SH,      0.95f, 1.0f, grass_col},
-                        {SW,   HORIZON, 0.95f, 1.0f, grass_col},
-                        {SW,   SH,      0.95f, 1.0f, grass_col},
-                        {0.0f, SH,      0.95f, 1.0f, grass_col},
+                        {0.0f, HORIZON, 0.95f, 1.0f, grass_col_v},
+                        {SW,   HORIZON, 0.95f, 1.0f, grass_col_v},
+                        {0.0f, SH,      0.95f, 1.0f, grass_col_v},
+                        {SW,   HORIZON, 0.95f, 1.0f, grass_col_v},
+                        {SW,   SH,      0.95f, 1.0f, grass_col_v},
+                        {0.0f, SH,      0.95f, 1.0f, grass_col_v},
                     };
                     g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
                         D3DPT_TRIANGLELIST, 2, grass, sizeof(RHW_VERT));
@@ -1429,7 +1477,7 @@ void game_frame_pump(void)
                         /* Alternating road color based on world distance (rumble strips) */
                         float world_d = py + (d0 + d1) * 0.5f;
                         int stripe = ((int)(world_d / 3.0f)) & 1;
-                        DWORD road_col = stripe ? 0xFF222233 : 0xFF1A1A2A;
+                        DWORD road_col = stripe ? tod_road_a : tod_road_b;
 
                         /* Draw road surface quad */
                         road_verts[vi++] = (RHW_VERT){lx0, y0, 0.9f, 1.0f, road_col};
