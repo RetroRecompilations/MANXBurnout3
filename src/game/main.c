@@ -1508,6 +1508,40 @@ void game_frame_pump(void)
                     }
                 }
 
+                /* ── Takedown flash effect ────────────────────────────── */
+                {
+                    float flash = _R_MEMF(0x5FFD04);
+                    if (flash > 0.0f) {
+                        /* Flash intensity: starts bright, fades out */
+                        int alpha = (int)(flash * 2.0f * 180.0f);
+                        if (alpha > 180) alpha = 180;
+                        if (alpha < 0) alpha = 0;
+                        DWORD flash_col = ((DWORD)alpha << 24) | 0x00FFFFFF; /* white with alpha */
+
+                        /* Enable alpha blending for flash overlay */
+                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                            D3DRS_ALPHABLENDENABLE, 1);
+                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                            19 /* D3DRS_SRCBLEND */, 5 /* D3DBLEND_SRCALPHA */);
+                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                            20 /* D3DRS_DESTBLEND */, 6 /* D3DBLEND_INVSRCALPHA */);
+
+                        RHW_VERT flash_verts[6] = {
+                            {0.0f, 0.0f, 0.01f, 1.0f, flash_col},
+                            {SCR_W, 0.0f, 0.01f, 1.0f, flash_col},
+                            {0.0f, SCR_H, 0.01f, 1.0f, flash_col},
+                            {SCR_W, 0.0f, 0.01f, 1.0f, flash_col},
+                            {SCR_W, SCR_H, 0.01f, 1.0f, flash_col},
+                            {0.0f, SCR_H, 0.01f, 1.0f, flash_col},
+                        };
+                        g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                            D3DPT_TRIANGLELIST, 2, flash_verts, sizeof(RHW_VERT));
+
+                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                            D3DRS_ALPHABLENDENABLE, 0);
+                    }
+                }
+
                 #undef W2SX
                 #undef W2SY
             }
@@ -1535,12 +1569,6 @@ void game_frame_pump(void)
             extern ptrdiff_t g_xbox_mem_offset;
             #define XMEM32(a) (*(volatile uint32_t*)((uintptr_t)(a) + g_xbox_mem_offset))
             #define XMEMF(a)  (*(volatile float*)((uintptr_t)(a) + g_xbox_mem_offset))
-            uint32_t game_state = XMEM32(0x4D53B8);
-            uint32_t load_state = XMEM32(0x4D5388);
-            float delta_time    = XMEMF(0x4AE1FC);
-            uint32_t frame_ctr  = XMEM32(0x4A1D84);
-            /* Car state: 0x557880 + 0x1E4 = state machine index */
-            uint32_t car_state  = XMEM32(0x557880 + 0x1E4);
             char title[256];
             /* Read physics state for display */
             uint32_t phys_ptr = XMEM32(0x557880 + 0x1B4);

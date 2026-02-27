@@ -1721,8 +1721,9 @@ void sub_000110E0(void)
                         if (speed > 50.0f) speed = 50.0f;
                         MEMF(phys_ptr + 0x1C) = speed;
 
-                        /* Store takedown count for HUD display */
+                        /* Store takedown count and flash timer for HUD */
                         MEM32(0x5FFD00) = _takedown_count;
+                        MEMF(0x5FFD04) = 0.5f; /* flash timer (seconds) */
                     }
                 }
                 #undef OBS_BASE
@@ -1730,6 +1731,16 @@ void sub_000110E0(void)
                 #undef OBS_SIZE
                 #undef OBS_ADDR
                 #undef OBS_RAND
+            }
+
+            /* Decrement takedown flash timer */
+            {
+                float flash = MEMF(0x5FFD04);
+                if (flash > 0.0f) {
+                    flash -= dt;
+                    if (flash < 0.0f) flash = 0.0f;
+                    MEMF(0x5FFD04) = flash;
+                }
             }
         }
     }
