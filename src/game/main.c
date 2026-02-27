@@ -1408,6 +1408,61 @@ void game_frame_pump(void)
                         D3DPT_TRIANGLELIST, 2, sky, sizeof(RHW_VERT));
                 }
 
+                /* ── Stars (visible during night phase) ────────────── */
+                {
+                    float cycle = fmodf(py / 3000.0f, 1.0f);
+                    if (cycle < 0.0f) cycle += 1.0f;
+                    /* Stars visible when cycle > 0.5 (sunset→night→dawn) */
+                    float star_alpha_f = 0.0f;
+                    if (cycle > 0.55f && cycle < 0.95f) {
+                        /* Ramp in 0.55-0.65, full 0.65-0.85, ramp out 0.85-0.95 */
+                        if (cycle < 0.65f) star_alpha_f = (cycle - 0.55f) / 0.1f;
+                        else if (cycle > 0.85f) star_alpha_f = 1.0f - (cycle - 0.85f) / 0.1f;
+                        else star_alpha_f = 1.0f;
+                    }
+                    if (star_alpha_f > 0.01f) {
+                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                            D3DRS_ALPHABLENDENABLE, 1);
+                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                            19, 5); /* SRCALPHA */
+                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                            20, 6); /* INVSRCALPHA */
+                        /* 40 deterministic stars using Knuth hash of index */
+                        #define STAR_COUNT 40
+                        static uint32_t _twinkle_seed = 99;
+                        _twinkle_seed = _twinkle_seed * 1103515245 + 12345;
+                        int si_star;
+                        for (si_star = 0; si_star < STAR_COUNT; si_star++) {
+                            uint32_t h = (uint32_t)si_star * 2654435761u;
+                            float sx_s = (float)((h >> 8) % 620) + 10.0f;
+                            float sy_s = (float)((h >> 16) % (int)(HORIZON - 20.0f)) + 5.0f;
+                            /* Twinkle: vary brightness per star per frame */
+                            float twinkle = 0.6f + 0.4f * sinf((float)si_star * 3.7f +
+                                (float)(_twinkle_seed & 0xFF) * 0.025f);
+                            int alpha = (int)(star_alpha_f * twinkle * 255.0f);
+                            if (alpha > 255) alpha = 255;
+                            /* Star color: mostly white, some slightly blue/yellow */
+                            DWORD star_rgb = (h & 3) == 0 ? 0x00AACCFF :
+                                             (h & 3) == 1 ? 0x00FFFFCC : 0x00FFFFFF;
+                            DWORD star_c = ((DWORD)alpha << 24) | star_rgb;
+                            float sz = 0.8f + (float)((h >> 4) & 3) * 0.3f; /* 0.8-1.7px */
+                            RHW_VERT star_v[6] = {
+                                {sx_s-sz, sy_s-sz, 0.97f, 1.0f, star_c},
+                                {sx_s+sz, sy_s-sz, 0.97f, 1.0f, star_c},
+                                {sx_s-sz, sy_s+sz, 0.97f, 1.0f, star_c},
+                                {sx_s+sz, sy_s-sz, 0.97f, 1.0f, star_c},
+                                {sx_s+sz, sy_s+sz, 0.97f, 1.0f, star_c},
+                                {sx_s-sz, sy_s+sz, 0.97f, 1.0f, star_c},
+                            };
+                            g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                D3DPT_TRIANGLELIST, 2, star_v, sizeof(RHW_VERT));
+                        }
+                        #undef STAR_COUNT
+                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                            D3DRS_ALPHABLENDENABLE, 0);
+                    }
+                }
+
                 /* ── Horizon scenery (mountain silhouettes) ─────────── */
                 {
                     /* Simple mountain range: triangles along the horizon.
@@ -1772,6 +1827,32 @@ void game_frame_pump(void)
                         };
                         g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
                             D3DPT_TRIANGLELIST, 2, ws, sizeof(RHW_VERT));
+                        /* Taillights on same-direction cars */
+                        if (!is_oncoming) {
+                            DWORD tl = 0xFFFF2222; /* red */
+                            float tlw = ohw * 0.2f, tlh = ohh * 0.1f;
+                            if (tlw < 0.5f) tlw = 0.5f;
+                            RHW_VERT tl_l[6] = {
+                                {sx-ohw*0.7f-tlw, sy-tlh, 0.32f, 1.0f, tl},
+                                {sx-ohw*0.7f+tlw, sy-tlh, 0.32f, 1.0f, tl},
+                                {sx-ohw*0.7f-tlw, sy+tlh, 0.32f, 1.0f, tl},
+                                {sx-ohw*0.7f+tlw, sy-tlh, 0.32f, 1.0f, tl},
+                                {sx-ohw*0.7f+tlw, sy+tlh, 0.32f, 1.0f, tl},
+                                {sx-ohw*0.7f-tlw, sy+tlh, 0.32f, 1.0f, tl},
+                            };
+                            RHW_VERT tl_r[6] = {
+                                {sx+ohw*0.7f-tlw, sy-tlh, 0.32f, 1.0f, tl},
+                                {sx+ohw*0.7f+tlw, sy-tlh, 0.32f, 1.0f, tl},
+                                {sx+ohw*0.7f-tlw, sy+tlh, 0.32f, 1.0f, tl},
+                                {sx+ohw*0.7f+tlw, sy-tlh, 0.32f, 1.0f, tl},
+                                {sx+ohw*0.7f+tlw, sy+tlh, 0.32f, 1.0f, tl},
+                                {sx+ohw*0.7f-tlw, sy+tlh, 0.32f, 1.0f, tl},
+                            };
+                            g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                D3DPT_TRIANGLELIST, 2, tl_l, sizeof(RHW_VERT));
+                            g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                D3DPT_TRIANGLELIST, 2, tl_r, sizeof(RHW_VERT));
+                        }
                         /* Headlights on oncoming cars */
                         if (is_oncoming) {
                             DWORD hl = 0xFFFFFF88; /* bright yellow-white */
@@ -1920,6 +2001,52 @@ void game_frame_pump(void)
                                 D3DPT_TRIANGLELIST, 1, flame_r, sizeof(RHW_VERT));
                         }
                     }
+
+                    /* ── Headlight beams (visible at night) ──────────────── */
+                    {
+                        float cycle_hl = fmodf(py / 3000.0f, 1.0f);
+                        if (cycle_hl < 0.0f) cycle_hl += 1.0f;
+                        float beam_alpha_f = 0.0f;
+                        if (cycle_hl > 0.55f && cycle_hl < 0.95f) {
+                            if (cycle_hl < 0.65f) beam_alpha_f = (cycle_hl - 0.55f) / 0.1f;
+                            else if (cycle_hl > 0.85f) beam_alpha_f = 1.0f - (cycle_hl - 0.85f) / 0.1f;
+                            else beam_alpha_f = 1.0f;
+                        }
+                        if (beam_alpha_f > 0.01f) {
+                            g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                                D3DRS_ALPHABLENDENABLE, 1);
+                            g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                                19, 5); /* SRCALPHA */
+                            g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                                20, 6); /* INVSRCALPHA */
+                            int ba = (int)(beam_alpha_f * 50.0f);
+                            DWORD beam_near = ((DWORD)ba << 24) | 0x00FFFFCC;
+                            DWORD beam_far  = 0x00FFFFCC;
+                            float beam_top = HORIZON + 40.0f;
+                            RHW_VERT bl[6] = {
+                                {car_cx-16.0f, car_cy-car_hh, 0.07f, 1.0f, beam_near},
+                                {car_cx-6.0f,  car_cy-car_hh, 0.07f, 1.0f, beam_near},
+                                {car_cx-40.0f, beam_top,       0.07f, 1.0f, beam_far},
+                                {car_cx-6.0f,  car_cy-car_hh, 0.07f, 1.0f, beam_near},
+                                {car_cx+10.0f, beam_top,       0.07f, 1.0f, beam_far},
+                                {car_cx-40.0f, beam_top,       0.07f, 1.0f, beam_far},
+                            };
+                            RHW_VERT br[6] = {
+                                {car_cx+6.0f,  car_cy-car_hh, 0.07f, 1.0f, beam_near},
+                                {car_cx+16.0f, car_cy-car_hh, 0.07f, 1.0f, beam_near},
+                                {car_cx-10.0f, beam_top,       0.07f, 1.0f, beam_far},
+                                {car_cx+16.0f, car_cy-car_hh, 0.07f, 1.0f, beam_near},
+                                {car_cx+40.0f, beam_top,       0.07f, 1.0f, beam_far},
+                                {car_cx-10.0f, beam_top,       0.07f, 1.0f, beam_far},
+                            };
+                            g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                D3DPT_TRIANGLELIST, 2, bl, sizeof(RHW_VERT));
+                            g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                D3DPT_TRIANGLELIST, 2, br, sizeof(RHW_VERT));
+                            g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                                D3DRS_ALPHABLENDENABLE, 0);
+                        }
+                    }
                 }
 
                 /* ── Speed lines (at high speed or when boosting) ────── */
@@ -2049,6 +2176,51 @@ void game_frame_pump(void)
                             g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
                                 D3DPT_TRIANGLELIST, 2, pip, sizeof(RHW_VERT));
                         }
+                    }
+                }
+
+                /* ── Checkpoint banner (green flash on milestone) ────── */
+                {
+                    float cp_flash = _R_MEMF(0x5FFD20);
+                    if (cp_flash > 0.0f) {
+                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                            D3DRS_ALPHABLENDENABLE, 1);
+                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                            19, 5); /* SRCALPHA */
+                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                            20, 6); /* INVSRCALPHA */
+                        /* Green banner across screen center, fading out */
+                        int cp_alpha = (int)(cp_flash / 1.5f * 180.0f);
+                        if (cp_alpha > 180) cp_alpha = 180;
+                        if (cp_alpha < 0) cp_alpha = 0;
+                        DWORD cp_col = ((DWORD)cp_alpha << 24) | 0x0022FF44;
+                        float banner_y = SH * 0.35f;
+                        float banner_h = 28.0f;
+                        RHW_VERT cp_bg[6] = {
+                            {0.0f, banner_y,            0.02f, 1.0f, cp_col},
+                            {SW,   banner_y,            0.02f, 1.0f, cp_col},
+                            {0.0f, banner_y + banner_h, 0.02f, 1.0f, cp_col},
+                            {SW,   banner_y,            0.02f, 1.0f, cp_col},
+                            {SW,   banner_y + banner_h, 0.02f, 1.0f, cp_col},
+                            {0.0f, banner_y + banner_h, 0.02f, 1.0f, cp_col},
+                        };
+                        g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                            D3DPT_TRIANGLELIST, 2, cp_bg, sizeof(RHW_VERT));
+                        /* White diamond marker in center of banner */
+                        DWORD dia_col = ((DWORD)cp_alpha << 24) | 0x00FFFFFF;
+                        float dc = CX, dy = banner_y + banner_h * 0.5f;
+                        RHW_VERT dia[12] = {
+                            {dc,       dy - 10.0f, 0.015f, 1.0f, dia_col},
+                            {dc + 8.0f, dy,        0.015f, 1.0f, dia_col},
+                            {dc,       dy + 10.0f, 0.015f, 1.0f, dia_col},
+                            {dc,       dy - 10.0f, 0.015f, 1.0f, dia_col},
+                            {dc - 8.0f, dy,        0.015f, 1.0f, dia_col},
+                            {dc,       dy + 10.0f, 0.015f, 1.0f, dia_col},
+                        };
+                        g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                            D3DPT_TRIANGLELIST, 2, dia, sizeof(RHW_VERT));
+                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                            D3DRS_ALPHABLENDENABLE, 0);
                     }
                 }
 

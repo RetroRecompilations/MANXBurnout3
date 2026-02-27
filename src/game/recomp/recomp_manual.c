@@ -1833,6 +1833,22 @@ void sub_000110E0(void)
                 }
             }
 
+            /* Checkpoint system: every 500 world units */
+            {
+                uint32_t last_cp = MEM32(0x5FFD1C);
+                uint32_t current_dist = (uint32_t)new_py;
+                uint32_t next_cp = last_cp + 500;
+                if (current_dist >= next_cp && new_py > 100.0f) {
+                    MEM32(0x5FFD1C) = (current_dist / 500) * 500;
+                    MEMF(0x5FFD20) = 1.5f; /* checkpoint flash timer */
+                    /* Reward: small boost fill */
+                    float boost = MEMF(0x5FFD08);
+                    boost += 15.0f;
+                    if (boost > 100.0f) boost = 100.0f;
+                    MEMF(0x5FFD08) = boost;
+                }
+            }
+
             /* Decrement flash and shake timers */
             {
                 float flash = MEMF(0x5FFD04);
@@ -1846,6 +1862,12 @@ void sub_000110E0(void)
                     shake -= dt;
                     if (shake < 0.0f) shake = 0.0f;
                     MEMF(0x5FFD18) = shake;
+                }
+                float cp_flash = MEMF(0x5FFD20);
+                if (cp_flash > 0.0f) {
+                    cp_flash -= dt;
+                    if (cp_flash < 0.0f) cp_flash = 0.0f;
+                    MEMF(0x5FFD20) = cp_flash;
                 }
             }
         }
