@@ -1750,34 +1750,38 @@ void sub_000110E0(void)
                     float abs_rx = rel_x < 0 ? -rel_x : rel_x;
                     float abs_ry = rel_y < 0 ? -rel_y : rel_y;
                     if (abs_rx < 3.0f && abs_ry < 4.5f) {
-                        /* TAKEDOWN! Oncoming = bigger bonus */
-                        _takedown_count++;
-                        /* Respawn */
                         if (is_oncoming) {
+                            /* CRASH! Head-on with oncoming = devastating.
+                             * Lose most speed, red screen shake, no boost. */
+                            speed *= 0.15f; /* lose 85% speed */
+                            MEMF(phys_ptr + 0x1C) = speed;
+                            MEMF(0x5FFD18) = 1.0f; /* screen shake timer */
+                            MEMF(0x5FFD04) = 0.8f; /* red flash */
+                            /* Respawn oncoming car */
                             float lane = -5.0f - (float)(OBS_RAND() % 3) * 3.0f;
                             MEMF(OBS_ADDR(oi, 0)) = lane;
                             MEMF(OBS_ADDR(oi, 4)) = new_py + spawn_base + 60.0f + (float)(OBS_RAND() % (int)(spawn_range + 1.0f));
                             MEMF(OBS_ADDR(oi, 8)) = -(10.0f + (float)(OBS_RAND() % (int)(speed_range + 1.0f)));
                         } else {
+                            /* TAKEDOWN! Same-direction rear-end = boost reward */
+                            _takedown_count++;
                             float lane = ((float)(OBS_RAND() % 5) - 2.0f) * 5.0f;
                             MEMF(OBS_ADDR(oi, 0)) = lane;
                             MEMF(OBS_ADDR(oi, 4)) = new_py + spawn_base + 20.0f + (float)(OBS_RAND() % (int)(spawn_range + 1.0f));
                             MEMF(OBS_ADDR(oi, 8)) = 3.0f + (float)(OBS_RAND() % (int)(speed_range + 1.0f));
+
+                            speed += 5.0f;
+                            if (speed > 50.0f) speed = 50.0f;
+                            MEMF(phys_ptr + 0x1C) = speed;
+
+                            MEM32(0x5FFD00) = _takedown_count;
+                            MEMF(0x5FFD04) = 0.5f; /* white flash */
+
+                            float boost = MEMF(0x5FFD08);
+                            boost += 25.0f;
+                            if (boost > 100.0f) boost = 100.0f;
+                            MEMF(0x5FFD08) = boost;
                         }
-
-                        /* Speed boost: bigger for oncoming */
-                        speed += is_oncoming ? 8.0f : 5.0f;
-                        if (speed > 50.0f) speed = 50.0f;
-                        MEMF(phys_ptr + 0x1C) = speed;
-
-                        MEM32(0x5FFD00) = _takedown_count;
-                        MEMF(0x5FFD04) = is_oncoming ? 0.7f : 0.5f; /* bigger flash */
-
-                        /* Boost meter: +35 oncoming, +25 normal */
-                        float boost = MEMF(0x5FFD08);
-                        boost += is_oncoming ? 35.0f : 25.0f;
-                        if (boost > 100.0f) boost = 100.0f;
-                        MEMF(0x5FFD08) = boost;
                     }
                     /* Near-miss detection */
                     else if (abs_rx < 5.0f && abs_ry < 6.0f && abs_ry > 2.0f
@@ -1815,13 +1819,19 @@ void sub_000110E0(void)
                 }
             }
 
-            /* Decrement takedown flash timer */
+            /* Decrement flash and shake timers */
             {
                 float flash = MEMF(0x5FFD04);
                 if (flash > 0.0f) {
                     flash -= dt;
                     if (flash < 0.0f) flash = 0.0f;
                     MEMF(0x5FFD04) = flash;
+                }
+                float shake = MEMF(0x5FFD18);
+                if (shake > 0.0f) {
+                    shake -= dt;
+                    if (shake < 0.0f) shake = 0.0f;
+                    MEMF(0x5FFD18) = shake;
                 }
             }
         }

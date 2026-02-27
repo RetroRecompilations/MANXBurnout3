@@ -1154,6 +1154,9 @@ void game_frame_pump(void)
                     throttle += (int32_t)xi.Gamepad.bRightTrigger * 8;
                     throttle -= (int32_t)xi.Gamepad.bLeftTrigger * 8;
                     steering += (int32_t)xi.Gamepad.sThumbLX / 32;
+                    /* A button or RB = boost */
+                    if (xi.Gamepad.wButtons & (XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_RIGHT_SHOULDER))
+                        XINP_MEM32(0x5FFD0C) = 1;
                 }
             }
 
@@ -1268,11 +1271,28 @@ void game_frame_pump(void)
                 /* XYZRHW + DIFFUSE vertex */
                 typedef struct { float x, y, z, rhw; DWORD color; } RHW_VERT;
 
+                /* Screen shake: random viewport offset during crash */
+                float shake_x = 0.0f, shake_y = 0.0f;
+                {
+                    float shake_t = _R_MEMF(0x5FFD18);
+                    if (shake_t > 0.0f) {
+                        static uint32_t _shake_seed = 31337;
+                        _shake_seed = _shake_seed * 1103515245 + 12345;
+                        float sx_r = ((float)((_shake_seed >> 16) & 0xFF) / 127.5f) - 1.0f;
+                        _shake_seed = _shake_seed * 1103515245 + 12345;
+                        float sy_r = ((float)((_shake_seed >> 16) & 0xFF) / 127.5f) - 1.0f;
+                        float intensity = shake_t * 12.0f; /* max 12px offset */
+                        shake_x = sx_r * intensity;
+                        shake_y = sy_r * intensity;
+                    }
+                }
+
                 /* Helper: project world point to screen.
                  * World: x=lateral (0=center), d=distance ahead of camera.
-                 * Returns screen x and y, and scale factor. */
-                #define PROJ_X(wx, d) (CX + ((wx) - px) * FOCAL / (d))
-                #define PROJ_Y(d) (HORIZON + CAM_H * FOCAL / (d))
+                 * Returns screen x and y, and scale factor.
+                 * shake_x/shake_y add viewport offset during crashes. */
+                #define PROJ_X(wx, d) (CX + shake_x + ((wx) - px) * FOCAL / (d))
+                #define PROJ_Y(d) (HORIZON + shake_y + CAM_H * FOCAL / (d))
                 #define PROJ_SCALE(d) (FOCAL / (d))
 
                 /* Road curve function: overlapping sine waves for S-curves.
@@ -1902,14 +1922,17 @@ void game_frame_pump(void)
                     }
                 }
 
-                /* ── Takedown flash effect ────────────────────────────── */
+                /* ── Flash effect (white=takedown, red=crash) ────────── */
                 {
                     float flash = _R_MEMF(0x5FFD04);
                     if (flash > 0.0f) {
                         int alpha = (int)(flash * 2.0f * 180.0f);
                         if (alpha > 180) alpha = 180;
                         if (alpha < 0) alpha = 0;
-                        DWORD flash_col = ((DWORD)alpha << 24) | 0x00FFFFFF;
+                        /* Red flash during crash (shake timer active), white for takedown */
+                        float shake = _R_MEMF(0x5FFD18);
+                        DWORD flash_rgb = (shake > 0.0f) ? 0x000044FF : 0x00FFFFFF;
+                        DWORD flash_col = ((DWORD)alpha << 24) | flash_rgb;
                         g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
                             D3DRS_ALPHABLENDENABLE, 1);
                         g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
