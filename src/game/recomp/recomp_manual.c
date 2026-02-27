@@ -1676,11 +1676,25 @@ void sub_000110E0(void)
                 /* Simple LCG PRNG for obstacle placement */
                 #define OBS_RAND() (_obs_seed = _obs_seed * 1103515245 + 12345, (_obs_seed >> 16) & 0x7FFF)
 
+                /* Difficulty scaling: obstacle spawn distance decreases,
+                 * obstacle speed variation increases with distance traveled.
+                 * At 0m: spawn gap 80-140, speeds 3-10
+                 * At 5000m: spawn gap 40-80, speeds 3-18 */
+                float difficulty = new_py * 0.0001f;
+                if (difficulty > 1.0f) difficulty = 1.0f;
+                if (difficulty < 0.0f) difficulty = 0.0f;
+                float spawn_base = 80.0f - difficulty * 40.0f;
+                float spawn_range = 60.0f - difficulty * 20.0f;
+                float speed_range = 8.0f + difficulty * 10.0f;
+
+                /* Store distance for HUD display */
+                MEM32(0x5FFD14) = (uint32_t)new_py;
+
                 /* Initialize obstacles on first call */
                 if (!_obs_init) {
                     _obs_init = 1;
                     for (oi = 0; oi < OBS_COUNT; oi++) {
-                        float lane = ((float)(OBS_RAND() % 5) - 2.0f) * 5.0f; /* -10, -5, 0, 5, 10 */
+                        float lane = ((float)(OBS_RAND() % 5) - 2.0f) * 5.0f;
                         float ahead = 30.0f + (float)(OBS_RAND() % 80);
                         MEMF(OBS_ADDR(oi, 0)) = lane;           /* pos_x */
                         MEMF(OBS_ADDR(oi, 4)) = new_py + ahead; /* pos_y */
@@ -1704,10 +1718,10 @@ void sub_000110E0(void)
                     /* Recycle if too far behind player */
                     if (oy < new_py - 60.0f) {
                         float lane = ((float)(OBS_RAND() % 5) - 2.0f) * 5.0f;
-                        float ahead = 80.0f + (float)(OBS_RAND() % 60);
+                        float ahead = spawn_base + (float)(OBS_RAND() % (int)(spawn_range + 1.0f));
                         MEMF(OBS_ADDR(oi, 0)) = lane;
                         MEMF(OBS_ADDR(oi, 4)) = new_py + ahead;
-                        MEMF(OBS_ADDR(oi, 8)) = 3.0f + (float)(OBS_RAND() % 8);
+                        MEMF(OBS_ADDR(oi, 8)) = 3.0f + (float)(OBS_RAND() % (int)(speed_range + 1.0f));
                         continue;
                     }
 
@@ -1719,11 +1733,11 @@ void sub_000110E0(void)
                     if (abs_rx < 3.0f && abs_ry < 4.5f) {
                         /* TAKEDOWN! */
                         _takedown_count++;
-                        /* Respawn obstacle far ahead */
+                        /* Respawn obstacle far ahead (difficulty-scaled) */
                         float lane = ((float)(OBS_RAND() % 5) - 2.0f) * 5.0f;
                         MEMF(OBS_ADDR(oi, 0)) = lane;
-                        MEMF(OBS_ADDR(oi, 4)) = new_py + 100.0f + (float)(OBS_RAND() % 40);
-                        MEMF(OBS_ADDR(oi, 8)) = 3.0f + (float)(OBS_RAND() % 8);
+                        MEMF(OBS_ADDR(oi, 4)) = new_py + spawn_base + 20.0f + (float)(OBS_RAND() % (int)(spawn_range + 1.0f));
+                        MEMF(OBS_ADDR(oi, 8)) = 3.0f + (float)(OBS_RAND() % (int)(speed_range + 1.0f));
 
                         /* Speed boost on takedown */
                         speed += 5.0f;

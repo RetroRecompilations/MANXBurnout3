@@ -1853,9 +1853,10 @@ void game_frame_pump(void)
             }
             uint32_t takedowns = XMEM32(0x5FFD00);
             float boost = *(volatile float*)((uintptr_t)0x5FFD08 + g_xbox_mem_offset);
+            uint32_t dist_m = XMEM32(0x5FFD14);
             snprintf(title, sizeof(title),
-                "Burnout 3 | spd=%.1f hdg=%.0f° pos=(%.0f,%.0f) TD=%u boost=%.0f%%",
-                spd, hdg * 57.2958f, px, py, takedowns, boost);
+                "Burnout 3 | spd=%.0f dist=%um TD=%u boost=%.0f%%",
+                spd, dist_m, takedowns, boost);
             #undef XMEM32
             #undef XMEMF
             SetWindowTextA(g_hwnd, title);
