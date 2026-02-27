@@ -1705,9 +1705,9 @@ void sub_000110E0(void)
                     /* AABB collision: car is ~4.5×2, obstacle is ~4×2 */
                     float rel_x = new_px - ox;
                     float rel_y = new_py - oy;
-                    if (rel_x < 0) rel_x = -rel_x;
-                    if (rel_y < 0) rel_y = -rel_y;
-                    if (rel_x < 3.0f && rel_y < 4.5f) {
+                    float abs_rx = rel_x < 0 ? -rel_x : rel_x;
+                    float abs_ry = rel_y < 0 ? -rel_y : rel_y;
+                    if (abs_rx < 3.0f && abs_ry < 4.5f) {
                         /* TAKEDOWN! */
                         _takedown_count++;
                         /* Respawn obstacle far ahead */
@@ -1723,7 +1723,23 @@ void sub_000110E0(void)
 
                         /* Store takedown count and flash timer for HUD */
                         MEM32(0x5FFD00) = _takedown_count;
-                        MEMF(0x5FFD04) = 0.5f; /* flash timer (seconds) */
+                        MEMF(0x5FFD04) = 0.5f; /* flash timer */
+
+                        /* Boost meter: +25 on takedown */
+                        float boost = MEMF(0x5FFD08);
+                        boost += 25.0f;
+                        if (boost > 100.0f) boost = 100.0f;
+                        MEMF(0x5FFD08) = boost;
+                    }
+                    /* Near-miss detection: within 5 world units lateral
+                     * but outside collision range, and obstacle is ahead */
+                    else if (abs_rx < 5.0f && abs_ry < 6.0f && abs_ry > 2.0f
+                             && speed > 5.0f) {
+                        /* Near miss! +5 boost */
+                        float boost = MEMF(0x5FFD08);
+                        boost += 5.0f * dt * 10.0f; /* gradual fill while passing */
+                        if (boost > 100.0f) boost = 100.0f;
+                        MEMF(0x5FFD08) = boost;
                     }
                 }
                 #undef OBS_BASE
@@ -1731,6 +1747,23 @@ void sub_000110E0(void)
                 #undef OBS_SIZE
                 #undef OBS_ADDR
                 #undef OBS_RAND
+            }
+
+            /* Boost activation: Shift key drains boost for extra speed */
+            {
+                float boost = MEMF(0x5FFD08);
+                uint32_t boost_active = MEM32(0x5FFD0C);
+                if (boost_active && boost > 0.0f && speed > 1.0f) {
+                    /* Drain boost meter */
+                    float drain = 30.0f * dt; /* empty in ~3.3 seconds */
+                    boost -= drain;
+                    if (boost < 0.0f) boost = 0.0f;
+                    MEMF(0x5FFD08) = boost;
+                    /* Apply speed boost: +50% max speed */
+                    speed += 20.0f * dt;
+                    if (speed > 75.0f) speed = 75.0f; /* boosted max speed */
+                    MEMF(phys_ptr + 0x1C) = speed;
+                }
             }
 
             /* Decrement takedown flash timer */

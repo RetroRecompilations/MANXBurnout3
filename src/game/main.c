@@ -1138,11 +1138,12 @@ void game_frame_pump(void)
             int32_t throttle = 0;  /* positive = gas */
             int32_t steering = 0;  /* positive = right */
 
-            /* Keyboard: WASD for driving */
+            /* Keyboard: WASD for driving, Shift for boost */
             if (GetAsyncKeyState('W') & 0x8000) throttle += 1000;
             if (GetAsyncKeyState('S') & 0x8000) throttle -= 1000;
             if (GetAsyncKeyState('A') & 0x8000) steering -= 1000;
             if (GetAsyncKeyState('D') & 0x8000) steering += 1000;
+            XINP_MEM32(0x5FFD0C) = (GetAsyncKeyState(VK_SHIFT) & 0x8000) ? 1 : 0;
 
             /* XInput gamepad (port 0) */
             {
@@ -1555,6 +1556,43 @@ void game_frame_pump(void)
                         D3DPT_TRIANGLELIST, 2, spd_bar, sizeof(RHW_VERT));
                 }
 
+                /* ── Boost bar (bottom-left HUD, below speed bar) ────── */
+                {
+                    float boost = _R_MEMF(0x5FFD08);
+                    float boost_pct = boost / 100.0f;
+                    if (boost_pct > 1.0f) boost_pct = 1.0f;
+                    if (boost_pct < 0.0f) boost_pct = 0.0f;
+                    float boost_w = boost_pct * 150.0f;
+                    /* Background */
+                    DWORD bbg_col = 0xFF202030;
+                    RHW_VERT bbg[6] = {
+                        {10.0f, SH-46.0f, 0.05f, 1.0f, bbg_col},
+                        {160.0f, SH-46.0f, 0.05f, 1.0f, bbg_col},
+                        {10.0f, SH-34.0f, 0.05f, 1.0f, bbg_col},
+                        {160.0f, SH-46.0f, 0.05f, 1.0f, bbg_col},
+                        {160.0f, SH-34.0f, 0.05f, 1.0f, bbg_col},
+                        {10.0f, SH-34.0f, 0.05f, 1.0f, bbg_col},
+                    };
+                    g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                        D3DPT_TRIANGLELIST, 2, bbg, sizeof(RHW_VERT));
+                    /* Boost fill: blue normally, orange when actively boosting */
+                    uint32_t boost_active = _R_MEM32(0x5FFD0C);
+                    DWORD boost_col = (boost_active && boost > 0.0f)
+                        ? 0xFFFF8833 : 0xFF3388FF;
+                    RHW_VERT bfill[6] = {
+                        {10.0f, SH-46.0f, 0.04f, 1.0f, boost_col},
+                        {10.0f+boost_w, SH-46.0f, 0.04f, 1.0f, boost_col},
+                        {10.0f, SH-34.0f, 0.04f, 1.0f, boost_col},
+                        {10.0f+boost_w, SH-46.0f, 0.04f, 1.0f, boost_col},
+                        {10.0f+boost_w, SH-34.0f, 0.04f, 1.0f, boost_col},
+                        {10.0f, SH-34.0f, 0.04f, 1.0f, boost_col},
+                    };
+                    if (boost_w > 0.5f) {
+                        g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                            D3DPT_TRIANGLELIST, 2, bfill, sizeof(RHW_VERT));
+                    }
+                }
+
                 /* ── Takedown counter (top-right HUD) ────────────────── */
                 {
                     uint32_t takedowns = _R_MEM32(0x5FFD00);
@@ -1647,9 +1685,10 @@ void game_frame_pump(void)
                 spd = XMEMF(phys_ptr + 0x1C);
             }
             uint32_t takedowns = XMEM32(0x5FFD00);
+            float boost = *(volatile float*)((uintptr_t)0x5FFD08 + g_xbox_mem_offset);
             snprintf(title, sizeof(title),
-                "Burnout 3 | spd=%.1f hdg=%.0f° pos=(%.0f,%.0f) takedowns=%u",
-                spd, hdg * 57.2958f, px, py, takedowns);
+                "Burnout 3 | spd=%.1f hdg=%.0f° pos=(%.0f,%.0f) TD=%u boost=%.0f%%",
+                spd, hdg * 57.2958f, px, py, takedowns, boost);
             #undef XMEM32
             #undef XMEMF
             SetWindowTextA(g_hwnd, title);

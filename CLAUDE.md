@@ -48,10 +48,12 @@ Game boots, loads, runs gameplay loop in state 4. Car has proper heading/speed p
 - Position integrated in sub_000110E0: pos += speed * heading_dir * dt
 
 ### D3D8 Rendering (main.c)
-- Top-down camera follows car position (world-to-screen transform)
-- Car: rotated rectangle with red hood triangle showing front
-- Road: dark asphalt strip, white edge lines, yellow center dashes (scroll)
-- HUD: speed bar (green forward, red reverse) in bottom-left
+- **Pseudo-3D perspective** (OutRun-style): camera behind car, road vanishing to horizon
+- 50 perspective-projected road segments with exponential depth distribution
+- Sky gradient, alternating road stripes, rumble strip edge lines, yellow center dashes
+- Traffic obstacles projected/scaled by distance with windshield detail
+- Player car at fixed screen position with steering tilt, windshield, taillights
+- HUD: speed bar (green/red), takedown counter pips, takedown flash overlay
 - Fixed FVF input layout for D3D11 (dummy elements for missing semantics)
 - Fixed D3DCOLOR format (R8G8B8A8_UNORM + BGRA→RGBA shader swizzle)
 
