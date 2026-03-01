@@ -34,6 +34,13 @@
 #include "../audio/dsound_xbox.h"
 #include "../input/xinput_xbox.h"
 
+/* Asset loading */
+#include "txd_loader.h"
+#include "bgv_loader.h"
+
+/* 3D renderer */
+#include "rw_renderer.h"
+
 /* Recompiled code */
 #include "recomp/gen/recomp_funcs.h"
 
@@ -722,6 +729,325 @@ static IDirect3D8 *g_d3d8 = NULL;
 static IDirect3DDevice8 *g_d3d_device = NULL;
 static IDirectSound8 *g_dsound = NULL;
 
+/* Loaded game textures */
+static TXD_Dict g_global_txd;
+static int g_textures_loaded = 0;
+
+/* Procedural paint texture for car models */
+static IDirect3DTexture8 *g_paint_tex = NULL;
+static IDirect3DTexture8 *g_road_tex = NULL;
+
+/* Create a procedural metallic paint texture.
+ * Generates a 64x64 A8R8G8B8 texture with metallic flake effect. */
+static IDirect3DTexture8 *create_paint_texture(IDirect3DDevice8 *dev,
+                                                uint8_t base_r, uint8_t base_g, uint8_t base_b)
+{
+    IDirect3DTexture8 *tex = NULL;
+    HRESULT hr = dev->lpVtbl->CreateTexture(dev, 64, 64, 1, 0,
+                                             D3DFMT_A8R8G8B8, 0, &tex);
+    if (FAILED(hr) || !tex) return NULL;
+
+    D3DLOCKED_RECT lr;
+    hr = tex->lpVtbl->LockRect(tex, 0, &lr, NULL, 0);
+    if (FAILED(hr)) { tex->lpVtbl->Release(tex); return NULL; }
+
+    uint32_t *pixels = (uint32_t *)lr.pBits;
+    uint32_t seed = 0xDEADBEEF;
+    int y, x;
+    for (y = 0; y < 64; y++) {
+        for (x = 0; x < 64; x++) {
+            /* LCG random for metallic flake */
+            seed = seed * 1103515245 + 12345;
+            float noise = ((float)((seed >> 16) & 0xFF) / 255.0f) * 2.0f - 1.0f;
+
+            /* Metallic flake: random brightness variation +-8% */
+            float flake = 1.0f + noise * 0.08f;
+
+            /* Fresnel-like edge brightening using UV-space distance from center */
+            float fx = ((float)x / 63.0f) * 2.0f - 1.0f;
+            float fy = ((float)y / 63.0f) * 2.0f - 1.0f;
+            float edge = fx * fx + fy * fy;
+            float fresnel = 1.0f + edge * 0.15f;
+
+            /* Combine */
+            float r = (float)base_r * flake * fresnel;
+            float g = (float)base_g * flake * fresnel;
+            float b = (float)base_b * flake * fresnel;
+
+            /* Clamp */
+            if (r > 255.0f) r = 255.0f; if (r < 0.0f) r = 0.0f;
+            if (g > 255.0f) g = 255.0f; if (g < 0.0f) g = 0.0f;
+            if (b > 255.0f) b = 255.0f; if (b < 0.0f) b = 0.0f;
+
+            pixels[y * (lr.Pitch / 4) + x] = 0xFF000000 |
+                ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+        }
+    }
+    tex->lpVtbl->UnlockRect(tex, 0);
+    return tex;
+}
+
+/* Create a procedural asphalt road texture.
+ * 128x128 with grain/noise pattern for realistic road surface. */
+static IDirect3DTexture8 *create_road_texture(IDirect3DDevice8 *dev)
+{
+    IDirect3DTexture8 *tex = NULL;
+    HRESULT hr = dev->lpVtbl->CreateTexture(dev, 128, 128, 1, 0,
+                                             D3DFMT_A8R8G8B8, 0, &tex);
+    if (FAILED(hr) || !tex) return NULL;
+
+    D3DLOCKED_RECT lr;
+    hr = tex->lpVtbl->LockRect(tex, 0, &lr, NULL, 0);
+    if (FAILED(hr)) { tex->lpVtbl->Release(tex); return NULL; }
+
+    uint32_t *pixels = (uint32_t *)lr.pBits;
+    uint32_t seed = 0x12345678;
+    int y, x;
+    for (y = 0; y < 128; y++) {
+        for (x = 0; x < 128; x++) {
+            /* Asphalt base: dark grey with random grain */
+            seed = seed * 1103515245 + 12345;
+            float noise1 = ((float)((seed >> 16) & 0xFF) / 255.0f);
+            seed = seed * 1103515245 + 12345;
+            float noise2 = ((float)((seed >> 16) & 0xFF) / 255.0f);
+
+            /* Mix fine grain + coarse patches */
+            float fine = noise1 * 0.15f;
+            float coarse = noise2 * 0.08f;
+            float base_v = 0.55f + fine + coarse;
+
+            /* Occasional light speckle (aggregate in asphalt) */
+            seed = seed * 1103515245 + 12345;
+            if (((seed >> 20) & 0x1F) == 0) {
+                base_v += 0.12f;
+            }
+
+            if (base_v > 1.0f) base_v = 1.0f;
+            uint8_t v = (uint8_t)(base_v * 255.0f);
+            pixels[y * (lr.Pitch / 4) + x] = 0xFF000000 | (v << 16) | (v << 8) | v;
+        }
+    }
+    tex->lpVtbl->UnlockRect(tex, 0);
+    return tex;
+}
+
+/* Paint color palette per vehicle class */
+static void get_class_paint_color(const char *class_name, int car_num,
+                                   uint8_t *r, uint8_t *g, uint8_t *b)
+{
+    /* Default: silver metallic */
+    *r = 180; *g = 185; *b = 195;
+
+    if (!class_name) return;
+
+    /* Each class gets a signature paint color, with variation per car number */
+    if (strcmp(class_name, "COMP") == 0) {
+        /* Compact: candy red */
+        *r = 210; *g = 30; *b = 30;
+    } else if (strcmp(class_name, "CUPE") == 0) {
+        /* Coupe: electric blue */
+        *r = 40; *g = 80; *b = 220;
+    } else if (strcmp(class_name, "HEVY") == 0) {
+        /* Heavy: dark green */
+        *r = 30; *g = 130; *b = 50;
+    } else if (strcmp(class_name, "HSPC") == 0) {
+        /* Hypercar: gold */
+        *r = 220; *g = 180; *b = 40;
+    } else if (strcmp(class_name, "MSCL") == 0) {
+        /* Muscle: deep purple */
+        *r = 120; *g = 30; *b = 180;
+    } else if (strcmp(class_name, "SPRT") == 0) {
+        /* Sport: bright orange */
+        *r = 230; *g = 120; *b = 20;
+    } else if (strcmp(class_name, "SUPR") == 0) {
+        /* Super: pearl white */
+        *r = 230; *g = 235; *b = 240;
+    }
+
+    /* Per-car variation: shift hue slightly based on car number */
+    int shift = (car_num * 17) % 40 - 20; /* -20 to +19 */
+    int ri = (int)*r + shift;
+    int gi = (int)*g + (shift / 2);
+    int bi = (int)*b - shift;
+    if (ri < 10) ri = 10; if (ri > 255) ri = 255;
+    if (gi < 10) gi = 10; if (gi > 255) gi = 255;
+    if (bi < 10) bi = 10; if (bi > 255) bi = 255;
+    *r = (uint8_t)ri; *g = (uint8_t)gi; *b = (uint8_t)bi;
+}
+
+/* 3D model viewer */
+static BGV_Model g_car_model;
+static int g_car_model_loaded = 0;
+static IDirect3DVertexBuffer8 *g_car_vb = NULL;
+static IDirect3DIndexBuffer8 *g_car_ib = NULL;
+static int g_show_3d_model = 0;  /* toggled by M key */
+static float g_model_rot_y = 0.0f;  /* auto-rotation / orbit yaw angle */
+static float g_model_cam_pitch = 0.3f;  /* camera pitch (radians, 0=level, >0=above) */
+static float g_model_cam_dist = 2.5f;   /* camera distance multiplier (of bounding radius) */
+static int g_model_auto_rotate = 1;     /* auto-rotate when no input */
+
+/* Vehicle catalog for model cycling (N/P keys) */
+typedef struct {
+    char class_name[8];   /* e.g. "COMP" */
+    int car_number;       /* e.g. 1 for Car1.bgv */
+} VehicleEntry;
+
+#define MAX_VEHICLES 128
+static VehicleEntry g_vehicle_list[MAX_VEHICLES];
+static int g_vehicle_count = 0;
+static int g_vehicle_index = 0;  /* current index into g_vehicle_list */
+
+static void build_vehicle_catalog(void)
+{
+    static const char *classes[] = {
+        "COMP", "CUPE", "HEVY", "HSPC", "MSCL", "SPRT", "SUPR", NULL
+    };
+    g_vehicle_count = 0;
+    int ci;
+    for (ci = 0; classes[ci] && g_vehicle_count < MAX_VEHICLES; ci++) {
+        int car;
+        for (car = 1; car <= 36 && g_vehicle_count < MAX_VEHICLES; car++) {
+            char path[256];
+            snprintf(path, sizeof(path),
+                     "Burnout 3 Takedown\\pveh\\%s\\Car%d.bgv",
+                     classes[ci], car);
+            FILE *test = fopen(path, "rb");
+            if (test) {
+                fclose(test);
+                strncpy(g_vehicle_list[g_vehicle_count].class_name,
+                        classes[ci], 7);
+                g_vehicle_list[g_vehicle_count].class_name[7] = '\0';
+                g_vehicle_list[g_vehicle_count].car_number = car;
+                g_vehicle_count++;
+            }
+        }
+    }
+    fprintf(stderr, "  Vehicle catalog: %d models found\n", g_vehicle_count);
+}
+
+static void load_vehicle_model(int index)
+{
+    if (index < 0 || index >= g_vehicle_count) return;
+
+    /* Release old model resources */
+    if (g_car_ib) { g_car_ib->lpVtbl->Release(g_car_ib); g_car_ib = NULL; }
+    if (g_car_vb) { g_car_vb->lpVtbl->Release(g_car_vb); g_car_vb = NULL; }
+    if (g_paint_tex) { g_paint_tex->lpVtbl->Release(g_paint_tex); g_paint_tex = NULL; }
+    bgv_free(&g_car_model);
+    g_car_model_loaded = 0;
+
+    /* Build path and load */
+    char path[256];
+    snprintf(path, sizeof(path),
+             "Burnout 3 Takedown\\pveh\\%s\\Car%d.bgv",
+             g_vehicle_list[index].class_name,
+             g_vehicle_list[index].car_number);
+
+    fprintf(stderr, "  [MODEL] Loading %s/%s Car%d...\n",
+            g_vehicle_list[index].class_name,
+            g_vehicle_list[index].class_name,
+            g_vehicle_list[index].car_number);
+
+    if (bgv_load(path, &g_car_model) != 0) {
+        fprintf(stderr, "  [MODEL] Failed to load %s\n", path);
+        return;
+    }
+    g_car_model_loaded = 1;
+    g_vehicle_index = index;
+
+    /* Create D3D8 vertex buffer */
+    DWORD fvf = D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_DIFFUSE | D3DFVF_TEX1;
+    UINT vb_size = g_car_model.vertex_count * sizeof(BGV_Vertex);
+    HRESULT hr = g_d3d_device->lpVtbl->CreateVertexBuffer(
+        g_d3d_device, vb_size, 0, fvf, D3DPOOL_MANAGED, &g_car_vb);
+    if (SUCCEEDED(hr)) {
+        BYTE *vb_data = NULL;
+        hr = g_car_vb->lpVtbl->Lock(g_car_vb, 0, vb_size, &vb_data, 0);
+        if (SUCCEEDED(hr)) {
+            memcpy(vb_data, g_car_model.vertices, vb_size);
+            g_car_vb->lpVtbl->Unlock(g_car_vb);
+        }
+    }
+
+    /* Create D3D8 index buffer */
+    UINT ib_size = g_car_model.index_count * sizeof(uint16_t);
+    hr = g_d3d_device->lpVtbl->CreateIndexBuffer(
+        g_d3d_device, ib_size, 0, D3DFMT_INDEX16, D3DPOOL_MANAGED, &g_car_ib);
+    if (SUCCEEDED(hr)) {
+        BYTE *ib_data = NULL;
+        hr = g_car_ib->lpVtbl->Lock(g_car_ib, 0, ib_size, &ib_data, 0);
+        if (SUCCEEDED(hr)) {
+            memcpy(ib_data, g_car_model.indices, ib_size);
+            g_car_ib->lpVtbl->Unlock(g_car_ib);
+        }
+    }
+
+    /* Create paint texture for this vehicle */
+    {
+        uint8_t pr, pg, pb;
+        get_class_paint_color(g_vehicle_list[index].class_name,
+                              g_vehicle_list[index].car_number, &pr, &pg, &pb);
+        g_paint_tex = create_paint_texture(g_d3d_device, pr, pg, pb);
+        fprintf(stderr, "  [MODEL] Loaded %s Car%d: %u verts, %u tris, paint RGB(%u,%u,%u)\n",
+                g_vehicle_list[index].class_name,
+                g_vehicle_list[index].car_number,
+                g_car_model.vertex_count,
+                g_car_model.index_count / 3,
+                (unsigned)pr, (unsigned)pg, (unsigned)pb);
+    }
+}
+
+/* Traffic car model pool: different models for visual variety */
+#define TRAFFIC_MODEL_COUNT 6
+static BGV_Model g_traffic_models[TRAFFIC_MODEL_COUNT];
+static int g_traffic_models_loaded = 0;
+
+static void load_traffic_models(void)
+{
+    /* Pick models spread across different classes for variety */
+    static const struct { const char *cls; int car; } traffic_picks[TRAFFIC_MODEL_COUNT] = {
+        {"COMP", 2}, {"SPRT", 3}, {"MSCL", 1},
+        {"CUPE", 5}, {"SUPR", 4}, {"HEVY", 1},
+    };
+    int i;
+    g_traffic_models_loaded = 0;
+    for (i = 0; i < TRAFFIC_MODEL_COUNT; i++) {
+        char path[256];
+        snprintf(path, sizeof(path), "Burnout 3 Takedown\\pveh\\%s\\Car%d.bgv",
+                 traffic_picks[i].cls, traffic_picks[i].car);
+        if (bgv_load_lod(path, &g_traffic_models[i], 1) == 0) {
+            g_traffic_models_loaded++;
+        } else {
+            memset(&g_traffic_models[i], 0, sizeof(BGV_Model));
+        }
+    }
+    /* Apply distinct paint colors to each traffic model */
+    {
+        static const struct { uint8_t r, g, b; } tints[TRAFFIC_MODEL_COUNT] = {
+            {255, 80, 60},   /* red */
+            {60, 130, 255},  /* blue */
+            {255, 220, 50},  /* yellow */
+            {40, 200, 80},   /* green */
+            {200, 200, 210}, /* silver */
+            {60, 60, 70},    /* dark grey */
+        };
+        for (i = 0; i < TRAFFIC_MODEL_COUNT; i++) {
+            if (g_traffic_models[i].vertices)
+                bgv_tint(&g_traffic_models[i], tints[i].r, tints[i].g, tints[i].b);
+        }
+    }
+    fprintf(stderr, "  Traffic models: %d/%d loaded\n",
+            g_traffic_models_loaded, TRAFFIC_MODEL_COUNT);
+}
+
+static void free_traffic_models(void)
+{
+    int i;
+    for (i = 0; i < TRAFFIC_MODEL_COUNT; i++)
+        bgv_free(&g_traffic_models[i]);
+    g_traffic_models_loaded = 0;
+}
+
 /* ── XBE loading ────────────────────────────────────────────── */
 
 /**
@@ -998,8 +1324,55 @@ static BOOL init_subsystems(void)
         }
     }
 
-    /* 4. Audio + Input */
-    fprintf(stderr, "[4/4] Audio + Input...\n");
+    /* 4. Load game textures */
+    fprintf(stderr, "[4/5] Loading game textures...\n");
+    {
+        int n = txd_load("Burnout 3 Takedown\\Data\\Global.txd", g_d3d_device, &g_global_txd);
+        if (n > 0) {
+            g_textures_loaded = 1;
+            fprintf(stderr, "  Loaded %d textures from Global.txd\n", n);
+        } else {
+            fprintf(stderr, "  WARNING: No textures loaded from Global.txd\n");
+        }
+    }
+
+    /* 4b. Build vehicle catalog and load first car model */
+    fprintf(stderr, "[4b] Loading car models...\n");
+    build_vehicle_catalog();
+    if (g_vehicle_count > 0) {
+        load_vehicle_model(0);
+    } else {
+        fprintf(stderr, "  WARNING: No vehicle models found\n");
+    }
+
+    /* 4c. Load traffic car models for variety */
+    load_traffic_models();
+
+    /* 4d. Initialize 3D renderer and register models */
+    rw_renderer_init();
+    if (g_car_model_loaded) {
+        rw_gameplay_register_models(&g_car_model,
+                                     g_traffic_models, TRAFFIC_MODEL_COUNT);
+    }
+
+    /* 4e. Load track geometry from streamed.dat */
+    {
+        const char *track_path = "Burnout 3 Takedown/Tracks/EU/C1_V1/streamed.dat";
+        if (rw_load_track(track_path) == 0) {
+            fprintf(stderr, "  Track geometry loaded: %s\n", track_path);
+        } else {
+            fprintf(stderr, "  Track geometry not available (proceeding with procedural road)\n");
+        }
+    }
+
+    /* 4f. Create procedural road texture */
+    g_road_tex = create_road_texture(g_d3d_device);
+    if (g_road_tex) {
+        fprintf(stderr, "  Created procedural road texture (128x128)\n");
+    }
+
+    /* 5. Audio + Input */
+    fprintf(stderr, "[5/5] Audio + Input...\n");
     xbox_DirectSoundCreate(NULL, &g_dsound, NULL);
     xbox_InputInit();
 
@@ -1012,6 +1385,18 @@ static void shutdown_subsystems(void)
     fprintf(stderr, "\n=== Shutting down ===\n");
 
     /* Reverse order of initialization */
+    rw_renderer_shutdown();
+    if (g_paint_tex) { g_paint_tex->lpVtbl->Release(g_paint_tex); g_paint_tex = NULL; }
+    if (g_road_tex) { g_road_tex->lpVtbl->Release(g_road_tex); g_road_tex = NULL; }
+    if (g_car_ib) { g_car_ib->lpVtbl->Release(g_car_ib); g_car_ib = NULL; }
+    if (g_car_vb) { g_car_vb->lpVtbl->Release(g_car_vb); g_car_vb = NULL; }
+    bgv_free(&g_car_model);
+    g_car_model_loaded = 0;
+    free_traffic_models();
+
+    txd_release(&g_global_txd);
+    g_textures_loaded = 0;
+
     if (g_dsound) {
         g_dsound->lpVtbl->Release(g_dsound);
         g_dsound = NULL;
@@ -1093,6 +1478,351 @@ static DWORD WINAPI watchdog_thread_func(LPVOID param)
 }
 
 /* ── Frame pump (called from recompiled game loop) ─────────── */
+
+/* ── Cached texture pointers (resolved once after TXD load) ──── */
+#define BOOST_FIRE_FRAMES 30
+static IDirect3DTexture8 *g_tex_boostfire[BOOST_FIRE_FRAMES];
+static IDirect3DTexture8 *g_tex_spark = NULL;
+static IDirect3DTexture8 *g_tex_smoke = NULL;
+static IDirect3DTexture8 *g_tex_shadow = NULL;
+static IDirect3DTexture8 *g_tex_star = NULL;
+static IDirect3DTexture8 *g_tex_healthbar = NULL;
+static IDirect3DTexture8 *g_tex_hud = NULL;
+static IDirect3DTexture8 *g_tex_corona = NULL;
+static IDirect3DTexture8 *g_tex_boostflare = NULL;
+static IDirect3DTexture8 *g_tex_explosion = NULL;
+static int g_tex_cache_init = 0;
+
+static void txd_cache_init(void)
+{
+    if (g_tex_cache_init || !g_textures_loaded) return;
+    g_tex_cache_init = 1;
+    /* Animated boost fire frames (BoostFireCore01..30) */
+    {
+        int fi;
+        for (fi = 0; fi < BOOST_FIRE_FRAMES; fi++) {
+            char name[32];
+            sprintf(name, "BoostFireCore%02d", fi + 1);
+            g_tex_boostfire[fi] = txd_find(&g_global_txd, name);
+        }
+    }
+    g_tex_spark      = txd_find(&g_global_txd, "fxspark");
+    g_tex_smoke      = txd_find(&g_global_txd, "fxsmoke");
+    g_tex_shadow     = txd_find(&g_global_txd, "blobbyshadow");
+    g_tex_star       = txd_find(&g_global_txd, "star");
+    g_tex_healthbar  = txd_find(&g_global_txd, "health_bar");
+    g_tex_hud        = txd_find(&g_global_txd, "HUD");
+    g_tex_corona     = txd_find(&g_global_txd, "coronastar");
+    g_tex_boostflare = txd_find(&g_global_txd, "boostflare");
+    g_tex_explosion  = txd_find(&g_global_txd, "fxexplosionfire");
+    fprintf(stderr, "TXD cache: fire[0]=%p spark=%p smoke=%p shadow=%p star=%p hbar=%p hud=%p corona=%p flare=%p expl=%p\n",
+            g_tex_boostfire[0], g_tex_spark, g_tex_smoke, g_tex_shadow,
+            g_tex_star, g_tex_healthbar, g_tex_hud, g_tex_corona,
+            g_tex_boostflare, g_tex_explosion);
+}
+
+/** Draw a textured quad (2 triangles) with alpha blending.
+ *  Switches to XYZRHW+DIFFUSE+TEX1 FVF, binds the texture, draws, restores. */
+static void draw_textured_quad(IDirect3DDevice8 *dev, IDirect3DTexture8 *tex,
+                                float x0, float y0, float x1, float y1,
+                                float z, DWORD color)
+{
+    typedef struct { float x, y, z, rhw; DWORD color; float u, v; } TV;
+    TV verts[6] = {
+        {x0, y0, z, 1.0f, color, 0.0f, 0.0f},
+        {x1, y0, z, 1.0f, color, 1.0f, 0.0f},
+        {x0, y1, z, 1.0f, color, 0.0f, 1.0f},
+        {x1, y0, z, 1.0f, color, 1.0f, 0.0f},
+        {x1, y1, z, 1.0f, color, 1.0f, 1.0f},
+        {x0, y1, z, 1.0f, color, 0.0f, 1.0f},
+    };
+    dev->lpVtbl->SetVertexShader(dev, D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+    dev->lpVtbl->SetTexture(dev, 0, (IDirect3DBaseTexture8 *)tex);
+    dev->lpVtbl->SetTextureStageState(dev, 0, 1 /*D3DTSS_COLOROP*/, 4 /*D3DTOP_MODULATE*/);
+    dev->lpVtbl->SetTextureStageState(dev, 0, 2 /*D3DTSS_COLORARG1*/, 2 /*D3DTA_TEXTURE*/);
+    dev->lpVtbl->SetTextureStageState(dev, 0, 3 /*D3DTSS_COLORARG2*/, 0 /*D3DTA_DIFFUSE*/);
+    dev->lpVtbl->SetTextureStageState(dev, 0, 4 /*D3DTSS_ALPHAOP*/, 4 /*D3DTOP_MODULATE*/);
+    dev->lpVtbl->SetTextureStageState(dev, 0, 5 /*D3DTSS_ALPHAARG1*/, 2 /*D3DTA_TEXTURE*/);
+    dev->lpVtbl->SetTextureStageState(dev, 0, 6 /*D3DTSS_ALPHAARG2*/, 0 /*D3DTA_DIFFUSE*/);
+    dev->lpVtbl->DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, verts, sizeof(TV));
+}
+
+/** Restore untextured rendering state after textured draws. */
+static void restore_untextured(IDirect3DDevice8 *dev)
+{
+    dev->lpVtbl->SetTexture(dev, 0, NULL);
+    dev->lpVtbl->SetVertexShader(dev, D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+    dev->lpVtbl->SetTextureStageState(dev, 0, 1, 1 /*D3DTOP_DISABLE*/);
+}
+
+/* ── 3D Model Viewer Rendering ──────────────────────────────── */
+
+/* Math utilities shared with rw_renderer.c */
+#include "rw_math.h"
+
+/** Render the 3D car model with ground plane. */
+static void render_3d_model_view(IDirect3DDevice8 *dev, float dt)
+{
+    if (!g_car_model_loaded || !g_car_vb || !g_car_ib)
+        return;
+
+    DWORD fvf = D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_DIFFUSE | D3DFVF_TEX1;
+
+    /* Draw gradient background for model viewer */
+    {
+        typedef struct { float x, y, z, rhw; DWORD color; } SV;
+        DWORD bg_top = 0xFF1A2636;  /* dark blue-grey */
+        DWORD bg_bot = 0xFF0A1018;  /* near black */
+        SV bg[6] = {
+            {0, 0, 0.999f, 1, bg_top}, {640, 0, 0.999f, 1, bg_top},
+            {0, 480, 0.999f, 1, bg_bot}, {640, 0, 0.999f, 1, bg_top},
+            {640, 480, 0.999f, 1, bg_bot}, {0, 480, 0.999f, 1, bg_bot},
+        };
+        dev->lpVtbl->SetVertexShader(dev, D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+        dev->lpVtbl->SetRenderState(dev, D3DRS_ZENABLE, FALSE);
+        dev->lpVtbl->DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, bg, sizeof(SV));
+    }
+
+    /* Camera orbit controls (arrow keys + zoom) */
+    {
+        int has_input = 0;
+        if (GetAsyncKeyState(VK_LEFT) & 0x8000) { g_model_rot_y -= dt * 2.0f; has_input = 1; }
+        if (GetAsyncKeyState(VK_RIGHT) & 0x8000) { g_model_rot_y += dt * 2.0f; has_input = 1; }
+        if (GetAsyncKeyState(VK_UP) & 0x8000) {
+            g_model_cam_pitch += dt * 1.5f;
+            if (g_model_cam_pitch > 1.4f) g_model_cam_pitch = 1.4f;
+            has_input = 1;
+        }
+        if (GetAsyncKeyState(VK_DOWN) & 0x8000) {
+            g_model_cam_pitch -= dt * 1.5f;
+            if (g_model_cam_pitch < -0.3f) g_model_cam_pitch = -0.3f;
+            has_input = 1;
+        }
+        if (GetAsyncKeyState(VK_OEM_PLUS) & 0x8000 || GetAsyncKeyState(VK_ADD) & 0x8000) {
+            g_model_cam_dist -= dt * 2.0f;
+            if (g_model_cam_dist < 1.2f) g_model_cam_dist = 1.2f;
+            has_input = 1;
+        }
+        if (GetAsyncKeyState(VK_OEM_MINUS) & 0x8000 || GetAsyncKeyState(VK_SUBTRACT) & 0x8000) {
+            g_model_cam_dist += dt * 2.0f;
+            if (g_model_cam_dist > 6.0f) g_model_cam_dist = 6.0f;
+            has_input = 1;
+        }
+        /* Space toggles auto-rotation */
+        {
+            static int sp_prev = 0;
+            int sp_now = (GetAsyncKeyState(VK_SPACE) & 0x8000) ? 1 : 0;
+            if (sp_now && !sp_prev) g_model_auto_rotate = !g_model_auto_rotate;
+            sp_prev = sp_now;
+        }
+        if (g_model_auto_rotate && !has_input)
+            g_model_rot_y += dt * 0.5f;
+    }
+
+    /* Set up world matrix (identity - camera orbits around model) */
+    D3DMATRIX world_mat;
+    mat4_identity((float *)&world_mat);
+
+    /* Set up view matrix: orbit camera using spherical coordinates */
+    D3DMATRIX view_mat;
+    float cam_r = g_car_model.bounding_radius * g_model_cam_dist;
+    float cam_x = cam_r * cosf(g_model_cam_pitch) * sinf(g_model_rot_y);
+    float cam_y = cam_r * sinf(g_model_cam_pitch);
+    float cam_z = cam_r * cosf(g_model_cam_pitch) * cosf(g_model_rot_y);
+    mat4_lookat((float *)&view_mat,
+                cam_x, cam_y, cam_z,      /* eye */
+                0.0f, 0.3f, 0.0f,         /* target (slightly above center) */
+                0.0f, 1.0f, 0.0f);        /* up */
+
+    /* Set up projection matrix */
+    D3DMATRIX proj_mat;
+    float aspect = 640.0f / 480.0f;
+    mat4_perspective((float *)&proj_mat, 60.0f * 3.14159f / 180.0f, aspect, 0.1f, 100.0f);
+
+    dev->lpVtbl->SetTransform(dev, D3DTS_WORLD, &world_mat);
+    dev->lpVtbl->SetTransform(dev, D3DTS_VIEW, &view_mat);
+    dev->lpVtbl->SetTransform(dev, D3DTS_PROJECTION, &proj_mat);
+
+    /* Render state for 3D */
+    dev->lpVtbl->SetRenderState(dev, D3DRS_ZENABLE, TRUE);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_ZWRITEENABLE, TRUE);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_LIGHTING, FALSE);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_CULLMODE, D3DCULL_NONE);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_ALPHABLENDENABLE, FALSE);
+
+    /* Bind paint texture (if available) for metallic car paint effect */
+    if (g_paint_tex) {
+        dev->lpVtbl->SetTexture(dev, 0, (IDirect3DBaseTexture8 *)g_paint_tex);
+    } else {
+        dev->lpVtbl->SetTexture(dev, 0, NULL);
+    }
+
+    /* Draw the car model using DrawIndexedPrimitiveUP */
+    dev->lpVtbl->SetVertexShader(dev, fvf);
+    dev->lpVtbl->SetStreamSource(dev, 0, NULL, 0);
+    dev->lpVtbl->SetIndices(dev, NULL, 0);
+    {
+        dev->lpVtbl->DrawIndexedPrimitiveUP(dev, D3DPT_TRIANGLELIST,
+                                           0, g_car_model.vertex_count,
+                                           g_car_model.index_count / 3,
+                                           g_car_model.indices, D3DFMT_INDEX16,
+                                           g_car_model.vertices, sizeof(BGV_Vertex));
+    }
+    /* Unbind texture */
+    dev->lpVtbl->SetTexture(dev, 0, NULL);
+
+    /* Draw ground plane as a simple colored quad */
+    {
+        typedef struct { float x, y, z; float nx, ny, nz; DWORD color; float u, v; } GV;
+        float gs = 10.0f;  /* ground size */
+        float gy = -0.15f; /* just below car */
+        DWORD gc = 0xFF333333; /* dark grey */
+        GV ground[6] = {
+            {-gs, gy, -gs,  0,1,0, gc, 0,0},
+            { gs, gy, -gs,  0,1,0, gc, 1,0},
+            {-gs, gy,  gs,  0,1,0, gc, 0,1},
+            { gs, gy, -gs,  0,1,0, gc, 1,0},
+            { gs, gy,  gs,  0,1,0, gc, 1,1},
+            {-gs, gy,  gs,  0,1,0, gc, 0,1},
+        };
+        dev->lpVtbl->SetStreamSource(dev, 0, NULL, 0);
+        dev->lpVtbl->SetIndices(dev, NULL, 0);
+        dev->lpVtbl->DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, ground, sizeof(GV));
+    }
+
+    /* Draw grid lines on the ground for spatial reference */
+    {
+        typedef struct { float x, y, z; float nx, ny, nz; DWORD color; float u, v; } GV;
+        float gy = -0.14f;
+        DWORD lc = 0xFF555555;
+        float lw = 0.02f;
+        int gi;
+        for (gi = -5; gi <= 5; gi++) {
+            float p = (float)gi * 2.0f;
+            /* Z-axis line */
+            GV lz[6] = {
+                {p-lw, gy, -10, 0,1,0, lc, 0,0}, {p+lw, gy, -10, 0,1,0, lc, 1,0},
+                {p-lw, gy,  10, 0,1,0, lc, 0,1}, {p+lw, gy, -10, 0,1,0, lc, 1,0},
+                {p+lw, gy,  10, 0,1,0, lc, 1,1}, {p-lw, gy,  10, 0,1,0, lc, 0,1},
+            };
+            dev->lpVtbl->DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, lz, sizeof(GV));
+            /* X-axis line */
+            GV lx[6] = {
+                {-10, gy, p-lw, 0,1,0, lc, 0,0}, { 10, gy, p-lw, 0,1,0, lc, 1,0},
+                {-10, gy, p+lw, 0,1,0, lc, 0,1}, { 10, gy, p-lw, 0,1,0, lc, 1,0},
+                { 10, gy, p+lw, 0,1,0, lc, 1,1}, {-10, gy, p+lw, 0,1,0, lc, 0,1},
+            };
+            dev->lpVtbl->DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, lx, sizeof(GV));
+        }
+    }
+
+    /* HUD overlay: vehicle info bar + navigation hint */
+    {
+        typedef struct { float x, y, z, rhw; DWORD color; } SV;
+
+        dev->lpVtbl->SetVertexShader(dev, D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+        dev->lpVtbl->SetStreamSource(dev, 0, NULL, 0);
+        dev->lpVtbl->SetIndices(dev, NULL, 0);
+        dev->lpVtbl->SetTexture(dev, 0, NULL);
+        dev->lpVtbl->SetRenderState(dev, D3DRS_ALPHABLENDENABLE, TRUE);
+        dev->lpVtbl->SetRenderState(dev, D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+        dev->lpVtbl->SetRenderState(dev, D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+        dev->lpVtbl->SetRenderState(dev, D3DRS_ZENABLE, FALSE);
+
+        /* Dark bar at top */
+        SV bar[6] = {
+            {0, 0, 0, 1, 0xCC000000}, {640, 0, 0, 1, 0xCC000000},
+            {0, 24, 0, 1, 0xCC000000}, {640, 0, 0, 1, 0xCC000000},
+            {640, 24, 0, 1, 0xCC000000}, {0, 24, 0, 1, 0xCC000000},
+        };
+        dev->lpVtbl->DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, bar, sizeof(SV));
+
+        /* Vehicle counter indicator: colored pips showing position in list */
+        if (g_vehicle_count > 0) {
+            float pip_x = 10.0f;
+            float pip_y = 8.0f;
+            float pip_w = 4.0f;
+            float pip_h = 8.0f;
+            float pip_gap = 2.0f;
+            /* Show up to 20 pips around current position */
+            int vis_start = g_vehicle_index - 10;
+            int vis_end = g_vehicle_index + 10;
+            if (vis_start < 0) { vis_end -= vis_start; vis_start = 0; }
+            if (vis_end > g_vehicle_count) vis_end = g_vehicle_count;
+            int vi;
+            for (vi = vis_start; vi < vis_end; vi++) {
+                DWORD pc = (vi == g_vehicle_index) ? 0xFFFF8800 : 0xFF666666;
+                float pw = (vi == g_vehicle_index) ? pip_w + 2.0f : pip_w;
+                float ph = (vi == g_vehicle_index) ? pip_h + 4.0f : pip_h;
+                float py = (vi == g_vehicle_index) ? pip_y - 2.0f : pip_y;
+                float px = pip_x + (float)(vi - vis_start) * (pip_w + pip_gap);
+                SV pip[6] = {
+                    {px, py, 0, 1, pc}, {px+pw, py, 0, 1, pc},
+                    {px, py+ph, 0, 1, pc}, {px+pw, py, 0, 1, pc},
+                    {px+pw, py+ph, 0, 1, pc}, {px, py+ph, 0, 1, pc},
+                };
+                dev->lpVtbl->DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, pip, sizeof(SV));
+            }
+
+            /* Navigation arrows: "<" on left, ">" on right */
+            /* Left arrow (triangle pointing left) */
+            SV arrow_l[3] = {
+                {pip_x - 12.0f, pip_y + pip_h/2, 0, 1, 0xFFCCCCCC},
+                {pip_x - 4.0f, pip_y, 0, 1, 0xFFCCCCCC},
+                {pip_x - 4.0f, pip_y + pip_h, 0, 1, 0xFFCCCCCC},
+            };
+            dev->lpVtbl->DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 1, arrow_l, sizeof(SV));
+            /* Right arrow */
+            float rx = pip_x + (float)(vis_end - vis_start) * (pip_w + pip_gap) + 4.0f;
+            SV arrow_r[3] = {
+                {rx + 8.0f, pip_y + pip_h/2, 0, 1, 0xFFCCCCCC},
+                {rx, pip_y, 0, 1, 0xFFCCCCCC},
+                {rx, pip_y + pip_h, 0, 1, 0xFFCCCCCC},
+            };
+            dev->lpVtbl->DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 1, arrow_r, sizeof(SV));
+        }
+
+        /* Stats bar at bottom */
+        SV bot_bar[6] = {
+            {0, 456, 0, 1, 0xCC000000}, {640, 456, 0, 1, 0xCC000000},
+            {0, 480, 0, 1, 0xCC000000}, {640, 456, 0, 1, 0xCC000000},
+            {640, 480, 0, 1, 0xCC000000}, {0, 480, 0, 1, 0xCC000000},
+        };
+        dev->lpVtbl->DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, bot_bar, sizeof(SV));
+
+        /* Vertex/tri count as horizontal bars (proportional to size) */
+        if (g_car_model_loaded) {
+            float vbar_w = (float)g_car_model.vertex_count / 10000.0f * 300.0f;
+            if (vbar_w > 300.0f) vbar_w = 300.0f;
+            float tbar_w = (float)(g_car_model.index_count / 3) / 10000.0f * 300.0f;
+            if (tbar_w > 300.0f) tbar_w = 300.0f;
+            SV vbar[6] = {
+                {10, 460, 0, 1, 0xFF44AA44}, {10+vbar_w, 460, 0, 1, 0xFF44AA44},
+                {10, 466, 0, 1, 0xFF44AA44}, {10+vbar_w, 460, 0, 1, 0xFF44AA44},
+                {10+vbar_w, 466, 0, 1, 0xFF44AA44}, {10, 466, 0, 1, 0xFF44AA44},
+            };
+            dev->lpVtbl->DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, vbar, sizeof(SV));
+            SV tbar[6] = {
+                {10, 470, 0, 1, 0xFF4488CC}, {10+tbar_w, 470, 0, 1, 0xFF4488CC},
+                {10, 476, 0, 1, 0xFF4488CC}, {10+tbar_w, 470, 0, 1, 0xFF4488CC},
+                {10+tbar_w, 476, 0, 1, 0xFF4488CC}, {10, 476, 0, 1, 0xFF4488CC},
+            };
+            dev->lpVtbl->DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, tbar, sizeof(SV));
+        }
+
+        dev->lpVtbl->SetRenderState(dev, D3DRS_ALPHABLENDENABLE, FALSE);
+        dev->lpVtbl->SetRenderState(dev, D3DRS_ZENABLE, TRUE);
+    }
+
+    /* Reset transforms to identity for subsequent 2D rendering */
+    {
+        D3DMATRIX ident;
+        mat4_identity((float *)&ident);
+        dev->lpVtbl->SetTransform(dev, D3DTS_WORLD, &ident);
+        dev->lpVtbl->SetTransform(dev, D3DTS_VIEW, &ident);
+        dev->lpVtbl->SetTransform(dev, D3DTS_PROJECTION, &ident);
+    }
+}
 
 void game_frame_pump(void)
 {
@@ -1209,6 +1939,55 @@ void game_frame_pump(void)
             if (GetAsyncKeyState(VK_RETURN) & 0x8000)  XINP_MEM8(0x4A1C75) = 1;
             if (GetAsyncKeyState(VK_ESCAPE) & 0x8000)  XINP_MEM8(0x4A1C79) = 1;
 
+            /* V key: toggle true 3D rendering mode */
+            {
+                static int v_key_prev = 0;
+                int v_key_now = (GetAsyncKeyState('V') & 0x8000) ? 1 : 0;
+                if (v_key_now && !v_key_prev) {
+                    rw_toggle_3d_mode();
+                }
+                v_key_prev = v_key_now;
+            }
+
+            /* T key: toggle track geometry visibility (in 3D mode) */
+            {
+                static int t_key_prev = 0;
+                int t_key_now = (GetAsyncKeyState('T') & 0x8000) ? 1 : 0;
+                if (t_key_now && !t_key_prev) {
+                    rw_toggle_track();
+                }
+                t_key_prev = t_key_now;
+            }
+
+            /* M key: toggle 3D model view */
+            {
+                static int m_key_prev = 0;
+                int m_key_now = (GetAsyncKeyState('M') & 0x8000) ? 1 : 0;
+                if (m_key_now && !m_key_prev) {
+                    g_show_3d_model = !g_show_3d_model;
+                    fprintf(stderr, "  [MODEL] 3D model view %s\n",
+                            g_show_3d_model ? "ON" : "OFF");
+                }
+                m_key_prev = m_key_now;
+            }
+
+            /* N/P keys: cycle through vehicle models in 3D view */
+            if (g_show_3d_model && g_vehicle_count > 1) {
+                static int n_key_prev = 0, p_key_prev = 0;
+                int n_key_now = (GetAsyncKeyState('N') & 0x8000) ? 1 : 0;
+                int p_key_now = (GetAsyncKeyState('P') & 0x8000) ? 1 : 0;
+                if (n_key_now && !n_key_prev) {
+                    int next = (g_vehicle_index + 1) % g_vehicle_count;
+                    load_vehicle_model(next);
+                }
+                if (p_key_now && !p_key_prev) {
+                    int prev = (g_vehicle_index - 1 + g_vehicle_count) % g_vehicle_count;
+                    load_vehicle_model(prev);
+                }
+                n_key_prev = n_key_now;
+                p_key_prev = p_key_now;
+            }
+
             /* Debug: log input state */
             {
                 static int _inp_dbg = 0;
@@ -1245,6 +2024,18 @@ void game_frame_pump(void)
             0xFF102040, /* Dark blue-grey */
             1.0f, 0);
 
+        /* Initialize texture cache on first frame */
+        txd_cache_init();
+
+        /* 3D model view mode (toggle with M key) */
+        if (g_show_3d_model && g_car_model_loaded) {
+            render_3d_model_view(g_d3d_device, 1.0f / 60.0f);
+        }
+        else if (rw_is_3d_mode()) {
+            /* True 3D rendering mode (toggle with V key) */
+            rw_gameplay_render();
+        }
+        else
         /* Pseudo-3D perspective road rendering (OutRun-style).
          * Camera is behind and above the car, looking forward.
          * Road rendered as horizontal trapezoid segments with perspective. */
@@ -1318,6 +2109,7 @@ void game_frame_pump(void)
 
                 /* XYZRHW + DIFFUSE vertex */
                 typedef struct { float x, y, z, rhw; DWORD color; } RHW_VERT;
+                typedef struct { float x, y, z, rhw; DWORD color; float u, v; } RHW_TEX_VERT;
 
                 /* Screen shake: random viewport offset during crash */
                 float shake_x = 0.0f, shake_y = 0.0f;
@@ -1355,7 +2147,10 @@ void game_frame_pump(void)
 
                 /* Pre-compute curve and hill offsets for each segment boundary.
                  * These accumulate in screen-space pixels so far segments
-                 * appear shifted, creating curved and hilly road illusion. */
+                 * appear shifted, creating curved and hilly road illusion.
+                 * Player heading adds visual road curvature (OutRun-style):
+                 * steering left makes the road appear to curve right, giving
+                 * the feeling of turning into the road rather than sliding. */
                 #define ROAD_SEGS 50
                 float curve_offsets[ROAD_SEGS + 1];
                 float hill_offsets[ROAD_SEGS + 1];
@@ -1363,6 +2158,8 @@ void game_frame_pump(void)
                     int ci;
                     curve_offsets[0] = 0.0f;
                     hill_offsets[0] = 0.0f;
+                    /* Steering-induced visual curvature: road bends opposite to heading */
+                    float steer_curve = -heading * 0.4f;
                     for (ci = 0; ci < ROAD_SEGS; ci++) {
                         float ct0 = (float)ci / ROAD_SEGS;
                         float ct1 = (float)(ci + 1) / ROAD_SEGS;
@@ -1370,7 +2167,9 @@ void game_frame_pump(void)
                         float cd1 = 2.0f + ct1 * ct1 * VIEW_DIST;
                         float cwy = py + (cd0 + cd1) * 0.5f;
                         float scale = FOCAL / ((cd0 + cd1) * 0.5f);
-                        curve_offsets[ci + 1] = curve_offsets[ci] + ROAD_CURVE(cwy) * scale * 20.0f;
+                        float track_curve = ROAD_CURVE(cwy) * scale * 20.0f;
+                        float steer_vis = steer_curve * scale * 25.0f;
+                        curve_offsets[ci + 1] = curve_offsets[ci] + track_curve + steer_vis;
                         hill_offsets[ci + 1] = hill_offsets[ci] + ROAD_HILL(cwy) * scale * 15.0f;
                     }
                 }
@@ -1502,12 +2301,21 @@ void game_frame_pump(void)
                         D3DPT_TRIANGLELIST, 2, grass, sizeof(RHW_VERT));
                 }
 
-                /* ── Road segments (perspective trapezoids) ──────────── */
+                /* ── Road segments (perspective trapezoids with asphalt texture) ── */
                 {
                     /* Build all road segment vertices in one array for batched draw */
-                    RHW_VERT road_verts[ROAD_SEGS * 6];
+                    RHW_TEX_VERT road_verts[ROAD_SEGS * 6];
                     int vi = 0;
                     int si;
+
+                    /* Bind road texture and switch to textured vertex format */
+                    if (g_road_tex) {
+                        g_d3d_device->lpVtbl->SetTexture(g_d3d_device, 0,
+                            (IDirect3DBaseTexture8 *)g_road_tex);
+                        g_d3d_device->lpVtbl->SetVertexShader(g_d3d_device,
+                            D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+                    }
+
                     for (si = 0; si < ROAD_SEGS; si++) {
                         /* Exponential depth distribution: more detail up close */
                         float t0 = (float)si / ROAD_SEGS;
@@ -1534,17 +2342,28 @@ void game_frame_pump(void)
                         int stripe = ((int)(world_d / 3.0f)) & 1;
                         DWORD road_col = stripe ? tod_road_a : tod_road_b;
 
+                        /* UV coords: U across road width (0-1), V tiles along distance */
+                        float v0 = fmodf(world_d * 0.15f, 1.0f);
+                        float v1 = fmodf((py + (d1 + d0) * 0.5f + 3.0f) * 0.15f, 1.0f);
+
                         /* Draw road surface quad */
-                        road_verts[vi++] = (RHW_VERT){lx0, y0, 0.9f, 1.0f, road_col};
-                        road_verts[vi++] = (RHW_VERT){rx0, y0, 0.9f, 1.0f, road_col};
-                        road_verts[vi++] = (RHW_VERT){lx1, y1, 0.9f, 1.0f, road_col};
-                        road_verts[vi++] = (RHW_VERT){rx0, y0, 0.9f, 1.0f, road_col};
-                        road_verts[vi++] = (RHW_VERT){rx1, y1, 0.9f, 1.0f, road_col};
-                        road_verts[vi++] = (RHW_VERT){lx1, y1, 0.9f, 1.0f, road_col};
+                        road_verts[vi++] = (RHW_TEX_VERT){lx0, y0, 0.9f, 1.0f, road_col, 0.0f, v0};
+                        road_verts[vi++] = (RHW_TEX_VERT){rx0, y0, 0.9f, 1.0f, road_col, 1.0f, v0};
+                        road_verts[vi++] = (RHW_TEX_VERT){lx1, y1, 0.9f, 1.0f, road_col, 0.0f, v1};
+                        road_verts[vi++] = (RHW_TEX_VERT){rx0, y0, 0.9f, 1.0f, road_col, 1.0f, v0};
+                        road_verts[vi++] = (RHW_TEX_VERT){rx1, y1, 0.9f, 1.0f, road_col, 1.0f, v1};
+                        road_verts[vi++] = (RHW_TEX_VERT){lx1, y1, 0.9f, 1.0f, road_col, 0.0f, v1};
                     }
                     if (vi > 0) {
                         g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
-                            D3DPT_TRIANGLELIST, vi / 3, road_verts, sizeof(RHW_VERT));
+                            D3DPT_TRIANGLELIST, vi / 3, road_verts, sizeof(RHW_TEX_VERT));
+                    }
+
+                    /* Unbind road texture and restore untextured vertex format */
+                    if (g_road_tex) {
+                        g_d3d_device->lpVtbl->SetTexture(g_d3d_device, 0, NULL);
+                        g_d3d_device->lpVtbl->SetVertexShader(g_d3d_device,
+                            D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
                     }
 
                     /* Rain puddles on road surface */
@@ -1588,6 +2407,51 @@ void game_frame_pump(void)
                             }
                             g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
                                 D3DRS_ALPHABLENDENABLE, 0);
+                        }
+                    }
+
+                    /* Road shoulder/curb (raised edge strips for depth) */
+                    {
+                        RHW_VERT curb_verts[ROAD_SEGS * 12]; /* left + right × 6 verts */
+                        int cvi = 0;
+                        for (si = 0; si < ROAD_SEGS; si++) {
+                            float t0 = (float)si / ROAD_SEGS;
+                            float t1 = (float)(si + 1) / ROAD_SEGS;
+                            float d0 = 2.0f + t0 * t0 * VIEW_DIST;
+                            float d1 = 2.0f + t1 * t1 * VIEW_DIST;
+                            float ho0 = hill_offsets[si], ho1 = hill_offsets[si + 1];
+                            float y0 = PROJ_Y(d0) - ho0;
+                            float y1 = PROJ_Y(d1) - ho1;
+                            if (y0 < HORIZON - 30.0f || y1 > SH) continue;
+                            if (y0 > SH) y0 = SH;
+                            float co0 = curve_offsets[si], co1 = curve_offsets[si + 1];
+                            float s0 = PROJ_SCALE(d0), s1 = PROJ_SCALE(d1);
+                            float curb_h0 = 0.3f * s0, curb_h1 = 0.3f * s1; /* curb height (subtle) */
+                            float curb_w0 = 1.5f * s0, curb_w1 = 1.5f * s1; /* curb width */
+                            DWORD curb_top = 0xFF555560;
+                            /* Left curb */
+                            float le0 = PROJ_X(-ROAD_HW, d0) + co0;
+                            float le1 = PROJ_X(-ROAD_HW, d1) + co1;
+                            /* Top face */
+                            curb_verts[cvi++] = (RHW_VERT){le0-curb_w0, y0-curb_h0, 0.88f, 1.0f, curb_top};
+                            curb_verts[cvi++] = (RHW_VERT){le0,         y0-curb_h0, 0.88f, 1.0f, curb_top};
+                            curb_verts[cvi++] = (RHW_VERT){le1-curb_w1, y1-curb_h1, 0.88f, 1.0f, curb_top};
+                            curb_verts[cvi++] = (RHW_VERT){le0,         y0-curb_h0, 0.88f, 1.0f, curb_top};
+                            curb_verts[cvi++] = (RHW_VERT){le1,         y1-curb_h1, 0.88f, 1.0f, curb_top};
+                            curb_verts[cvi++] = (RHW_VERT){le1-curb_w1, y1-curb_h1, 0.88f, 1.0f, curb_top};
+                            /* Right curb */
+                            float re0 = PROJ_X(ROAD_HW, d0) + co0;
+                            float re1 = PROJ_X(ROAD_HW, d1) + co1;
+                            curb_verts[cvi++] = (RHW_VERT){re0,         y0-curb_h0, 0.88f, 1.0f, curb_top};
+                            curb_verts[cvi++] = (RHW_VERT){re0+curb_w0, y0-curb_h0, 0.88f, 1.0f, curb_top};
+                            curb_verts[cvi++] = (RHW_VERT){re1,         y1-curb_h1, 0.88f, 1.0f, curb_top};
+                            curb_verts[cvi++] = (RHW_VERT){re0+curb_w0, y0-curb_h0, 0.88f, 1.0f, curb_top};
+                            curb_verts[cvi++] = (RHW_VERT){re1+curb_w1, y1-curb_h1, 0.88f, 1.0f, curb_top};
+                            curb_verts[cvi++] = (RHW_VERT){re1,         y1-curb_h1, 0.88f, 1.0f, curb_top};
+                        }
+                        if (cvi > 0) {
+                            g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                D3DPT_TRIANGLELIST, cvi / 3, curb_verts, sizeof(RHW_VERT));
                         }
                     }
 
@@ -1765,35 +2629,85 @@ void game_frame_pump(void)
                                 g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
                                     D3DPT_TRIANGLELIST, 1, cn, sizeof(RHW_VERT));
                             } else if (obj_type == 3) {
-                                /* Building: colored rectangle */
-                                float bw = 2.5f * sc, bh = 6.0f * sc;
-                                if (bw < 1.0f) bw = 1.0f;
+                                /* Building: 3D box with front face + side wall + roof top */
+                                float b3w = 2.5f * sc, b3h = 6.0f * sc;
+                                if (b3w < 1.0f) b3w = 1.0f;
                                 DWORD bld_colors[4] = {0xFF556677, 0xFF665544, 0xFF554466, 0xFF446655};
                                 DWORD bc = bld_colors[world_idx & 3];
+                                /* Darken for side wall */
+                                DWORD bc_side = (bc & 0xFF000000) |
+                                    (((bc >> 16) & 0xFF) / 2 << 16) |
+                                    (((bc >> 8) & 0xFF) / 2 << 8) |
+                                    ((bc & 0xFF) / 2);
+                                /* Lighten for roof top */
+                                DWORD bc_roof = (bc & 0xFF000000) |
+                                    ((((bc >> 16) & 0xFF) + 30 > 255 ? 255 : ((bc >> 16) & 0xFF) + 30) << 16) |
+                                    ((((bc >> 8) & 0xFF) + 30 > 255 ? 255 : ((bc >> 8) & 0xFF) + 30) << 8) |
+                                    (((bc & 0xFF) + 30 > 255 ? 255 : (bc & 0xFF) + 30));
+                                /* Front face */
                                 RHW_VERT bv[6] = {
-                                    {sx_obj-bw, sy_base-bh, 0.5f, 1.0f, bc},
-                                    {sx_obj+bw, sy_base-bh, 0.5f, 1.0f, bc},
-                                    {sx_obj-bw, sy_base,    0.5f, 1.0f, bc},
-                                    {sx_obj+bw, sy_base-bh, 0.5f, 1.0f, bc},
-                                    {sx_obj+bw, sy_base,    0.5f, 1.0f, bc},
-                                    {sx_obj-bw, sy_base,    0.5f, 1.0f, bc},
+                                    {sx_obj-b3w, sy_base-b3h, 0.5f, 1.0f, bc},
+                                    {sx_obj+b3w, sy_base-b3h, 0.5f, 1.0f, bc},
+                                    {sx_obj-b3w, sy_base,     0.5f, 1.0f, bc},
+                                    {sx_obj+b3w, sy_base-b3h, 0.5f, 1.0f, bc},
+                                    {sx_obj+b3w, sy_base,     0.5f, 1.0f, bc},
+                                    {sx_obj-b3w, sy_base,     0.5f, 1.0f, bc},
                                 };
                                 g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
                                     D3DPT_TRIANGLELIST, 2, bv, sizeof(RHW_VERT));
-                                /* Window row */
-                                DWORD win_c = 0xFFAABBDD;
-                                float ww = bw * 0.6f, wh = bh * 0.15f;
-                                float wy = sy_base - bh * 0.6f;
-                                RHW_VERT wv[6] = {
-                                    {sx_obj-ww, wy-wh, 0.49f, 1.0f, win_c},
-                                    {sx_obj+ww, wy-wh, 0.49f, 1.0f, win_c},
-                                    {sx_obj-ww, wy+wh, 0.49f, 1.0f, win_c},
-                                    {sx_obj+ww, wy-wh, 0.49f, 1.0f, win_c},
-                                    {sx_obj+ww, wy+wh, 0.49f, 1.0f, win_c},
-                                    {sx_obj-ww, wy+wh, 0.49f, 1.0f, win_c},
+                                /* Side wall (perspective depth - extends toward vanishing pt) */
+                                float depth_w = b3w * 0.6f;
+                                float depth_shrink = 0.85f; /* far edge smaller */
+                                int bld_side = (side == 0) ? 1 : 0; /* inner side visible */
+                                float side_x = bld_side ? (sx_obj + b3w) : (sx_obj - b3w);
+                                float side_dir = bld_side ? 1.0f : -1.0f;
+                                RHW_VERT sw[6] = {
+                                    {side_x, sy_base-b3h, 0.51f, 1.0f, bc_side},
+                                    {side_x+depth_w*side_dir, sy_base-b3h*depth_shrink, 0.51f, 1.0f, bc_side},
+                                    {side_x, sy_base, 0.51f, 1.0f, bc_side},
+                                    {side_x+depth_w*side_dir, sy_base-b3h*depth_shrink, 0.51f, 1.0f, bc_side},
+                                    {side_x+depth_w*side_dir, sy_base, 0.51f, 1.0f, bc_side},
+                                    {side_x, sy_base, 0.51f, 1.0f, bc_side},
                                 };
                                 g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
-                                    D3DPT_TRIANGLELIST, 2, wv, sizeof(RHW_VERT));
+                                    D3DPT_TRIANGLELIST, 2, sw, sizeof(RHW_VERT));
+                                /* Roof top (extends backward into distance) */
+                                float roof_d = b3h * 0.15f; /* small roof depth */
+                                RHW_VERT rt[6] = {
+                                    {sx_obj-b3w, sy_base-b3h, 0.49f, 1.0f, bc_roof},
+                                    {sx_obj+b3w, sy_base-b3h, 0.49f, 1.0f, bc_roof},
+                                    {sx_obj-b3w*0.9f, sy_base-b3h-roof_d, 0.49f, 1.0f, bc_roof},
+                                    {sx_obj+b3w, sy_base-b3h, 0.49f, 1.0f, bc_roof},
+                                    {sx_obj+b3w*0.9f, sy_base-b3h-roof_d, 0.49f, 1.0f, bc_roof},
+                                    {sx_obj-b3w*0.9f, sy_base-b3h-roof_d, 0.49f, 1.0f, bc_roof},
+                                };
+                                g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                    D3DPT_TRIANGLELIST, 2, rt, sizeof(RHW_VERT));
+                                /* Window rows (two rows for more detail) */
+                                DWORD win_c = 0xFFAABBDD;
+                                float ww = b3w * 0.6f, wh_w = b3h * 0.1f;
+                                float wy1 = sy_base - b3h * 0.35f;
+                                float wy2 = sy_base - b3h * 0.65f;
+                                RHW_VERT wv1[6] = {
+                                    {sx_obj-ww, wy1-wh_w, 0.48f, 1.0f, win_c},
+                                    {sx_obj+ww, wy1-wh_w, 0.48f, 1.0f, win_c},
+                                    {sx_obj-ww, wy1+wh_w, 0.48f, 1.0f, win_c},
+                                    {sx_obj+ww, wy1-wh_w, 0.48f, 1.0f, win_c},
+                                    {sx_obj+ww, wy1+wh_w, 0.48f, 1.0f, win_c},
+                                    {sx_obj-ww, wy1+wh_w, 0.48f, 1.0f, win_c},
+                                };
+                                RHW_VERT wv2[6] = {
+                                    {sx_obj-ww, wy2-wh_w, 0.48f, 1.0f, win_c},
+                                    {sx_obj+ww, wy2-wh_w, 0.48f, 1.0f, win_c},
+                                    {sx_obj-ww, wy2+wh_w, 0.48f, 1.0f, win_c},
+                                    {sx_obj+ww, wy2-wh_w, 0.48f, 1.0f, win_c},
+                                    {sx_obj+ww, wy2+wh_w, 0.48f, 1.0f, win_c},
+                                    {sx_obj-ww, wy2+wh_w, 0.48f, 1.0f, win_c},
+                                };
+                                g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                    D3DPT_TRIANGLELIST, 2, wv1, sizeof(RHW_VERT));
+                                g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                    D3DPT_TRIANGLELIST, 2, wv2, sizeof(RHW_VERT));
                             } else if (obj_type == 4) {
                                 /* Road sign: thin post with small square sign on top */
                                 float pw = 0.3f * sc, ph = 5.0f * sc;
@@ -2039,38 +2953,196 @@ void game_frame_pump(void)
                         /* Cull off-screen */
                         if (sx < -40.0f || sx > SW+40.0f || sy < HORIZON || sy > SH) continue;
 
-                        /* Car rectangle scaled by perspective */
+                        /* 3D car model: body + cabin + roof + side panels */
                         int is_oncoming = (flags & 2) != 0;
-                        float ohw = 2.0f * scale, ohh = 3.0f * scale;
+                        float ohw = 1.6f * scale;  /* body half-width */
+                        float obh = 1.2f * scale;  /* body height (lower section) */
+                        float och = 0.8f * scale;  /* cabin height (upper section) */
+                        float orf = 1.0f * scale;  /* roof depth (forward extension) */
                         DWORD oc = is_oncoming ? onc_colors[oi & 3] : obs_colors[oi & 3];
-                        /* Car body */
-                        RHW_VERT obs[6] = {
-                            {sx-ohw, sy-ohh, 0.4f, 1.0f, oc},
-                            {sx+ohw, sy-ohh, 0.4f, 1.0f, oc},
-                            {sx-ohw, sy,     0.4f, 1.0f, oc},
-                            {sx+ohw, sy-ohh, 0.4f, 1.0f, oc},
-                            {sx+ohw, sy,     0.4f, 1.0f, oc},
-                            {sx-ohw, sy,     0.4f, 1.0f, oc},
-                        };
-                        g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
-                            D3DPT_TRIANGLELIST, 2, obs, sizeof(RHW_VERT));
-                        /* Windshield (darker top) */
-                        DWORD wc = 0xFF202040;
-                        float wh = ohh * 0.35f;
-                        RHW_VERT ws[6] = {
-                            {sx-ohw*0.8f, sy-ohh,    0.35f, 1.0f, wc},
-                            {sx+ohw*0.8f, sy-ohh,    0.35f, 1.0f, wc},
-                            {sx-ohw*0.8f, sy-ohh+wh, 0.35f, 1.0f, wc},
-                            {sx+ohw*0.8f, sy-ohh,    0.35f, 1.0f, wc},
-                            {sx+ohw*0.8f, sy-ohh+wh, 0.35f, 1.0f, wc},
-                            {sx-ohw*0.8f, sy-ohh+wh, 0.35f, 1.0f, wc},
-                        };
-                        g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
-                            D3DPT_TRIANGLELIST, 2, ws, sizeof(RHW_VERT));
+                        /* Darken color for side panels */
+                        DWORD oc_dark = (oc & 0xFF000000) |
+                            (((oc >> 16) & 0xFF) * 2/3 << 16) |
+                            (((oc >> 8) & 0xFF) * 2/3 << 8) |
+                            ((oc & 0xFF) * 2/3);
+                        /* Lighten for roof */
+                        DWORD oc_light = (oc & 0xFF000000) |
+                            ((((oc >> 16) & 0xFF) + 40 > 255 ? 255 : ((oc >> 16) & 0xFF) + 40) << 16) |
+                            ((((oc >> 8) & 0xFF) + 40 > 255 ? 255 : ((oc >> 8) & 0xFF) + 40) << 8) |
+                            (((oc & 0xFF) + 40 > 255 ? 255 : (oc & 0xFF) + 40));
+
+                        float o_belt = sy - obh;         /* beltline */
+                        float o_roof = o_belt - och;     /* top of glass */
+                        float o_hood = o_roof - orf;     /* front of roof */
+                        float o_cw = ohw * 0.82f;        /* cabin narrower */
+
+                        /* Shadow under car (textured if available) */
+                        if (g_tex_shadow) {
+                            float shw = ohw * 1.4f, shh = obh * 0.25f;
+                            g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                                D3DRS_ALPHABLENDENABLE, 1);
+                            g_d3d_device->lpVtbl->SetRenderState(g_d3d_device, 19, 5);
+                            g_d3d_device->lpVtbl->SetRenderState(g_d3d_device, 20, 6);
+                            draw_textured_quad(g_d3d_device, g_tex_shadow,
+                                sx - shw, sy - shh, sx + shw, sy + shh,
+                                0.42f, 0x80000000);
+                            restore_untextured(g_d3d_device);
+                            g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                                D3DRS_ALPHABLENDENABLE, 0);
+                        }
+
+                        /* Traffic car body: 3D model or fallback procedural */
+                        {
+                            int tmi = oi % TRAFFIC_MODEL_COUNT;
+                            BGV_Model *tm = &g_traffic_models[tmi];
+                            if (g_traffic_models_loaded > 0 && tm->vertices && tm->index_count > 0) {
+                                /* Render 3D model at this traffic car's screen position */
+                                DWORD fvf_3d = D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_DIFFUSE | D3DFVF_TEX1;
+                                float tr = tm->bounding_radius;
+
+                                /* World: rotate to face camera (same-dir shows rear, oncoming shows front) */
+                                D3DMATRIX tw;
+                                float trot = is_oncoming ? 3.14159f : 0.0f;
+                                /* Add slight angle based on lane position */
+                                trot += (sx - CX) * 0.001f;
+                                mat4_rotation_y((float *)&tw, trot);
+
+                                /* View: camera behind and above */
+                                D3DMATRIX tv;
+                                mat4_lookat((float *)&tv,
+                                    0.0f, tr * 0.8f, -tr * 2.2f,
+                                    0.0f, tr * 0.15f, 0.0f,
+                                    0.0f, 1.0f, 0.0f);
+
+                                /* Projection with off-center shift to match screen position */
+                                D3DMATRIX tp;
+                                mat4_perspective((float *)&tp,
+                                    32.0f * 3.14159f / 180.0f,
+                                    SW / SH, 0.1f, 50.0f);
+                                /* NDC position: sx,sy → NDC */
+                                float ndc_x = (sx / (SW * 0.5f)) - 1.0f;
+                                float ndc_y = 1.0f - (sy / (SH * 0.5f));
+                                ((float *)&tp)[8] = ndc_x;
+                                ((float *)&tp)[9] = ndc_y;
+                                /* Scale model to match pseudo-3D apparent size.
+                                 * Player car at scale~1 occupies ~48px (ohw=24).
+                                 * This traffic car has ohw = 1.6*scale pixels.
+                                 * Scale projection f factor proportionally. */
+                                float size_ratio = (ohw * 2.0f) / 48.0f;
+                                ((float *)&tp)[0] *= size_ratio;
+                                ((float *)&tp)[5] *= size_ratio;
+
+                                g_d3d_device->lpVtbl->SetTransform(g_d3d_device, D3DTS_WORLD, &tw);
+                                g_d3d_device->lpVtbl->SetTransform(g_d3d_device, D3DTS_VIEW, &tv);
+                                g_d3d_device->lpVtbl->SetTransform(g_d3d_device, D3DTS_PROJECTION, &tp);
+
+                                g_d3d_device->lpVtbl->SetRenderState(g_d3d_device, D3DRS_ZENABLE, TRUE);
+                                g_d3d_device->lpVtbl->SetRenderState(g_d3d_device, D3DRS_ZWRITEENABLE, TRUE);
+                                g_d3d_device->lpVtbl->SetRenderState(g_d3d_device, D3DRS_LIGHTING, FALSE);
+                                g_d3d_device->lpVtbl->SetRenderState(g_d3d_device, D3DRS_CULLMODE, D3DCULL_NONE);
+                                g_d3d_device->lpVtbl->SetTexture(g_d3d_device, 0, NULL);
+                                g_d3d_device->lpVtbl->SetTextureStageState(g_d3d_device, 0, 1, 1);
+
+                                g_d3d_device->lpVtbl->SetVertexShader(g_d3d_device, fvf_3d);
+                                g_d3d_device->lpVtbl->SetStreamSource(g_d3d_device, 0, NULL, 0);
+                                g_d3d_device->lpVtbl->SetIndices(g_d3d_device, NULL, 0);
+
+                                g_d3d_device->lpVtbl->DrawIndexedPrimitiveUP(g_d3d_device,
+                                    D3DPT_TRIANGLELIST,
+                                    0, tm->vertex_count, tm->index_count / 3,
+                                    tm->indices, D3DFMT_INDEX16,
+                                    tm->vertices, sizeof(BGV_Vertex));
+
+                                /* Restore screen-space state */
+                                D3DMATRIX ident;
+                                mat4_identity((float *)&ident);
+                                g_d3d_device->lpVtbl->SetTransform(g_d3d_device, D3DTS_WORLD, &ident);
+                                g_d3d_device->lpVtbl->SetTransform(g_d3d_device, D3DTS_VIEW, &ident);
+                                g_d3d_device->lpVtbl->SetTransform(g_d3d_device, D3DTS_PROJECTION, &ident);
+                                g_d3d_device->lpVtbl->SetVertexShader(g_d3d_device, D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+                                g_d3d_device->lpVtbl->SetRenderState(g_d3d_device, D3DRS_ZENABLE, FALSE);
+                            } else {
+                                /* Fallback: procedural colored rectangles */
+                                RHW_VERT obody[6] = {
+                                    {sx-ohw, o_belt, 0.40f, 1.0f, oc},
+                                    {sx+ohw, o_belt, 0.40f, 1.0f, oc},
+                                    {sx-ohw, sy,     0.40f, 1.0f, oc_dark},
+                                    {sx+ohw, o_belt, 0.40f, 1.0f, oc},
+                                    {sx+ohw, sy,     0.40f, 1.0f, oc_dark},
+                                    {sx-ohw, sy,     0.40f, 1.0f, oc_dark},
+                                };
+                                g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                    D3DPT_TRIANGLELIST, 2, obody, sizeof(RHW_VERT));
+                                RHW_VERT ocab[6] = {
+                                    {sx-o_cw, o_roof, 0.38f, 1.0f, oc},
+                                    {sx+o_cw, o_roof, 0.38f, 1.0f, oc},
+                                    {sx-o_cw, o_belt, 0.38f, 1.0f, oc},
+                                    {sx+o_cw, o_roof, 0.38f, 1.0f, oc},
+                                    {sx+o_cw, o_belt, 0.38f, 1.0f, oc},
+                                    {sx-o_cw, o_belt, 0.38f, 1.0f, oc},
+                                };
+                                g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                    D3DPT_TRIANGLELIST, 2, ocab, sizeof(RHW_VERT));
+                                {
+                                    float rfw = o_cw * 0.85f;
+                                    RHW_VERT oroof[6] = {
+                                        {sx-rfw, o_hood,  0.36f, 1.0f, oc_light},
+                                        {sx+rfw, o_hood,  0.36f, 1.0f, oc_light},
+                                        {sx-o_cw, o_roof, 0.36f, 1.0f, oc_light},
+                                        {sx+rfw, o_hood,  0.36f, 1.0f, oc_light},
+                                        {sx+o_cw, o_roof, 0.36f, 1.0f, oc_light},
+                                        {sx-o_cw, o_roof, 0.36f, 1.0f, oc_light},
+                                    };
+                                    g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                        D3DPT_TRIANGLELIST, 2, oroof, sizeof(RHW_VERT));
+                                }
+                                {
+                                    DWORD wc = 0xFF202040;
+                                    float gw = o_cw * 0.75f;
+                                    RHW_VERT oglass[6] = {
+                                        {sx-gw, o_roof+1.0f*scale, 0.37f, 1.0f, wc},
+                                        {sx+gw, o_roof+1.0f*scale, 0.37f, 1.0f, wc},
+                                        {sx-gw, o_belt-0.5f*scale, 0.37f, 1.0f, wc},
+                                        {sx+gw, o_roof+1.0f*scale, 0.37f, 1.0f, wc},
+                                        {sx+gw, o_belt-0.5f*scale, 0.37f, 1.0f, wc},
+                                        {sx-gw, o_belt-0.5f*scale, 0.37f, 1.0f, wc},
+                                    };
+                                    g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                        D3DPT_TRIANGLELIST, 2, oglass, sizeof(RHW_VERT));
+                                }
+                                {
+                                    float side_bias = (sx - CX) / (SW * 0.5f);
+                                    float side_w = 1.5f * scale * (1.0f + 0.5f * (side_bias > 0 ? side_bias : -side_bias));
+                                    if (side_bias < -0.05f) {
+                                        RHW_VERT oside[6] = {
+                                            {sx+ohw, o_roof,  0.41f, 1.0f, oc_dark},
+                                            {sx+ohw+side_w, o_roof, 0.41f, 1.0f, oc_dark},
+                                            {sx+ohw, sy,      0.41f, 1.0f, oc_dark},
+                                            {sx+ohw+side_w, o_roof, 0.41f, 1.0f, oc_dark},
+                                            {sx+ohw+side_w, sy,     0.41f, 1.0f, oc_dark},
+                                            {sx+ohw, sy,      0.41f, 1.0f, oc_dark},
+                                        };
+                                        g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                            D3DPT_TRIANGLELIST, 2, oside, sizeof(RHW_VERT));
+                                    } else if (side_bias > 0.05f) {
+                                        RHW_VERT oside[6] = {
+                                            {sx-ohw-side_w, o_roof, 0.41f, 1.0f, oc_dark},
+                                            {sx-ohw, o_roof,        0.41f, 1.0f, oc_dark},
+                                            {sx-ohw-side_w, sy,     0.41f, 1.0f, oc_dark},
+                                            {sx-ohw, o_roof,        0.41f, 1.0f, oc_dark},
+                                            {sx-ohw, sy,            0.41f, 1.0f, oc_dark},
+                                            {sx-ohw-side_w, sy,     0.41f, 1.0f, oc_dark},
+                                        };
+                                        g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                            D3DPT_TRIANGLELIST, 2, oside, sizeof(RHW_VERT));
+                                    }
+                                }
+                            }
+                        }
                         /* Taillights on same-direction cars */
                         if (!is_oncoming) {
-                            DWORD tl = 0xFFFF2222; /* red */
-                            float tlw = ohw * 0.2f, tlh = ohh * 0.1f;
+                            DWORD tl = 0xFFFF2222;
+                            float tlw = ohw * 0.2f, tlh = obh * 0.15f;
                             if (tlw < 0.5f) tlw = 0.5f;
                             RHW_VERT tl_l[6] = {
                                 {sx-ohw*0.7f-tlw, sy-tlh, 0.32f, 1.0f, tl},
@@ -2095,8 +3167,8 @@ void game_frame_pump(void)
                         }
                         /* Headlights on oncoming cars */
                         if (is_oncoming) {
-                            DWORD hl = 0xFFFFFF88; /* bright yellow-white */
-                            float hlw = ohw * 0.25f, hlh = ohh * 0.15f;
+                            DWORD hl = 0xFFFFFF88;
+                            float hlw = ohw * 0.25f, hlh = obh * 0.15f;
                             RHW_VERT hl_l[6] = {
                                 {sx-ohw*0.6f-hlw, sy-hlh, 0.33f, 1.0f, hl},
                                 {sx-ohw*0.6f+hlw, sy-hlh, 0.33f, 1.0f, hl},
@@ -2125,120 +3197,409 @@ void game_frame_pump(void)
                     #undef OBS_ADDR
                 }
 
-                /* ── Player car (fixed at bottom of screen) ──────────── */
+                /* ── Player car (3D box model, viewed from behind-above) ── */
                 {
-                    float car_cx = CX; /* car at screen center horizontally */
-                    float car_cy = SH - 60.0f; /* near bottom */
-                    float car_hw = 24.0f, car_hh = 32.0f; /* screen-space size */
-                    /* Steering tilt: shift car left/right slightly based on heading */
-                    car_cx += heading * 40.0f;
+                    float car_cx = CX;
+                    float car_cy = SH - 55.0f; /* near bottom */
+                    /* Steering offset: small horizontal shift */
+                    car_cx += heading * 18.0f;
+                    /* Steering tilt: skew top relative to bottom */
+                    float car_tilt = heading * 12.0f;
 
-                    /* Car body */
-                    /* Car shadow (semi-transparent dark ellipse behind car) */
+                    /* Car dimensions (screen-space pixels) */
+                    float bw = 24.0f;   /* body half-width */
+                    float bh = 14.0f;   /* body height (rear face) */
+                    float ch = 8.0f;    /* cabin height (glass area) */
+                    float rw = 20.0f;   /* roof half-width (narrower) */
+                    float rd = 10.0f;   /* roof depth forward (toward horizon) */
+                    float hw_narrow = 18.0f; /* cabin narrower than fenders */
+
+                    /* Y coordinates */
+                    float y_bumper = car_cy + bh;       /* bottom of car */
+                    float y_belt   = car_cy;            /* beltline (body/cabin join) */
+                    float y_roof   = car_cy - ch;       /* top of rear glass */
+                    float y_hood   = y_roof - rd;       /* front of roof (toward horizon) */
+
+                    /* Shadow (ground plane) */
                     {
                         g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
                             D3DRS_ALPHABLENDENABLE, 1);
-                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
-                            19, 5); /* SRCALPHA */
-                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
-                            20, 6); /* INVSRCALPHA */
-                        DWORD sh_col = 0x40000000; /* semi-transparent black */
-                        float shw = car_hw + 4.0f, shh = car_hh + 2.0f;
-                        float sh_y = car_cy + 4.0f; /* offset down slightly */
-                        RHW_VERT shadow[6] = {
-                            {car_cx-shw, sh_y-shh, 0.25f, 1.0f, sh_col},
-                            {car_cx+shw, sh_y-shh, 0.25f, 1.0f, sh_col},
-                            {car_cx-shw, sh_y+shh, 0.25f, 1.0f, sh_col},
-                            {car_cx+shw, sh_y-shh, 0.25f, 1.0f, sh_col},
-                            {car_cx+shw, sh_y+shh, 0.25f, 1.0f, sh_col},
-                            {car_cx-shw, sh_y+shh, 0.25f, 1.0f, sh_col},
-                        };
-                        g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
-                            D3DPT_TRIANGLELIST, 2, shadow, sizeof(RHW_VERT));
+                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device, 19, 5);
+                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device, 20, 6);
+                        DWORD sh_col = 0x60000000;
+                        float shw = bw + 6.0f;
+                        if (g_tex_shadow) {
+                            draw_textured_quad(g_d3d_device, g_tex_shadow,
+                                car_cx - shw, y_bumper - 2.0f,
+                                car_cx + shw, y_bumper + 10.0f,
+                                0.25f, sh_col);
+                            restore_untextured(g_d3d_device);
+                        } else {
+                            RHW_VERT shadow[6] = {
+                                {car_cx-shw+car_tilt*0.3f, y_bumper-2.0f,  0.25f, 1.0f, sh_col},
+                                {car_cx+shw+car_tilt*0.3f, y_bumper-2.0f,  0.25f, 1.0f, sh_col},
+                                {car_cx-shw,               y_bumper+10.0f, 0.25f, 1.0f, sh_col},
+                                {car_cx+shw+car_tilt*0.3f, y_bumper-2.0f,  0.25f, 1.0f, sh_col},
+                                {car_cx+shw,               y_bumper+10.0f, 0.25f, 1.0f, sh_col},
+                                {car_cx-shw,               y_bumper+10.0f, 0.25f, 1.0f, sh_col},
+                            };
+                            g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                D3DPT_TRIANGLELIST, 2, shadow, sizeof(RHW_VERT));
+                        }
                         g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
                             D3DRS_ALPHABLENDENABLE, 0);
                     }
 
-                    DWORD body_col = 0xFFE0E0FF; /* pale blue-white */
-                    RHW_VERT car_body[6] = {
-                        {car_cx-car_hw, car_cy-car_hh, 0.2f, 1.0f, body_col},
-                        {car_cx+car_hw, car_cy-car_hh, 0.2f, 1.0f, body_col},
-                        {car_cx-car_hw, car_cy+car_hh, 0.2f, 1.0f, body_col},
-                        {car_cx+car_hw, car_cy-car_hh, 0.2f, 1.0f, body_col},
-                        {car_cx+car_hw, car_cy+car_hh, 0.2f, 1.0f, body_col},
-                        {car_cx-car_hw, car_cy+car_hh, 0.2f, 1.0f, body_col},
-                    };
-                    g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
-                        D3DPT_TRIANGLELIST, 2, car_body, sizeof(RHW_VERT));
+                    /* ---- Car body: 3D model or fallback procedural ---- */
+                    if (g_car_model_loaded) {
+                        /* Clear Z-buffer so 3D model renders cleanly */
+                        g_d3d_device->lpVtbl->Clear(g_d3d_device, 0, NULL,
+                            D3DCLEAR_ZBUFFER, 0, 1.0f, 0);
 
-                    /* Windshield (dark area at top of car) */
-                    DWORD wind_col = 0xFF404060;
-                    float wh = car_hh * 0.3f;
-                    RHW_VERT windshield[6] = {
-                        {car_cx-car_hw*0.7f, car_cy-car_hh,    0.15f, 1.0f, wind_col},
-                        {car_cx+car_hw*0.7f, car_cy-car_hh,    0.15f, 1.0f, wind_col},
-                        {car_cx-car_hw*0.7f, car_cy-car_hh+wh, 0.15f, 1.0f, wind_col},
-                        {car_cx+car_hw*0.7f, car_cy-car_hh,    0.15f, 1.0f, wind_col},
-                        {car_cx+car_hw*0.7f, car_cy-car_hh+wh, 0.15f, 1.0f, wind_col},
-                        {car_cx-car_hw*0.7f, car_cy-car_hh+wh, 0.15f, 1.0f, wind_col},
-                    };
-                    g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
-                        D3DPT_TRIANGLELIST, 2, windshield, sizeof(RHW_VERT));
+                        /* Render actual 3D car model in the pseudo-3D scene */
+                        DWORD fvf_3d = D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_DIFFUSE | D3DFVF_TEX1;
 
-                    /* Taillights */
-                    DWORD tail_col = 0xFFFF2222;
-                    float tw = 4.0f, th = 3.0f;
-                    RHW_VERT tail_l[6] = {
-                        {car_cx-car_hw+1, car_cy+car_hh-th, 0.1f, 1.0f, tail_col},
-                        {car_cx-car_hw+1+tw, car_cy+car_hh-th, 0.1f, 1.0f, tail_col},
-                        {car_cx-car_hw+1, car_cy+car_hh, 0.1f, 1.0f, tail_col},
-                        {car_cx-car_hw+1+tw, car_cy+car_hh-th, 0.1f, 1.0f, tail_col},
-                        {car_cx-car_hw+1+tw, car_cy+car_hh, 0.1f, 1.0f, tail_col},
-                        {car_cx-car_hw+1, car_cy+car_hh, 0.1f, 1.0f, tail_col},
-                    };
-                    RHW_VERT tail_r[6] = {
-                        {car_cx+car_hw-1-tw, car_cy+car_hh-th, 0.1f, 1.0f, tail_col},
-                        {car_cx+car_hw-1, car_cy+car_hh-th, 0.1f, 1.0f, tail_col},
-                        {car_cx+car_hw-1-tw, car_cy+car_hh, 0.1f, 1.0f, tail_col},
-                        {car_cx+car_hw-1, car_cy+car_hh-th, 0.1f, 1.0f, tail_col},
-                        {car_cx+car_hw-1, car_cy+car_hh, 0.1f, 1.0f, tail_col},
-                        {car_cx+car_hw-1-tw, car_cy+car_hh, 0.1f, 1.0f, tail_col},
-                    };
-                    g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
-                        D3DPT_TRIANGLELIST, 2, tail_l, sizeof(RHW_VERT));
-                    g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
-                        D3DPT_TRIANGLELIST, 2, tail_r, sizeof(RHW_VERT));
+                        /* World matrix: rotate car by steering heading */
+                        D3DMATRIX car_world;
+                        mat4_rotation_y((float *)&car_world, heading * 0.3f);
 
-                    /* Boost exhaust flames (when actively boosting) */
+                        /* View matrix: camera behind and above, looking at car rear */
+                        D3DMATRIX car_view;
+                        float r = g_car_model.bounding_radius;
+                        mat4_lookat((float *)&car_view,
+                                    0.0f, r * 0.8f, -r * 2.2f,  /* eye: behind+above */
+                                    0.0f, r * 0.15f, 0.0f,       /* target: car center-low */
+                                    0.0f, 1.0f, 0.0f);           /* up */
+
+                        /* Projection with off-center shift to place car at bottom of screen.
+                         * Target screen Y ~= 425/480 = NDC Y -0.77.
+                         * m[9] shifts Y in NDC, m[8] shifts X in NDC. */
+                        D3DMATRIX car_proj;
+                        mat4_perspective((float *)&car_proj,
+                                         32.0f * 3.14159f / 180.0f,
+                                         SW / SH, 0.1f, 50.0f);
+                        ((float *)&car_proj)[9] = -0.77f;
+                        /* Horizontal shift for steering: heading*18px / 320 half-width */
+                        ((float *)&car_proj)[8] = heading * (18.0f / 320.0f);
+
+                        g_d3d_device->lpVtbl->SetTransform(g_d3d_device, D3DTS_WORLD, &car_world);
+                        g_d3d_device->lpVtbl->SetTransform(g_d3d_device, D3DTS_VIEW, &car_view);
+                        g_d3d_device->lpVtbl->SetTransform(g_d3d_device, D3DTS_PROJECTION, &car_proj);
+
+                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device, D3DRS_ZENABLE, TRUE);
+                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device, D3DRS_ZWRITEENABLE, TRUE);
+                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device, D3DRS_LIGHTING, FALSE);
+                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device, D3DRS_CULLMODE, D3DCULL_NONE);
+
+                        /* Bind paint texture for player car */
+                        if (g_paint_tex) {
+                            g_d3d_device->lpVtbl->SetTexture(g_d3d_device, 0,
+                                (IDirect3DBaseTexture8 *)g_paint_tex);
+                        } else {
+                            g_d3d_device->lpVtbl->SetTexture(g_d3d_device, 0, NULL);
+                        }
+
+                        g_d3d_device->lpVtbl->SetVertexShader(g_d3d_device, fvf_3d);
+                        g_d3d_device->lpVtbl->SetStreamSource(g_d3d_device, 0, NULL, 0);
+                        g_d3d_device->lpVtbl->SetIndices(g_d3d_device, NULL, 0);
+
+                        g_d3d_device->lpVtbl->DrawIndexedPrimitiveUP(g_d3d_device,
+                            D3DPT_TRIANGLELIST,
+                            0, g_car_model.vertex_count,
+                            g_car_model.index_count / 3,
+                            g_car_model.indices, D3DFMT_INDEX16,
+                            g_car_model.vertices, sizeof(BGV_Vertex));
+
+                        /* Unbind paint texture */
+                        g_d3d_device->lpVtbl->SetTexture(g_d3d_device, 0, NULL);
+
+                        /* Reset transforms back to identity for subsequent screen-space drawing */
+                        D3DMATRIX ident;
+                        mat4_identity((float *)&ident);
+                        g_d3d_device->lpVtbl->SetTransform(g_d3d_device, D3DTS_WORLD, &ident);
+                        g_d3d_device->lpVtbl->SetTransform(g_d3d_device, D3DTS_VIEW, &ident);
+                        g_d3d_device->lpVtbl->SetTransform(g_d3d_device, D3DTS_PROJECTION, &ident);
+
+                        /* Restore screen-space vertex format */
+                        g_d3d_device->lpVtbl->SetVertexShader(g_d3d_device,
+                            D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device, D3DRS_ZENABLE, FALSE);
+                    } else {
+                    /* ---- Fallback: procedural car body ---- */
+                    /* Lower body (rear face - fenders, bumper, trunk) */
+                    {
+                        DWORD body_main = 0xFFD0D0EE;
+                        DWORD body_dark = 0xFFA0A0CC;
+                        RHW_VERT body[6] = {
+                            {car_cx-bw+car_tilt*0.5f, y_belt,   0.20f, 1.0f, body_main},
+                            {car_cx+bw+car_tilt*0.5f, y_belt,   0.20f, 1.0f, body_main},
+                            {car_cx-bw,               y_bumper, 0.20f, 1.0f, body_dark},
+                            {car_cx+bw+car_tilt*0.5f, y_belt,   0.20f, 1.0f, body_main},
+                            {car_cx+bw,               y_bumper, 0.20f, 1.0f, body_dark},
+                            {car_cx-bw,               y_bumper, 0.20f, 1.0f, body_dark},
+                        };
+                        g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                            D3DPT_TRIANGLELIST, 2, body, sizeof(RHW_VERT));
+                    }
+                    {
+                        DWORD bumper_c = 0xFF333344;
+                        float bmp_h = 3.0f;
+                        RHW_VERT bumper[6] = {
+                            {car_cx-bw, y_bumper-bmp_h, 0.19f, 1.0f, bumper_c},
+                            {car_cx+bw, y_bumper-bmp_h, 0.19f, 1.0f, bumper_c},
+                            {car_cx-bw, y_bumper,       0.19f, 1.0f, bumper_c},
+                            {car_cx+bw, y_bumper-bmp_h, 0.19f, 1.0f, bumper_c},
+                            {car_cx+bw, y_bumper,       0.19f, 1.0f, bumper_c},
+                            {car_cx-bw, y_bumper,       0.19f, 1.0f, bumper_c},
+                        };
+                        g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                            D3DPT_TRIANGLELIST, 2, bumper, sizeof(RHW_VERT));
+                    }
+                    {
+                        DWORD cabin_c = 0xFFC0C0DD;
+                        float t2 = car_tilt * 0.8f;
+                        RHW_VERT cabin[6] = {
+                            {car_cx-hw_narrow+car_tilt, y_roof, 0.18f, 1.0f, cabin_c},
+                            {car_cx+hw_narrow+car_tilt, y_roof, 0.18f, 1.0f, cabin_c},
+                            {car_cx-hw_narrow+t2,       y_belt, 0.18f, 1.0f, cabin_c},
+                            {car_cx+hw_narrow+car_tilt, y_roof, 0.18f, 1.0f, cabin_c},
+                            {car_cx+hw_narrow+t2,       y_belt, 0.18f, 1.0f, cabin_c},
+                            {car_cx-hw_narrow+t2,       y_belt, 0.18f, 1.0f, cabin_c},
+                        };
+                        g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                            D3DPT_TRIANGLELIST, 2, cabin, sizeof(RHW_VERT));
+                    }
+                    {
+                        DWORD glass_c = 0xFF303050;
+                        float gw = hw_narrow * 0.75f;
+                        float gt = car_tilt * 0.9f;
+                        RHW_VERT glass[6] = {
+                            {car_cx-gw+car_tilt, y_roof+2.0f,  0.17f, 1.0f, glass_c},
+                            {car_cx+gw+car_tilt, y_roof+2.0f,  0.17f, 1.0f, glass_c},
+                            {car_cx-gw+gt,       y_belt-2.0f,  0.17f, 1.0f, glass_c},
+                            {car_cx+gw+car_tilt, y_roof+2.0f,  0.17f, 1.0f, glass_c},
+                            {car_cx+gw+gt,       y_belt-2.0f,  0.17f, 1.0f, glass_c},
+                            {car_cx-gw+gt,       y_belt-2.0f,  0.17f, 1.0f, glass_c},
+                        };
+                        g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                            D3DPT_TRIANGLELIST, 2, glass, sizeof(RHW_VERT));
+                    }
+                    {
+                        DWORD roof_c = 0xFFE8E8FF;
+                        DWORD roof_front = 0xFFD0D0EE;
+                        float rf_narrow = rw * 0.85f;
+                        RHW_VERT roof[6] = {
+                            {car_cx-rf_narrow+car_tilt*1.3f, y_hood,  0.16f, 1.0f, roof_front},
+                            {car_cx+rf_narrow+car_tilt*1.3f, y_hood,  0.16f, 1.0f, roof_front},
+                            {car_cx-rw+car_tilt,             y_roof,  0.16f, 1.0f, roof_c},
+                            {car_cx+rf_narrow+car_tilt*1.3f, y_hood,  0.16f, 1.0f, roof_front},
+                            {car_cx+rw+car_tilt,             y_roof,  0.16f, 1.0f, roof_c},
+                            {car_cx-rw+car_tilt,             y_roof,  0.16f, 1.0f, roof_c},
+                        };
+                        g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                            D3DPT_TRIANGLELIST, 2, roof, sizeof(RHW_VERT));
+                    }
+                    {
+                        DWORD hood_c = 0xFFD8D8F0;
+                        DWORD hood_far = 0xFFB0B0D0;
+                        float hood_w = bw * 0.9f;
+                        float hood_fw = bw * 0.6f;
+                        float hood_end = y_hood - 5.0f;
+                        RHW_VERT hood[6] = {
+                            {car_cx-hood_fw+car_tilt*1.5f, hood_end, 0.22f, 1.0f, hood_far},
+                            {car_cx+hood_fw+car_tilt*1.5f, hood_end, 0.22f, 1.0f, hood_far},
+                            {car_cx-hood_w+car_tilt*1.2f,  y_hood,   0.22f, 1.0f, hood_c},
+                            {car_cx+hood_fw+car_tilt*1.5f, hood_end, 0.22f, 1.0f, hood_far},
+                            {car_cx+hood_w+car_tilt*1.2f,  y_hood,   0.22f, 1.0f, hood_c},
+                            {car_cx-hood_w+car_tilt*1.2f,  y_hood,   0.22f, 1.0f, hood_c},
+                        };
+                        g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                            D3DPT_TRIANGLELIST, 2, hood, sizeof(RHW_VERT));
+                    }
+                    {
+                        DWORD ws_c = 0xFF252545;
+                        float ws_w = rw * 0.8f;
+                        float ws_fw = rw * 0.65f;
+                        RHW_VERT ws[6] = {
+                            {car_cx-ws_fw+car_tilt*1.3f, y_hood,       0.155f, 1.0f, ws_c},
+                            {car_cx+ws_fw+car_tilt*1.3f, y_hood,       0.155f, 1.0f, ws_c},
+                            {car_cx-ws_w+car_tilt,       y_roof+1.0f,  0.155f, 1.0f, ws_c},
+                            {car_cx+ws_fw+car_tilt*1.3f, y_hood,       0.155f, 1.0f, ws_c},
+                            {car_cx+ws_w+car_tilt,       y_roof+1.0f,  0.155f, 1.0f, ws_c},
+                            {car_cx-ws_w+car_tilt,       y_roof+1.0f,  0.155f, 1.0f, ws_c},
+                        };
+                        g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                            D3DPT_TRIANGLELIST, 2, ws, sizeof(RHW_VERT));
+                    }
+                    {
+                        float side_depth = 4.0f;
+                        float left_w  = side_depth + heading * 20.0f;
+                        float right_w = side_depth - heading * 20.0f;
+                        if (left_w < 1.0f) left_w = 1.0f;
+                        if (right_w < 1.0f) right_w = 1.0f;
+                        if (left_w > 14.0f) left_w = 14.0f;
+                        if (right_w > 14.0f) right_w = 14.0f;
+                        DWORD side_l = 0xFF8888AA;
+                        DWORD side_r = 0xFF9090BB;
+                        float lx = car_cx - bw;
+                        RHW_VERT ls[12] = {
+                            {lx - left_w+car_tilt*0.3f, y_belt,   0.21f, 1.0f, side_l},
+                            {lx+car_tilt*0.5f,          y_belt,   0.21f, 1.0f, side_l},
+                            {lx - left_w,               y_bumper, 0.21f, 1.0f, side_l},
+                            {lx+car_tilt*0.5f,          y_belt,   0.21f, 1.0f, side_l},
+                            {lx,                        y_bumper, 0.21f, 1.0f, side_l},
+                            {lx - left_w,               y_bumper, 0.21f, 1.0f, side_l},
+                            {lx - left_w*0.6f+car_tilt, y_roof,   0.175f, 1.0f, side_l},
+                            {lx+car_tilt,               y_roof,   0.175f, 1.0f, side_l},
+                            {lx - left_w*0.6f+car_tilt*0.8f, y_belt, 0.175f, 1.0f, side_l},
+                            {lx+car_tilt,               y_roof,   0.175f, 1.0f, side_l},
+                            {lx+car_tilt*0.8f,          y_belt,   0.175f, 1.0f, side_l},
+                            {lx - left_w*0.6f+car_tilt*0.8f, y_belt, 0.175f, 1.0f, side_l},
+                        };
+                        g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                            D3DPT_TRIANGLELIST, 4, ls, sizeof(RHW_VERT));
+                        float rx = car_cx + bw;
+                        RHW_VERT rs[12] = {
+                            {rx+car_tilt*0.5f,           y_belt,   0.21f, 1.0f, side_r},
+                            {rx + right_w+car_tilt*0.3f, y_belt,   0.21f, 1.0f, side_r},
+                            {rx,                         y_bumper, 0.21f, 1.0f, side_r},
+                            {rx + right_w+car_tilt*0.3f, y_belt,   0.21f, 1.0f, side_r},
+                            {rx + right_w,               y_bumper, 0.21f, 1.0f, side_r},
+                            {rx,                         y_bumper, 0.21f, 1.0f, side_r},
+                            {rx+car_tilt,               y_roof,   0.175f, 1.0f, side_r},
+                            {rx + right_w*0.6f+car_tilt, y_roof,  0.175f, 1.0f, side_r},
+                            {rx+car_tilt*0.8f,          y_belt,   0.175f, 1.0f, side_r},
+                            {rx + right_w*0.6f+car_tilt, y_roof,  0.175f, 1.0f, side_r},
+                            {rx + right_w*0.6f+car_tilt*0.8f, y_belt, 0.175f, 1.0f, side_r},
+                            {rx+car_tilt*0.8f,          y_belt,   0.175f, 1.0f, side_r},
+                        };
+                        g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                            D3DPT_TRIANGLELIST, 4, rs, sizeof(RHW_VERT));
+                    }
+                    } /* end else (fallback procedural car) */
+
+                    /* ---- Taillights (on bumper) ---- */
+                    {
+                        DWORD tail_col = 0xFFFF2222;
+                        float tw = 5.0f, th = 3.0f;
+                        float tl_y = y_bumper - th;
+                        RHW_VERT tl_l[6] = {
+                            {car_cx-bw+2, tl_y,     0.10f, 1.0f, tail_col},
+                            {car_cx-bw+2+tw, tl_y,  0.10f, 1.0f, tail_col},
+                            {car_cx-bw+2, y_bumper, 0.10f, 1.0f, tail_col},
+                            {car_cx-bw+2+tw, tl_y,  0.10f, 1.0f, tail_col},
+                            {car_cx-bw+2+tw, y_bumper, 0.10f, 1.0f, tail_col},
+                            {car_cx-bw+2, y_bumper, 0.10f, 1.0f, tail_col},
+                        };
+                        RHW_VERT tl_r[6] = {
+                            {car_cx+bw-2-tw, tl_y,     0.10f, 1.0f, tail_col},
+                            {car_cx+bw-2, tl_y,        0.10f, 1.0f, tail_col},
+                            {car_cx+bw-2-tw, y_bumper, 0.10f, 1.0f, tail_col},
+                            {car_cx+bw-2, tl_y,        0.10f, 1.0f, tail_col},
+                            {car_cx+bw-2, y_bumper,    0.10f, 1.0f, tail_col},
+                            {car_cx+bw-2-tw, y_bumper, 0.10f, 1.0f, tail_col},
+                        };
+                        g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                            D3DPT_TRIANGLELIST, 2, tl_l, sizeof(RHW_VERT));
+                        g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                            D3DPT_TRIANGLELIST, 2, tl_r, sizeof(RHW_VERT));
+                        /* Taillight glow (alpha blended, slightly larger) */
+                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                            D3DRS_ALPHABLENDENABLE, 1);
+                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device, 19, 5);
+                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device, 20, 6);
+                        DWORD glow = 0x40FF0000;
+                        float glw = tw + 3.0f;
+                        RHW_VERT gl_l[6] = {
+                            {car_cx-bw+2-1, tl_y-1,       0.09f, 1.0f, glow},
+                            {car_cx-bw+2+glw, tl_y-1,     0.09f, 1.0f, glow},
+                            {car_cx-bw+2-1, y_bumper+1,   0.09f, 1.0f, glow},
+                            {car_cx-bw+2+glw, tl_y-1,     0.09f, 1.0f, glow},
+                            {car_cx-bw+2+glw, y_bumper+1,  0.09f, 1.0f, glow},
+                            {car_cx-bw+2-1, y_bumper+1,   0.09f, 1.0f, glow},
+                        };
+                        RHW_VERT gl_r[6] = {
+                            {car_cx+bw-2-glw, tl_y-1,     0.09f, 1.0f, glow},
+                            {car_cx+bw-2+1, tl_y-1,       0.09f, 1.0f, glow},
+                            {car_cx+bw-2-glw, y_bumper+1,  0.09f, 1.0f, glow},
+                            {car_cx+bw-2+1, tl_y-1,       0.09f, 1.0f, glow},
+                            {car_cx+bw-2+1, y_bumper+1,   0.09f, 1.0f, glow},
+                            {car_cx+bw-2-glw, y_bumper+1,  0.09f, 1.0f, glow},
+                        };
+                        g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                            D3DPT_TRIANGLELIST, 2, gl_l, sizeof(RHW_VERT));
+                        g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                            D3DPT_TRIANGLELIST, 2, gl_r, sizeof(RHW_VERT));
+                        g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                            D3DRS_ALPHABLENDENABLE, 0);
+                    }
+
+                    /* ---- Boost exhaust flames ---- */
                     {
                         float boost_val = _R_MEMF(0x5FFD08);
                         uint32_t boost_btn = _R_MEM32(0x5FFD0C);
                         if (boost_btn && boost_val > 0.0f && speed > 5.0f) {
-                            /* Animated flame length using a pseudo-random flicker */
                             static uint32_t _flame_seed = 7777;
                             _flame_seed = _flame_seed * 1103515245 + 12345;
                             float flicker = 0.7f + 0.3f * ((float)((_flame_seed >> 16) & 0xFF) / 255.0f);
-                            float flame_len = 18.0f * flicker;
-                            /* Left exhaust flame */
-                            DWORD f_inner = 0xFFFFFF44; /* bright yellow */
-                            DWORD f_outer = 0xFFFF4400; /* orange-red at tip */
-                            float fx_l = car_cx - car_hw * 0.4f;
-                            float fx_r = car_cx + car_hw * 0.4f;
-                            float fy_top = car_cy + car_hh;
-                            RHW_VERT flame_l[3] = {
-                                {fx_l - 3.0f, fy_top, 0.08f, 1.0f, f_inner},
-                                {fx_l + 3.0f, fy_top, 0.08f, 1.0f, f_inner},
-                                {fx_l, fy_top + flame_len, 0.08f, 1.0f, f_outer},
-                            };
-                            RHW_VERT flame_r[3] = {
-                                {fx_r - 3.0f, fy_top, 0.08f, 1.0f, f_inner},
-                                {fx_r + 3.0f, fy_top, 0.08f, 1.0f, f_inner},
-                                {fx_r, fy_top + flame_len, 0.08f, 1.0f, f_outer},
-                            };
-                            g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
-                                D3DPT_TRIANGLELIST, 1, flame_l, sizeof(RHW_VERT));
-                            g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
-                                D3DPT_TRIANGLELIST, 1, flame_r, sizeof(RHW_VERT));
+                            float flame_len = 20.0f * flicker;
+                            float fx_l = car_cx - bw * 0.35f;
+                            float fx_r = car_cx + bw * 0.35f;
+
+                            g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                                D3DRS_ALPHABLENDENABLE, 1);
+                            g_d3d_device->lpVtbl->SetRenderState(g_d3d_device, 19, 5);
+                            g_d3d_device->lpVtbl->SetRenderState(g_d3d_device, 20, 2 /*D3DBLEND_ONE - additive*/);
+
+                            /* Pick animated fire frame */
+                            static uint32_t _fire_frame = 0;
+                            _fire_frame++;
+                            int fi_idx = (int)(_fire_frame / 2) % BOOST_FIRE_FRAMES;
+                            IDirect3DTexture8 *fire_tex = g_tex_boostfire[fi_idx];
+                            if (fire_tex) {
+                                /* Textured animated boost flame sprites */
+                                float fw = 8.0f * flicker;
+                                draw_textured_quad(g_d3d_device, fire_tex,
+                                    fx_l - fw, y_bumper, fx_l + fw, y_bumper + flame_len,
+                                    0.08f, 0xFFFFFF88);
+                                draw_textured_quad(g_d3d_device, fire_tex,
+                                    fx_r - fw, y_bumper, fx_r + fw, y_bumper + flame_len,
+                                    0.08f, 0xFFFFFF88);
+                                /* Boost flare glow behind flames */
+                                if (g_tex_boostflare) {
+                                    float gr = 14.0f * flicker;
+                                    draw_textured_quad(g_d3d_device, g_tex_boostflare,
+                                        fx_l - gr, y_bumper - gr*0.3f,
+                                        fx_l + gr, y_bumper + flame_len + gr*0.5f,
+                                        0.09f, 0x60FFAA44);
+                                    draw_textured_quad(g_d3d_device, g_tex_boostflare,
+                                        fx_r - gr, y_bumper - gr*0.3f,
+                                        fx_r + gr, y_bumper + flame_len + gr*0.5f,
+                                        0.09f, 0x60FFAA44);
+                                }
+                                restore_untextured(g_d3d_device);
+                            } else {
+                                /* Fallback: untextured triangle flames */
+                                DWORD f_inner = 0xFFFFFF44;
+                                DWORD f_outer = 0xFFFF4400;
+                                RHW_VERT flame_l[3] = {
+                                    {fx_l - 3.0f, y_bumper, 0.08f, 1.0f, f_inner},
+                                    {fx_l + 3.0f, y_bumper, 0.08f, 1.0f, f_inner},
+                                    {fx_l, y_bumper + flame_len, 0.08f, 1.0f, f_outer},
+                                };
+                                RHW_VERT flame_r[3] = {
+                                    {fx_r - 3.0f, y_bumper, 0.08f, 1.0f, f_inner},
+                                    {fx_r + 3.0f, y_bumper, 0.08f, 1.0f, f_inner},
+                                    {fx_r, y_bumper + flame_len, 0.08f, 1.0f, f_outer},
+                                };
+                                g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                    D3DPT_TRIANGLELIST, 1, flame_l, sizeof(RHW_VERT));
+                                g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                    D3DPT_TRIANGLELIST, 1, flame_r, sizeof(RHW_VERT));
+                            }
+
+                            g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                                D3DRS_ALPHABLENDENABLE, 0);
                         }
                     }
 
@@ -2263,26 +3624,44 @@ void game_frame_pump(void)
                             DWORD beam_near = ((DWORD)ba << 24) | 0x00FFFFCC;
                             DWORD beam_far  = 0x00FFFFCC;
                             float beam_top = HORIZON + 40.0f;
+                            float beam_src_y = y_hood - 10.0f; /* from front of hood */
                             RHW_VERT bl[6] = {
-                                {car_cx-16.0f, car_cy-car_hh, 0.07f, 1.0f, beam_near},
-                                {car_cx-6.0f,  car_cy-car_hh, 0.07f, 1.0f, beam_near},
-                                {car_cx-40.0f, beam_top,       0.07f, 1.0f, beam_far},
-                                {car_cx-6.0f,  car_cy-car_hh, 0.07f, 1.0f, beam_near},
-                                {car_cx+10.0f, beam_top,       0.07f, 1.0f, beam_far},
-                                {car_cx-40.0f, beam_top,       0.07f, 1.0f, beam_far},
+                                {car_cx-16.0f, beam_src_y, 0.07f, 1.0f, beam_near},
+                                {car_cx-6.0f,  beam_src_y, 0.07f, 1.0f, beam_near},
+                                {car_cx-40.0f, beam_top,   0.07f, 1.0f, beam_far},
+                                {car_cx-6.0f,  beam_src_y, 0.07f, 1.0f, beam_near},
+                                {car_cx+10.0f, beam_top,   0.07f, 1.0f, beam_far},
+                                {car_cx-40.0f, beam_top,   0.07f, 1.0f, beam_far},
                             };
                             RHW_VERT br[6] = {
-                                {car_cx+6.0f,  car_cy-car_hh, 0.07f, 1.0f, beam_near},
-                                {car_cx+16.0f, car_cy-car_hh, 0.07f, 1.0f, beam_near},
-                                {car_cx-10.0f, beam_top,       0.07f, 1.0f, beam_far},
-                                {car_cx+16.0f, car_cy-car_hh, 0.07f, 1.0f, beam_near},
-                                {car_cx+40.0f, beam_top,       0.07f, 1.0f, beam_far},
-                                {car_cx-10.0f, beam_top,       0.07f, 1.0f, beam_far},
+                                {car_cx+6.0f,  beam_src_y, 0.07f, 1.0f, beam_near},
+                                {car_cx+16.0f, beam_src_y, 0.07f, 1.0f, beam_near},
+                                {car_cx-10.0f, beam_top,   0.07f, 1.0f, beam_far},
+                                {car_cx+16.0f, beam_src_y, 0.07f, 1.0f, beam_near},
+                                {car_cx+40.0f, beam_top,   0.07f, 1.0f, beam_far},
+                                {car_cx-10.0f, beam_top,   0.07f, 1.0f, beam_far},
                             };
                             g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
                                 D3DPT_TRIANGLELIST, 2, bl, sizeof(RHW_VERT));
                             g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
                                 D3DPT_TRIANGLELIST, 2, br, sizeof(RHW_VERT));
+                            /* Corona glow at headlight source */
+                            if (g_tex_corona) {
+                                g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                                    20, 2 /*D3DBLEND_ONE - additive*/);
+                                int ca = (int)(beam_alpha_f * 120.0f);
+                                DWORD cc = ((DWORD)ca << 24) | 0x00FFFFAA;
+                                float cr = 10.0f;
+                                draw_textured_quad(g_d3d_device, g_tex_corona,
+                                    car_cx - 11.0f - cr, beam_src_y - cr,
+                                    car_cx - 11.0f + cr, beam_src_y + cr,
+                                    0.06f, cc);
+                                draw_textured_quad(g_d3d_device, g_tex_corona,
+                                    car_cx + 11.0f - cr, beam_src_y - cr,
+                                    car_cx + 11.0f + cr, beam_src_y + cr,
+                                    0.06f, cc);
+                                restore_untextured(g_d3d_device);
+                            }
                             g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
                                 D3DRS_ALPHABLENDENABLE, 0);
                         }
@@ -2344,6 +3723,10 @@ void game_frame_pump(void)
                         float spark_base_y = SH - 70.0f;
                         /* Emit 12 spark particles from wall contact point */
                         static uint32_t _spark_seed = 33333;
+                        if (g_tex_spark) {
+                            g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
+                                20, 2 /*D3DBLEND_ONE - additive for sparks*/);
+                        }
                         int si_sp;
                         for (si_sp = 0; si_sp < 12; si_sp++) {
                             _spark_seed = _spark_seed * 1103515245 + 12345;
@@ -2362,17 +3745,26 @@ void game_frame_pump(void)
                             DWORD sp_rgb = ((_spark_seed >> 20) & 1) ? 0x00FFAA22 : 0x00FFDD44;
                             DWORD sp_c = ((DWORD)spa << 24) | sp_rgb;
                             float ssz = 1.0f + spark_t * 2.0f;
-                            RHW_VERT spv[6] = {
-                                {spx-ssz, spy-ssz, 0.03f, 1.0f, sp_c},
-                                {spx+ssz, spy-ssz, 0.03f, 1.0f, sp_c},
-                                {spx-ssz, spy+ssz, 0.03f, 1.0f, sp_c},
-                                {spx+ssz, spy-ssz, 0.03f, 1.0f, sp_c},
-                                {spx+ssz, spy+ssz, 0.03f, 1.0f, sp_c},
-                                {spx-ssz, spy+ssz, 0.03f, 1.0f, sp_c},
-                            };
-                            g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
-                                D3DPT_TRIANGLELIST, 2, spv, sizeof(RHW_VERT));
+                            if (g_tex_spark) {
+                                /* Textured spark particle */
+                                draw_textured_quad(g_d3d_device, g_tex_spark,
+                                    spx - ssz*1.5f, spy - ssz*1.5f,
+                                    spx + ssz*1.5f, spy + ssz*1.5f,
+                                    0.03f, sp_c);
+                            } else {
+                                RHW_VERT spv[6] = {
+                                    {spx-ssz, spy-ssz, 0.03f, 1.0f, sp_c},
+                                    {spx+ssz, spy-ssz, 0.03f, 1.0f, sp_c},
+                                    {spx-ssz, spy+ssz, 0.03f, 1.0f, sp_c},
+                                    {spx+ssz, spy-ssz, 0.03f, 1.0f, sp_c},
+                                    {spx+ssz, spy+ssz, 0.03f, 1.0f, sp_c},
+                                    {spx-ssz, spy+ssz, 0.03f, 1.0f, sp_c},
+                                };
+                                g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                    D3DPT_TRIANGLELIST, 2, spv, sizeof(RHW_VERT));
+                            }
                         }
+                        if (g_tex_spark) restore_untextured(g_d3d_device);
                         g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
                             D3DRS_ALPHABLENDENABLE, 0);
                     }
@@ -2464,16 +3856,24 @@ void game_frame_pump(void)
                     g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
                         D3DPT_TRIANGLELIST, 2, bg_bar, sizeof(RHW_VERT));
                     DWORD spd_col = (speed >= 0) ? 0xFF44FF44 : 0xFFFF4444;
-                    RHW_VERT spd_bar[6] = {
-                        {10.0f, SH-30.0f, 0.04f, 1.0f, spd_col},
-                        {10.0f+bar_w, SH-30.0f, 0.04f, 1.0f, spd_col},
-                        {10.0f, SH-18.0f, 0.04f, 1.0f, spd_col},
-                        {10.0f+bar_w, SH-30.0f, 0.04f, 1.0f, spd_col},
-                        {10.0f+bar_w, SH-18.0f, 0.04f, 1.0f, spd_col},
-                        {10.0f, SH-18.0f, 0.04f, 1.0f, spd_col},
-                    };
-                    g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
-                        D3DPT_TRIANGLELIST, 2, spd_bar, sizeof(RHW_VERT));
+                    if (g_tex_healthbar && bar_w > 1.0f) {
+                        /* Textured speed bar using game health_bar texture */
+                        draw_textured_quad(g_d3d_device, g_tex_healthbar,
+                            10.0f, SH - 30.0f, 10.0f + bar_w, SH - 18.0f,
+                            0.04f, spd_col);
+                        restore_untextured(g_d3d_device);
+                    } else {
+                        RHW_VERT spd_bar[6] = {
+                            {10.0f, SH-30.0f, 0.04f, 1.0f, spd_col},
+                            {10.0f+bar_w, SH-30.0f, 0.04f, 1.0f, spd_col},
+                            {10.0f, SH-18.0f, 0.04f, 1.0f, spd_col},
+                            {10.0f+bar_w, SH-30.0f, 0.04f, 1.0f, spd_col},
+                            {10.0f+bar_w, SH-18.0f, 0.04f, 1.0f, spd_col},
+                            {10.0f, SH-18.0f, 0.04f, 1.0f, spd_col},
+                        };
+                        g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                            D3DPT_TRIANGLELIST, 2, spd_bar, sizeof(RHW_VERT));
+                    }
                 }
 
                 /* ── Boost bar (bottom-left HUD, below speed bar) ────── */
@@ -2522,16 +3922,24 @@ void game_frame_pump(void)
                         for (ti = 0; ti < takedowns && ti < 20; ti++) {
                             float tx = SW - 20.0f - (float)(ti % 10) * 14.0f;
                             float ty = 10.0f + (float)(ti / 10) * 14.0f;
-                            RHW_VERT pip[6] = {
-                                {tx, ty, 0.02f, 1.0f, td_col},
-                                {tx+10.0f, ty, 0.02f, 1.0f, td_col},
-                                {tx, ty+10.0f, 0.02f, 1.0f, td_col},
-                                {tx+10.0f, ty, 0.02f, 1.0f, td_col},
-                                {tx+10.0f, ty+10.0f, 0.02f, 1.0f, td_col},
-                                {tx, ty+10.0f, 0.02f, 1.0f, td_col},
-                            };
-                            g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
-                                D3DPT_TRIANGLELIST, 2, pip, sizeof(RHW_VERT));
+                            if (g_tex_star) {
+                                /* Textured star pip for each takedown */
+                                draw_textured_quad(g_d3d_device, g_tex_star,
+                                    tx, ty, tx + 12.0f, ty + 12.0f,
+                                    0.02f, 0xFFFF4444);
+                                restore_untextured(g_d3d_device);
+                            } else {
+                                RHW_VERT pip[6] = {
+                                    {tx, ty, 0.02f, 1.0f, td_col},
+                                    {tx+10.0f, ty, 0.02f, 1.0f, td_col},
+                                    {tx, ty+10.0f, 0.02f, 1.0f, td_col},
+                                    {tx+10.0f, ty, 0.02f, 1.0f, td_col},
+                                    {tx+10.0f, ty+10.0f, 0.02f, 1.0f, td_col},
+                                    {tx, ty+10.0f, 0.02f, 1.0f, td_col},
+                                };
+                                g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                    D3DPT_TRIANGLELIST, 2, pip, sizeof(RHW_VERT));
+                            }
                         }
                     }
                 }
@@ -2541,24 +3949,73 @@ void game_frame_pump(void)
                     uint32_t score = _R_MEM32(0x5FFD24);
                     float mult = _R_MEMF(0x5FFD28);
                     if (mult < 1.0f) mult = 1.0f;
-                    /* Score background bar */
-                    DWORD sbg = 0xC0101020;
+                    /* Score background with bright border */
                     g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
                         D3DRS_ALPHABLENDENABLE, 1);
                     g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
                         19, 5);
                     g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
                         20, 6);
-                    RHW_VERT s_bg[6] = {
-                        {10.0f, 10.0f, 0.02f, 1.0f, sbg},
-                        {170.0f, 10.0f, 0.02f, 1.0f, sbg},
-                        {10.0f, 42.0f, 0.02f, 1.0f, sbg},
-                        {170.0f, 10.0f, 0.02f, 1.0f, sbg},
-                        {170.0f, 42.0f, 0.02f, 1.0f, sbg},
-                        {10.0f, 42.0f, 0.02f, 1.0f, sbg},
+                    /* Bright border frame */
+                    DWORD sborder = 0xC0445566;
+                    RHW_VERT s_bdr[6] = {
+                        {8.0f, 8.0f, 0.022f, 1.0f, sborder},
+                        {172.0f, 8.0f, 0.022f, 1.0f, sborder},
+                        {8.0f, 44.0f, 0.022f, 1.0f, sborder},
+                        {172.0f, 8.0f, 0.022f, 1.0f, sborder},
+                        {172.0f, 44.0f, 0.022f, 1.0f, sborder},
+                        {8.0f, 44.0f, 0.022f, 1.0f, sborder},
                     };
                     g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
-                        D3DPT_TRIANGLELIST, 2, s_bg, sizeof(RHW_VERT));
+                        D3DPT_TRIANGLELIST, 2, s_bdr, sizeof(RHW_VERT));
+                    /* Dark background fill */
+                    DWORD sbg = 0xD0182030;
+                    if (g_tex_hud) {
+                        draw_textured_quad(g_d3d_device, g_tex_hud,
+                            10.0f, 10.0f, 170.0f, 42.0f,
+                            0.02f, 0xD0FFFFFF);
+                        restore_untextured(g_d3d_device);
+                    } else {
+                        RHW_VERT s_bg[6] = {
+                            {10.0f, 10.0f, 0.02f, 1.0f, sbg},
+                            {170.0f, 10.0f, 0.02f, 1.0f, sbg},
+                            {10.0f, 42.0f, 0.02f, 1.0f, sbg},
+                            {170.0f, 10.0f, 0.02f, 1.0f, sbg},
+                            {170.0f, 42.0f, 0.02f, 1.0f, sbg},
+                            {10.0f, 42.0f, 0.02f, 1.0f, sbg},
+                        };
+                        g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                            D3DPT_TRIANGLELIST, 2, s_bg, sizeof(RHW_VERT));
+                    }
+                    /* Score digit visualization: white blocks per digit */
+                    {
+                        uint32_t s = score;
+                        int digit_i;
+                        float dx_d = 155.0f;
+                        DWORD digit_c = 0xE0EEEEFF;
+                        for (digit_i = 0; digit_i < 8 && (s > 0 || digit_i == 0); digit_i++) {
+                            int d = s % 10;
+                            s /= 10;
+                            /* Draw digit as stacked bars (crude 7-segment style) */
+                            float dh = 2.5f;
+                            float dy_d = 14.0f;
+                            int row;
+                            for (row = 0; row < d && row < 9; row++) {
+                                RHW_VERT dv[6] = {
+                                    {dx_d, dy_d, 0.018f, 1.0f, digit_c},
+                                    {dx_d+8.0f, dy_d, 0.018f, 1.0f, digit_c},
+                                    {dx_d, dy_d+dh, 0.018f, 1.0f, digit_c},
+                                    {dx_d+8.0f, dy_d, 0.018f, 1.0f, digit_c},
+                                    {dx_d+8.0f, dy_d+dh, 0.018f, 1.0f, digit_c},
+                                    {dx_d, dy_d+dh, 0.018f, 1.0f, digit_c},
+                                };
+                                g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                    D3DPT_TRIANGLELIST, 2, dv, sizeof(RHW_VERT));
+                                dy_d += dh + 0.5f;
+                            }
+                            dx_d -= 12.0f;
+                        }
+                    }
                     /* Multiplier indicator: colored bar at bottom.
                      * Width scales with multiplier (1x-8x), color shifts. */
                     if (mult > 1.0f) {
@@ -2644,7 +4101,7 @@ void game_frame_pump(void)
                         if (alpha < 0) alpha = 0;
                         /* Red flash during crash (shake timer active), white for takedown */
                         float shake = _R_MEMF(0x5FFD18);
-                        DWORD flash_rgb = (shake > 0.0f) ? 0x000044FF : 0x00FFFFFF;
+                        DWORD flash_rgb = (shake > 0.0f) ? 0x00FF4400 : 0x00FFFFFF;
                         DWORD flash_col = ((DWORD)alpha << 24) | flash_rgb;
                         g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
                             D3DRS_ALPHABLENDENABLE, 1);
@@ -2652,16 +4109,23 @@ void game_frame_pump(void)
                             19, 5);
                         g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
                             20, 6);
-                        RHW_VERT flash_verts[6] = {
-                            {0.0f, 0.0f, 0.01f, 1.0f, flash_col},
-                            {SW, 0.0f, 0.01f, 1.0f, flash_col},
-                            {0.0f, SH, 0.01f, 1.0f, flash_col},
-                            {SW, 0.0f, 0.01f, 1.0f, flash_col},
-                            {SW, SH, 0.01f, 1.0f, flash_col},
-                            {0.0f, SH, 0.01f, 1.0f, flash_col},
-                        };
-                        g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
-                            D3DPT_TRIANGLELIST, 2, flash_verts, sizeof(RHW_VERT));
+                        /* Use explosion texture for crash flash */
+                        if (shake > 0.0f && g_tex_explosion) {
+                            draw_textured_quad(g_d3d_device, g_tex_explosion,
+                                0.0f, 0.0f, SW, SH, 0.01f, flash_col);
+                            restore_untextured(g_d3d_device);
+                        } else {
+                            RHW_VERT flash_verts[6] = {
+                                {0.0f, 0.0f, 0.01f, 1.0f, flash_col},
+                                {SW, 0.0f, 0.01f, 1.0f, flash_col},
+                                {0.0f, SH, 0.01f, 1.0f, flash_col},
+                                {SW, 0.0f, 0.01f, 1.0f, flash_col},
+                                {SW, SH, 0.01f, 1.0f, flash_col},
+                                {0.0f, SH, 0.01f, 1.0f, flash_col},
+                            };
+                            g_d3d_device->lpVtbl->DrawPrimitiveUP(g_d3d_device,
+                                D3DPT_TRIANGLELIST, 2, flash_verts, sizeof(RHW_VERT));
+                        }
                         g_d3d_device->lpVtbl->SetRenderState(g_d3d_device,
                             D3DRS_ALPHABLENDENABLE, 0);
                     }
@@ -2871,9 +4335,19 @@ void game_frame_pump(void)
             uint32_t score = XMEM32(0x5FFD24);
             float mult = XMEMF(0x5FFD28);
             if (mult < 1.0f) mult = 1.0f;
-            snprintf(title, sizeof(title),
-                "Burnout 3 | spd=%.0f dist=%um TD=%u boost=%.0f%% score=%u x%.1f",
-                spd, dist_m, takedowns, boost, score, mult);
+            if (g_show_3d_model && g_vehicle_count > 0) {
+                snprintf(title, sizeof(title),
+                    "Burnout 3 | MODEL: %s/Car%d (%d/%d) %uv %ut | Arrows=orbit +/-=zoom Space=spin N/P=car M=back",
+                    g_vehicle_list[g_vehicle_index].class_name,
+                    g_vehicle_list[g_vehicle_index].car_number,
+                    g_vehicle_index + 1, g_vehicle_count,
+                    g_car_model.vertex_count,
+                    g_car_model.index_count / 3);
+            } else {
+                snprintf(title, sizeof(title),
+                    "Burnout 3 | spd=%.0f dist=%um TD=%u boost=%.0f%% score=%u x%.1f",
+                    spd, dist_m, takedowns, boost, score, mult);
+            }
             #undef XMEM32
             #undef XMEMF
             SetWindowTextA(g_hwnd, title);

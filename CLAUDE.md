@@ -34,10 +34,27 @@ The goal is to translate the original x86 Xbox code into a native Windows execut
 - Addresses are always shown as hex with 0x prefix (e.g., 0x001D2807)
 - Xbox kernel function names use their original Xbox names with `xbox_` prefix when reimplemented
 
-## Current Work State (Session 20)
+## Current Work State (Session 22)
 
-### Status: Full arcade driving game with weather, tunnels, scoring, and rearview mirror
-Game boots, loads, runs gameplay loop in state 4. Pseudo-3D OutRun-style driving with curving/hilly roads, 12 traffic cars, boost/takedown/crash mechanics, score combos, weather cycling, tunnel sections, varied roadside scenery, rear-view mirror, and time-of-day lighting.
+### Status: True 3D renderer with chase camera + toggleable rendering modes
+Game boots, loads, runs gameplay loop in state 4. **Two rendering modes** toggled with V key:
+1. **Pseudo-3D** (default): OutRun-style 2.5D rendering (unchanged from Session 21)
+2. **True 3D** (V key): Full 3D world-space rendering with chase camera, ground plane, procedural road with curve offsets and lane markings, mountain backdrop, sky gradient, and 3D vehicle models for player car and all 12 traffic slots.
+
+### RenderWare 3D Renderer (NEW - Session 22)
+- **rw_renderer.c/h**: Full 3D scene renderer using D3D8→D3D11 layer
+  - `RW_Camera`, `RW_Mesh`, `RW_Object`, `RW_Scene` data structures
+  - Persistent GPU vertex/index buffers (no per-frame upload)
+  - Chase camera: follows player car along heading with speed-adaptive distance
+  - Procedural road: 80 segments with curve offsets, center dashes, edge lines
+  - Ground plane: large grass quad following player position
+  - Mountain backdrop: 24-peak ring of triangle silhouettes
+  - HUD: speed bar, boost bar, score/multiplier, "3D MODE" indicator
+- **rw_math.h**: Shared math utilities extracted from main.c
+  - mat4_identity, mat4_perspective, mat4_lookat, mat4_rotation_y
+  - mat4_translation, mat4_scaling, mat4_multiply (new)
+- **V key toggle**: switches between pseudo-3D and true 3D at runtime
+- Both rendering paths coexist — pseudo-3D code is NOT removed
 
 ### Physics Model (sub_000636D0 + sub_000110E0)
 - **Heading angle** at fake physics body +0x18 (radians, 0=north, CW positive)
@@ -45,6 +62,19 @@ Game boots, loads, runs gameplay loop in state 4. Pseudo-3D OutRun-style driving
 - W/S: forward/reverse acceleration, A/D: steering (speed-dependent)
 - Road curves apply centripetal force (0x5FFD10) pushing car outward
 - Position integrated: pos += speed * heading_dir * dt
+
+### 3D Vehicle Models (NEW - Session 21)
+- **BGV loader** (`bgv_loader.c`): parses Criterion .bgv vehicle geometry files
+  - Xbox D3DVSDT_NORMPACKED3 packed normals (11-11-10 bit signed)
+  - Triangle strip → triangle list conversion with degenerate restart markers
+  - Draw call extraction from sub-entry descriptors (pattern scan)
+  - Fake directional lighting baked into vertex colors
+- **Vehicle catalog**: 67 models across 7 classes (COMP/CUPE/HEVY/HSPC/MSCL/SPRT/SUPR)
+- **3D model viewer** (M key): turntable view with auto-rotation, ground plane, grid
+- **Model cycling** (N/P keys): browse all 67 vehicles, window title shows stats
+- **Player car**: actual 3D model in gameplay view (off-center projection positioning)
+- **Traffic cars**: 6 different 3D models with color tints (red/blue/yellow/green/silver/grey)
+- Vehicle textures are in .btv files (paint variants) - format not yet decoded
 
 ### D3D8 Rendering (main.c)
 - **Pseudo-3D perspective** (OutRun-style): camera behind car, road to horizon
@@ -100,8 +130,12 @@ Game boots, loads, runs gameplay loop in state 4. Pseudo-3D OutRun-style driving
 - AI braking when player approaches from behind in same lane
 
 ### Next Steps
-1. Long-term: fix the real physics world initialization
-2. Long-term: hook into RenderWare scene graph for actual 3D rendering
+1. Add procedural 3D world: skybox with time-of-day, roadside objects (trees/buildings), tunnels
+2. Decode .btv vehicle texture format and apply to 3D models
+3. Parse static.dat track geometry and render actual game tracks
+4. Write camera matrices to Xbox VAs for recompiled code compatibility
+5. Long-term: fix the real physics world initialization
+6. Long-term: reconnect original RW code to our renderer
 
 ### Key Input Addresses
 - Accumulators: 0x4D652C (throttle), 0x4D6530 (steering) - written by game_frame_pump()
@@ -111,6 +145,9 @@ Game boots, loads, runs gameplay loop in state 4. Pseudo-3D OutRun-style driving
 
 ### Controls
 - **Keyboard**: WASD = drive, Shift = boost, ESC = quit
+- **V key**: toggle true 3D rendering mode (chase camera)
+- **M key**: toggle 3D model viewer (turntable view)
+- **N/P keys**: next/previous vehicle model (in model viewer)
 - **Gamepad**: Left stick = steer, RT/LT = gas/brake, A or RB = boost
 
 ### Gen File Patches (must re-apply after regen)

@@ -2399,6 +2399,8 @@ void sub_00022660(void)
  */
 void sub_0003D9E0(void)
 {
+    /* If 3D renderer is active and game is in gameplay state, render 3D scene.
+     * The actual rendering happens in game_frame_pump() which checks rw_is_3d_mode(). */
     esp += 4; return; /* pop dummy return address */
 }
 
@@ -2485,9 +2487,9 @@ void sub_000636D0(void)
 
         int32_t raw_str = (int32_t)MEM32(0x4D6530)
                         - 2 * (int32_t)MEM32(0x4D6B28);
-        /* turn_rate = raw_input * 0.003 radians/s (scaled by speed in integrator)
-         *   A/D key (raw=1000): base turn rate = 3.0 rad/s */
-        float turn_f = (float)raw_str * 0.003f;
+        /* turn_rate = raw_input * 0.0018 radians/s (scaled by speed in integrator)
+         *   A/D key (raw=1000): base turn rate = 1.8 rad/s */
+        float turn_f = (float)raw_str * 0.0018f;
 
         uint32_t vel_ptr = MEM32(esi + 0x1B4);
         MEMF(vel_ptr + 8) = accel_f;

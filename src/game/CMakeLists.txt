@@ -15,6 +15,10 @@ file(GLOB RECOMP_GEN_SOURCES
 # Game executable sources
 set(GAME_SOURCES
     main.c
+    txd_loader.c
+    bgv_loader.c
+    track_loader.c
+    rw_renderer.c
     recomp/recomp_test.c
     recomp/recomp_manual.c
     ${RECOMP_GEN_SOURCES}

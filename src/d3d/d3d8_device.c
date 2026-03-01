@@ -1054,6 +1054,18 @@ static HRESULT __stdcall d3d8_CreateDevice(IDirect3D8 *self, UINT Adapter, DWORD
 
     d3d8_init_default_states(&g_device_state);
 
+    /* Set initial viewport (D3D11 requires explicit viewport) */
+    {
+        D3D11_VIEWPORT vp;
+        vp.TopLeftX = 0.0f;
+        vp.TopLeftY = 0.0f;
+        vp.Width    = (FLOAT)g_device_state.width;
+        vp.Height   = (FLOAT)g_device_state.height;
+        vp.MinDepth = 0.0f;
+        vp.MaxDepth = 1.0f;
+        ID3D11DeviceContext_RSSetViewports(g_device_state.d3d11_context, 1, &vp);
+    }
+
     /* Initialize shader and state subsystems */
     hr = d3d8_shaders_init();
     if (FAILED(hr)) {
