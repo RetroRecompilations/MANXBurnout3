@@ -34,22 +34,32 @@ The goal is to translate the original x86 Xbox code into a native Windows execut
 - Addresses are always shown as hex with 0x prefix (e.g., 0x001D2807)
 - Xbox kernel function names use their original Xbox names with `xbox_` prefix when reimplemented
 
-## Current Work State (Session 22)
+## Current Work State (Session 24)
 
-### Status: True 3D renderer with chase camera + toggleable rendering modes
+### Status: True 3D renderer with full visual parity to pseudo-3D mode
 Game boots, loads, runs gameplay loop in state 4. **Two rendering modes** toggled with V key:
 1. **Pseudo-3D** (default): OutRun-style 2.5D rendering (unchanged from Session 21)
-2. **True 3D** (V key): Full 3D world-space rendering with chase camera, ground plane, procedural road with curve offsets and lane markings, mountain backdrop, sky gradient, and 3D vehicle models for player car and all 12 traffic slots.
+2. **True 3D** (V key): Full 3D world-space rendering with chase camera, time-of-day cycling, roadside scenery, tunnels, night stars, rain weather, and 3D vehicle models.
 
-### RenderWare 3D Renderer (NEW - Session 22)
+### RenderWare 3D Renderer
 - **rw_renderer.c/h**: Full 3D scene renderer using D3D8→D3D11 layer
   - `RW_Camera`, `RW_Mesh`, `RW_Object`, `RW_Scene` data structures
   - Persistent GPU vertex/index buffers (no per-frame upload)
   - Chase camera: follows player car along heading with speed-adaptive distance
   - Procedural road: 80 segments with curve offsets, center dashes, edge lines
   - Ground plane: large grass quad following player position
-  - Mountain backdrop: 24-peak ring of triangle silhouettes
+  - Mountain backdrop: 24-peak ring of triangle silhouettes (time-of-day colored)
   - HUD: speed bar, boost bar, score/multiplier, "3D MODE" indicator
+  - **Time-of-day** (NEW Session 24): 4-phase color cycling (dawn→day→sunset→night, 3000-unit period)
+    - Sky gradient, ground plane, mountains, road all cycle colors
+    - Road darkens at night, building windows light up
+  - **Roadside objects** (NEW Session 24): 6 types placed along procedural road
+    - Guard posts, trees (regular/tall), buildings (with night windows), road signs, billboards
+    - Deterministic hash-based placement, 18-unit spacing, both sides of road
+  - **Tunnel sections** (NEW Session 24): every 2000 units, 200 units long
+    - Ceiling, walls, orange strip lights, curve-following segments
+  - **Night stars** (NEW Session 24): 40 twinkling stars during night phase (cycle 0.55-0.95)
+  - **Rain weather** (NEW Session 24): 6000-unit cycle with rain streaks, fog overlay
 - **rw_math.h**: Shared math utilities extracted from main.c
   - mat4_identity, mat4_perspective, mat4_lookat, mat4_rotation_y
   - mat4_translation, mat4_scaling, mat4_multiply (new)
@@ -130,9 +140,9 @@ Game boots, loads, runs gameplay loop in state 4. **Two rendering modes** toggle
 - AI braking when player approaches from behind in same lane
 
 ### Next Steps
-1. Add procedural 3D world: skybox with time-of-day, roadside objects (trees/buildings), tunnels
-2. Decode .btv vehicle texture format and apply to 3D models
-3. Parse static.dat track geometry and render actual game tracks
+1. Decode .btv vehicle texture format and apply to 3D models
+2. Parse static.dat track geometry and render actual game tracks
+3. Add rain puddles on 3D road surface during rain weather
 4. Write camera matrices to Xbox VAs for recompiled code compatibility
 5. Long-term: fix the real physics world initialization
 6. Long-term: reconnect original RW code to our renderer

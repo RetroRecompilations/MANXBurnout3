@@ -45,6 +45,90 @@ extern ptrdiff_t g_xbox_mem_offset;
 #define RW_MEMF(a)  (*(volatile float*)((uintptr_t)(a) + g_xbox_mem_offset))
 #define RW_MEM32(a) (*(volatile uint32_t*)((uintptr_t)(a) + g_xbox_mem_offset))
 
+/* ── Time-of-day color lerp ──────────────────────────────────── */
+
+#define LERP_COL(a, b, t) ( \
+    (((DWORD)(((float)(((a)>>24)&0xFF))*(1.0f-(t)) + ((float)(((b)>>24)&0xFF))*(t))) << 24) | \
+    (((DWORD)(((float)(((a)>>16)&0xFF))*(1.0f-(t)) + ((float)(((b)>>16)&0xFF))*(t))) << 16) | \
+    (((DWORD)(((float)(((a)>>8)&0xFF))*(1.0f-(t)) + ((float)(((b)>>8)&0xFF))*(t))) << 8) | \
+    (((DWORD)(((float)((a)&0xFF))*(1.0f-(t)) + ((float)((b)&0xFF))*(t)))) )
+
+/* Time-of-day state (computed once per frame) */
+typedef struct {
+    float cycle;        /* 0-1, based on player forward distance / 3000 */
+    float night;        /* 0-1, how dark is night (0 = day, 1 = full night) */
+    DWORD sky_top;
+    DWORD sky_bot;
+    DWORD grass;
+    DWORD mountain;
+    DWORD road_a;
+    DWORD road_b;
+} TOD_State;
+
+static TOD_State g_tod;
+
+static void tod_update(float py)
+{
+    float cycle = fmodf(py / 3000.0f, 1.0f);
+    if (cycle < 0.0f) cycle += 1.0f;
+    g_tod.cycle = cycle;
+
+    DWORD sky_top, sky_bot, grass, mtn;
+
+    if (cycle < 0.25f) {
+        /* Dawn → Day */
+        float t = cycle / 0.25f;
+        sky_top = LERP_COL(0xFF2A1040, 0xFF1020A0, t);
+        sky_bot = LERP_COL(0xFFDD6633, 0xFF6090D0, t);
+        grass   = LERP_COL(0xFF1A2810, 0xFF1A3318, t);
+        mtn     = LERP_COL(0xFF3A2040, 0xFF304060, t);
+    } else if (cycle < 0.50f) {
+        /* Day → Sunset */
+        float t = (cycle - 0.25f) / 0.25f;
+        sky_top = LERP_COL(0xFF1020A0, 0xFF602080, t);
+        sky_bot = LERP_COL(0xFF6090D0, 0xFFFF6622, t);
+        grass   = LERP_COL(0xFF1A3318, 0xFF2A2810, t);
+        mtn     = LERP_COL(0xFF304060, 0xFF503040, t);
+    } else if (cycle < 0.75f) {
+        /* Sunset → Night */
+        float t = (cycle - 0.50f) / 0.25f;
+        sky_top = LERP_COL(0xFF602080, 0xFF080818, t);
+        sky_bot = LERP_COL(0xFFFF6622, 0xFF101830, t);
+        grass   = LERP_COL(0xFF2A2810, 0xFF0A1508, t);
+        mtn     = LERP_COL(0xFF503040, 0xFF101828, t);
+    } else {
+        /* Night → Dawn */
+        float t = (cycle - 0.75f) / 0.25f;
+        sky_top = LERP_COL(0xFF080818, 0xFF2A1040, t);
+        sky_bot = LERP_COL(0xFF101830, 0xFFDD6633, t);
+        grass   = LERP_COL(0xFF0A1508, 0xFF1A2810, t);
+        mtn     = LERP_COL(0xFF101828, 0xFF3A2040, t);
+    }
+
+    g_tod.sky_top = sky_top;
+    g_tod.sky_bot = sky_bot;
+    g_tod.grass = grass;
+    g_tod.mountain = mtn;
+
+    /* Night factor for road darkening */
+    float night = 0.0f;
+    if (cycle > 0.50f && cycle <= 0.75f)
+        night = (cycle - 0.50f) / 0.25f;
+    else if (cycle > 0.75f)
+        night = 1.0f - (cycle - 0.75f) / 0.25f;
+    g_tod.night = night;
+
+    /* Road colors darken at night */
+    g_tod.road_a = LERP_COL(0xFF383838, 0xFF111118, night);
+    g_tod.road_b = LERP_COL(0xFF404040, 0xFF0A0A14, night);
+}
+
+/* ── Rain/weather state ─────────────────────────────────────── */
+
+static float g_rain_intensity = 0.0f;
+static uint32_t g_rain_seed = 12345;
+static uint32_t g_twinkle_seed = 42;
+
 /* ── Module state ────────────────────────────────────────────── */
 
 static int g_3d_mode = 0;              /* 1 = true 3D, 0 = pseudo-3D */
@@ -377,9 +461,9 @@ static void build_road_mesh_data(float player_z, float player_x,
     float cum_offset_x = 0.0f;
     float road_y = 0.0f;
 
-    /* Road surface color: alternating grey stripes */
-    DWORD asphalt_dark = 0xFF383838;
-    DWORD asphalt_light = 0xFF404040;
+    /* Road surface color: alternating grey stripes (darkens at night) */
+    DWORD asphalt_dark = g_tod.road_a;
+    DWORD asphalt_light = g_tod.road_b;
 
     int vi = 0, ii = 0;
 
@@ -509,9 +593,9 @@ static void build_road_mesh_data(float player_z, float player_x,
 
 static void render_sky_gradient(IDirect3DDevice8 *dev)
 {
-    /* Full-screen gradient quad behind everything */
-    DWORD sky_top = 0xFF3060A0;  /* blue */
-    DWORD sky_bot = 0xFF80A0C0;  /* lighter blue at horizon */
+    /* Full-screen gradient quad using time-of-day colors */
+    DWORD sky_top = g_tod.sky_top;
+    DWORD sky_bot = g_tod.sky_bot;
 
     ScreenVert sky[6] = {
         {0,   0,   0.999f, 1.0f, sky_top},
@@ -540,7 +624,7 @@ static void render_ground_plane(IDirect3DDevice8 *dev, float player_x, float pla
     /* Large grass-colored quad centered on player */
     float gs = 300.0f;
     float gy = -0.05f;
-    DWORD grass = 0xFF2A5A1A;
+    DWORD grass = g_tod.grass;
 
     BGV_Vertex ground[6] = {
         {player_x - gs, gy, player_z - gs, 0,1,0, grass, 0,0},
@@ -600,8 +684,9 @@ static void render_mountains(IDirect3DDevice8 *dev, float player_x, float player
     float dist = 250.0f;
     float base_y = -5.0f;
     int num_peaks = 24;
-    DWORD mtn_color = 0xFF2A3A4A;
-    DWORD mtn_top   = 0xFF3A4A5A;
+    DWORD mtn_color = g_tod.mountain;
+    /* Peak tops slightly lighter */
+    DWORD mtn_top = LERP_COL(mtn_color, 0xFFFFFFFF, 0.15f);
 
     BGV_Vertex tri[3];
     dev->lpVtbl->SetStreamSource(dev, 0, NULL, 0);
@@ -640,6 +725,426 @@ static void render_mountains(IDirect3DDevice8 *dev, float player_x, float player
         dev->lpVtbl->DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 1,
                                       tri, sizeof(BGV_Vertex));
     }
+}
+
+/* ── Roadside Objects (3D) ───────────────────────────────────── */
+
+/*
+ * Render scenery objects (trees, buildings, guard posts, signs, billboards)
+ * along both sides of the procedural road, in 3D world space.
+ * Uses deterministic hashing for object type/color variation.
+ */
+static void render_roadside_objects(IDirect3DDevice8 *dev,
+                                     float player_x, float player_z,
+                                     float road_curve)
+{
+    float obj_spacing = 18.0f;
+    float view_dist = 200.0f;
+    float road_hw = ROAD_WIDTH;
+    float side_offset = road_hw + 3.0f;
+
+    D3DMATRIX ident;
+    mat4_identity((float *)&ident);
+    dev->lpVtbl->SetTransform(dev, D3DTS_WORLD, &ident);
+    dev->lpVtbl->SetTexture(dev, 0, NULL);
+    dev->lpVtbl->SetTextureStageState(dev, 0, 1, 1); /* COLOROP = DISABLE */
+    dev->lpVtbl->SetVertexShader(dev, FVF_3D);
+    dev->lpVtbl->SetStreamSource(dev, 0, NULL, 0);
+    dev->lpVtbl->SetIndices(dev, NULL, 0);
+
+    /* Start placement slightly behind player */
+    float first_z = floorf(player_z / obj_spacing) * obj_spacing - obj_spacing;
+    int road_y = 0;
+
+    /* Accumulated curve offset for X displacement */
+    for (float z = first_z; z < player_z + view_dist; z += obj_spacing) {
+        /* Distance ahead of player */
+        float dz = z - player_z;
+        if (dz < -obj_spacing) continue;
+
+        /* Deterministic object type from world position */
+        int world_idx = (int)(z / obj_spacing);
+        if (world_idx < 0) world_idx = -world_idx;
+        uint32_t h = (uint32_t)(world_idx) * 2654435761u;
+        int obj_type = (int)((h >> 16) % 6);
+
+        /* Road curve displaces X position */
+        float curve_x = road_curve * dz * 0.02f;
+        float center_x = player_x + curve_x;
+
+        /* Render on both sides of the road */
+        for (int side = 0; side < 2; side++) {
+            float sx = center_x + ((side == 0) ? -side_offset : side_offset);
+            float sz = z;
+            float sy = (float)road_y;
+            BGV_Vertex v[12]; /* enough for any object type */
+
+            switch (obj_type) {
+            case 0: { /* Guard post */
+                float pw = 0.3f, ph = 2.5f;
+                DWORD gc = 0xFFAAAAAA;
+                v[0] = (BGV_Vertex){sx - pw, sy,      sz, 0,0,1, gc, 0,0};
+                v[1] = (BGV_Vertex){sx + pw, sy,      sz, 0,0,1, gc, 1,0};
+                v[2] = (BGV_Vertex){sx - pw, sy + ph,  sz, 0,0,1, gc, 0,1};
+                v[3] = (BGV_Vertex){sx + pw, sy,      sz, 0,0,1, gc, 1,0};
+                v[4] = (BGV_Vertex){sx + pw, sy + ph,  sz, 0,0,1, gc, 1,1};
+                v[5] = (BGV_Vertex){sx - pw, sy + ph,  sz, 0,0,1, gc, 0,1};
+                dev->lpVtbl->DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, v, sizeof(BGV_Vertex));
+                break;
+            }
+            case 1:   /* Tree (regular) */
+            case 2: { /* Tree (tall) */
+                float trunk_w = 0.3f;
+                float trunk_h = (obj_type == 1) ? 4.0f : 6.0f;
+                float canopy_w = (obj_type == 1) ? 2.0f : 3.0f;
+                float canopy_h = (obj_type == 1) ? 3.0f : 4.5f;
+                DWORD trunk_c = 0xFF443322;
+                DWORD leaf_c = (world_idx & 1) ? 0xFF227733 : 0xFF2D8844;
+                /* Darken at night */
+                if (g_tod.night > 0.0f) {
+                    leaf_c = LERP_COL(leaf_c, 0xFF0A1508, g_tod.night);
+                    trunk_c = LERP_COL(trunk_c, 0xFF111108, g_tod.night);
+                }
+                /* Trunk: 2 tris */
+                v[0] = (BGV_Vertex){sx - trunk_w, sy,           sz, 0,0,1, trunk_c, 0,0};
+                v[1] = (BGV_Vertex){sx + trunk_w, sy,           sz, 0,0,1, trunk_c, 1,0};
+                v[2] = (BGV_Vertex){sx - trunk_w, sy + trunk_h, sz, 0,0,1, trunk_c, 0,1};
+                v[3] = (BGV_Vertex){sx + trunk_w, sy,           sz, 0,0,1, trunk_c, 1,0};
+                v[4] = (BGV_Vertex){sx + trunk_w, sy + trunk_h, sz, 0,0,1, trunk_c, 1,1};
+                v[5] = (BGV_Vertex){sx - trunk_w, sy + trunk_h, sz, 0,0,1, trunk_c, 0,1};
+                dev->lpVtbl->DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, v, sizeof(BGV_Vertex));
+                /* Canopy: triangle */
+                v[0] = (BGV_Vertex){sx - canopy_w, sy + trunk_h,            sz, 0,0,1, leaf_c, 0,1};
+                v[1] = (BGV_Vertex){sx,            sy + trunk_h + canopy_h, sz, 0,0,1, leaf_c, 0.5f,0};
+                v[2] = (BGV_Vertex){sx + canopy_w, sy + trunk_h,            sz, 0,0,1, leaf_c, 1,1};
+                dev->lpVtbl->DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 1, v, sizeof(BGV_Vertex));
+                break;
+            }
+            case 3: { /* Building (front face + side wall + roof) */
+                float bw = 2.5f, bh = 6.0f;
+                DWORD base_colors[4] = {0xFF556677, 0xFF665544, 0xFF554466, 0xFF446655};
+                DWORD bc = base_colors[world_idx & 3];
+                if (g_tod.night > 0.0f)
+                    bc = LERP_COL(bc, 0xFF111118, g_tod.night * 0.6f);
+                /* Side color: darker */
+                DWORD sc = ((bc >> 1) & 0x7F7F7F7F) | 0xFF000000;
+                /* Front face: 2 tris */
+                v[0] = (BGV_Vertex){sx - bw, sy,      sz, 0,0,1, bc, 0,0};
+                v[1] = (BGV_Vertex){sx + bw, sy,      sz, 0,0,1, bc, 1,0};
+                v[2] = (BGV_Vertex){sx - bw, sy + bh, sz, 0,0,1, bc, 0,1};
+                v[3] = (BGV_Vertex){sx + bw, sy,      sz, 0,0,1, bc, 1,0};
+                v[4] = (BGV_Vertex){sx + bw, sy + bh, sz, 0,0,1, bc, 1,1};
+                v[5] = (BGV_Vertex){sx - bw, sy + bh, sz, 0,0,1, bc, 0,1};
+                dev->lpVtbl->DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, v, sizeof(BGV_Vertex));
+                /* Side wall: 2 tris (depth toward road exterior) */
+                float depth = (side == 0) ? -1.5f : 1.5f;
+                v[0] = (BGV_Vertex){sx + bw, sy,      sz,         0,0,1, sc, 0,0};
+                v[1] = (BGV_Vertex){sx + bw, sy,      sz + depth, 0,0,1, sc, 1,0};
+                v[2] = (BGV_Vertex){sx + bw, sy + bh, sz,         0,0,1, sc, 0,1};
+                v[3] = (BGV_Vertex){sx + bw, sy,      sz + depth, 0,0,1, sc, 1,0};
+                v[4] = (BGV_Vertex){sx + bw, sy + bh, sz + depth, 0,0,1, sc, 1,1};
+                v[5] = (BGV_Vertex){sx + bw, sy + bh, sz,         0,0,1, sc, 0,1};
+                dev->lpVtbl->DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, v, sizeof(BGV_Vertex));
+                /* Windows (lit at night) */
+                if (g_tod.night > 0.3f) {
+                    DWORD wc = 0xFFAABBDD;
+                    float wy1 = sy + bh * 0.35f, wy2 = sy + bh * 0.65f;
+                    float wwh = bh * 0.08f;
+                    float wwx = bw * 0.6f;
+                    for (int row = 0; row < 2; row++) {
+                        float wy = (row == 0) ? wy1 : wy2;
+                        v[0] = (BGV_Vertex){sx - wwx, wy,       sz + 0.01f, 0,0,1, wc, 0,0};
+                        v[1] = (BGV_Vertex){sx + wwx, wy,       sz + 0.01f, 0,0,1, wc, 1,0};
+                        v[2] = (BGV_Vertex){sx - wwx, wy + wwh, sz + 0.01f, 0,0,1, wc, 0,1};
+                        v[3] = (BGV_Vertex){sx + wwx, wy,       sz + 0.01f, 0,0,1, wc, 1,0};
+                        v[4] = (BGV_Vertex){sx + wwx, wy + wwh, sz + 0.01f, 0,0,1, wc, 1,1};
+                        v[5] = (BGV_Vertex){sx - wwx, wy + wwh, sz + 0.01f, 0,0,1, wc, 0,1};
+                        dev->lpVtbl->DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, v, sizeof(BGV_Vertex));
+                    }
+                }
+                break;
+            }
+            case 4: { /* Road sign */
+                float pw = 0.15f, post_h = 4.0f;
+                float sign_w = 1.5f, sign_h = 1.2f;
+                DWORD post_c = 0xFF888888;
+                DWORD sign_c = 0xFF2244AA;
+                /* Post: 2 tris */
+                v[0] = (BGV_Vertex){sx - pw, sy,           sz, 0,0,1, post_c, 0,0};
+                v[1] = (BGV_Vertex){sx + pw, sy,           sz, 0,0,1, post_c, 1,0};
+                v[2] = (BGV_Vertex){sx - pw, sy + post_h,  sz, 0,0,1, post_c, 0,1};
+                v[3] = (BGV_Vertex){sx + pw, sy,           sz, 0,0,1, post_c, 1,0};
+                v[4] = (BGV_Vertex){sx + pw, sy + post_h,  sz, 0,0,1, post_c, 1,1};
+                v[5] = (BGV_Vertex){sx - pw, sy + post_h,  sz, 0,0,1, post_c, 0,1};
+                dev->lpVtbl->DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, v, sizeof(BGV_Vertex));
+                /* Sign face: 2 tris */
+                float sy2 = sy + post_h;
+                v[0] = (BGV_Vertex){sx - sign_w, sy2,           sz, 0,0,1, sign_c, 0,0};
+                v[1] = (BGV_Vertex){sx + sign_w, sy2,           sz, 0,0,1, sign_c, 1,0};
+                v[2] = (BGV_Vertex){sx - sign_w, sy2 + sign_h,  sz, 0,0,1, sign_c, 0,1};
+                v[3] = (BGV_Vertex){sx + sign_w, sy2,           sz, 0,0,1, sign_c, 1,0};
+                v[4] = (BGV_Vertex){sx + sign_w, sy2 + sign_h,  sz, 0,0,1, sign_c, 1,1};
+                v[5] = (BGV_Vertex){sx - sign_w, sy2 + sign_h,  sz, 0,0,1, sign_c, 0,1};
+                dev->lpVtbl->DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, v, sizeof(BGV_Vertex));
+                break;
+            }
+            case 5: { /* Billboard */
+                float pw = 0.2f, post_h = 3.5f;
+                float panel_w = 3.0f, panel_h = 2.2f;
+                DWORD post_c = 0xFF666666;
+                DWORD panel_colors[4] = {0xFF884422, 0xFF226644, 0xFF443388, 0xFF886622};
+                DWORD pc = panel_colors[world_idx & 3];
+                /* Post: 2 tris */
+                v[0] = (BGV_Vertex){sx - pw, sy,           sz, 0,0,1, post_c, 0,0};
+                v[1] = (BGV_Vertex){sx + pw, sy,           sz, 0,0,1, post_c, 1,0};
+                v[2] = (BGV_Vertex){sx - pw, sy + post_h,  sz, 0,0,1, post_c, 0,1};
+                v[3] = (BGV_Vertex){sx + pw, sy,           sz, 0,0,1, post_c, 1,0};
+                v[4] = (BGV_Vertex){sx + pw, sy + post_h,  sz, 0,0,1, post_c, 1,1};
+                v[5] = (BGV_Vertex){sx - pw, sy + post_h,  sz, 0,0,1, post_c, 0,1};
+                dev->lpVtbl->DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, v, sizeof(BGV_Vertex));
+                /* Panel face: 2 tris */
+                float py2 = sy + post_h;
+                v[0] = (BGV_Vertex){sx - panel_w, py2,            sz, 0,0,1, pc, 0,0};
+                v[1] = (BGV_Vertex){sx + panel_w, py2,            sz, 0,0,1, pc, 1,0};
+                v[2] = (BGV_Vertex){sx - panel_w, py2 + panel_h,  sz, 0,0,1, pc, 0,1};
+                v[3] = (BGV_Vertex){sx + panel_w, py2,            sz, 0,0,1, pc, 1,0};
+                v[4] = (BGV_Vertex){sx + panel_w, py2 + panel_h,  sz, 0,0,1, pc, 1,1};
+                v[5] = (BGV_Vertex){sx - panel_w, py2 + panel_h,  sz, 0,0,1, pc, 0,1};
+                dev->lpVtbl->DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, v, sizeof(BGV_Vertex));
+                /* White text stripe */
+                DWORD wt = 0xFFDDDDDD;
+                float stripe_y = py2 + panel_h * 0.4f;
+                float stripe_h = panel_h * 0.2f;
+                v[0] = (BGV_Vertex){sx - panel_w * 0.8f, stripe_y,            sz + 0.01f, 0,0,1, wt, 0,0};
+                v[1] = (BGV_Vertex){sx + panel_w * 0.8f, stripe_y,            sz + 0.01f, 0,0,1, wt, 1,0};
+                v[2] = (BGV_Vertex){sx - panel_w * 0.8f, stripe_y + stripe_h, sz + 0.01f, 0,0,1, wt, 0,1};
+                v[3] = (BGV_Vertex){sx + panel_w * 0.8f, stripe_y,            sz + 0.01f, 0,0,1, wt, 1,0};
+                v[4] = (BGV_Vertex){sx + panel_w * 0.8f, stripe_y + stripe_h, sz + 0.01f, 0,0,1, wt, 1,1};
+                v[5] = (BGV_Vertex){sx - panel_w * 0.8f, stripe_y + stripe_h, sz + 0.01f, 0,0,1, wt, 0,1};
+                dev->lpVtbl->DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, v, sizeof(BGV_Vertex));
+                break;
+            }
+            }
+        }
+    }
+}
+
+/* ── Tunnel Rendering (3D) ──────────────────────────────────── */
+
+static void render_tunnel(IDirect3DDevice8 *dev,
+                           float player_x, float player_z,
+                           float road_curve)
+{
+    float tunnel_period = 2000.0f;
+    float tunnel_len = 200.0f;
+
+    /* Check if player is in a tunnel zone */
+    float tunnel_phase = fmodf(player_z, tunnel_period);
+    if (tunnel_phase < 0.0f) tunnel_phase += tunnel_period;
+    int in_tunnel = (tunnel_phase > tunnel_period - tunnel_len);
+    if (!in_tunnel) return;
+
+    float road_hw = ROAD_WIDTH + 2.0f;
+    float ceil_h = 8.0f;
+    DWORD ceil_c = 0xFF181822;
+    DWORD wall_c = 0xFF252535;
+
+    D3DMATRIX ident;
+    mat4_identity((float *)&ident);
+    dev->lpVtbl->SetTransform(dev, D3DTS_WORLD, &ident);
+    dev->lpVtbl->SetTexture(dev, 0, NULL);
+    dev->lpVtbl->SetTextureStageState(dev, 0, 1, 1);
+    dev->lpVtbl->SetVertexShader(dev, FVF_3D);
+    dev->lpVtbl->SetStreamSource(dev, 0, NULL, 0);
+    dev->lpVtbl->SetIndices(dev, NULL, 0);
+
+    /* Find tunnel start Z */
+    float tunnel_start = floorf(player_z / tunnel_period) * tunnel_period +
+                          (tunnel_period - tunnel_len);
+
+    float seg_len = 5.0f;
+    int num_segs = (int)(tunnel_len / seg_len);
+    float cum_curve = 0.0f;
+
+    for (int s = 0; s < num_segs; s++) {
+        float z0 = tunnel_start + (float)s * seg_len;
+        float z1 = z0 + seg_len;
+        float dz0 = z0 - player_z;
+        float dz1 = z1 - player_z;
+
+        /* Skip segments too far behind or ahead */
+        if (dz1 < -20.0f || dz0 > 200.0f) {
+            cum_curve += road_curve * seg_len * 0.02f;
+            continue;
+        }
+
+        float x0 = player_x + cum_curve;
+        cum_curve += road_curve * seg_len * 0.02f;
+        float x1 = player_x + cum_curve;
+
+        BGV_Vertex v[6];
+
+        /* Ceiling: quad spanning road width */
+        v[0] = (BGV_Vertex){x0 - road_hw, ceil_h, z0, 0,-1,0, ceil_c, 0,0};
+        v[1] = (BGV_Vertex){x0 + road_hw, ceil_h, z0, 0,-1,0, ceil_c, 1,0};
+        v[2] = (BGV_Vertex){x1 - road_hw, ceil_h, z1, 0,-1,0, ceil_c, 0,1};
+        v[3] = (BGV_Vertex){x0 + road_hw, ceil_h, z0, 0,-1,0, ceil_c, 1,0};
+        v[4] = (BGV_Vertex){x1 + road_hw, ceil_h, z1, 0,-1,0, ceil_c, 1,1};
+        v[5] = (BGV_Vertex){x1 - road_hw, ceil_h, z1, 0,-1,0, ceil_c, 0,1};
+        dev->lpVtbl->DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, v, sizeof(BGV_Vertex));
+
+        /* Left wall */
+        v[0] = (BGV_Vertex){x0 - road_hw, 0,      z0, 1,0,0, wall_c, 0,0};
+        v[1] = (BGV_Vertex){x1 - road_hw, 0,      z1, 1,0,0, wall_c, 1,0};
+        v[2] = (BGV_Vertex){x0 - road_hw, ceil_h, z0, 1,0,0, wall_c, 0,1};
+        v[3] = (BGV_Vertex){x1 - road_hw, 0,      z1, 1,0,0, wall_c, 1,0};
+        v[4] = (BGV_Vertex){x1 - road_hw, ceil_h, z1, 1,0,0, wall_c, 1,1};
+        v[5] = (BGV_Vertex){x0 - road_hw, ceil_h, z0, 1,0,0, wall_c, 0,1};
+        dev->lpVtbl->DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, v, sizeof(BGV_Vertex));
+
+        /* Right wall */
+        v[0] = (BGV_Vertex){x0 + road_hw, 0,      z0, -1,0,0, wall_c, 0,0};
+        v[1] = (BGV_Vertex){x1 + road_hw, 0,      z1, -1,0,0, wall_c, 1,0};
+        v[2] = (BGV_Vertex){x0 + road_hw, ceil_h, z0, -1,0,0, wall_c, 0,1};
+        v[3] = (BGV_Vertex){x1 + road_hw, 0,      z1, -1,0,0, wall_c, 1,0};
+        v[4] = (BGV_Vertex){x1 + road_hw, ceil_h, z1, -1,0,0, wall_c, 1,1};
+        v[5] = (BGV_Vertex){x0 + road_hw, ceil_h, z0, -1,0,0, wall_c, 0,1};
+        dev->lpVtbl->DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, v, sizeof(BGV_Vertex));
+
+        /* Orange strip lights on ceiling (every other segment) */
+        if (s % 3 == 0) {
+            DWORD light_c = 0xFFFF8833;
+            float lw = 0.3f, lh = 0.05f;
+            float lz = (z0 + z1) * 0.5f;
+            float lx = (x0 + x1) * 0.5f;
+            v[0] = (BGV_Vertex){lx - lw, ceil_h - lh, lz, 0,-1,0, light_c, 0,0};
+            v[1] = (BGV_Vertex){lx + lw, ceil_h - lh, lz, 0,-1,0, light_c, 1,0};
+            v[2] = (BGV_Vertex){lx - lw, ceil_h,      lz, 0,-1,0, light_c, 0,1};
+            v[3] = (BGV_Vertex){lx + lw, ceil_h - lh, lz, 0,-1,0, light_c, 1,0};
+            v[4] = (BGV_Vertex){lx + lw, ceil_h,      lz, 0,-1,0, light_c, 1,1};
+            v[5] = (BGV_Vertex){lx - lw, ceil_h,      lz, 0,-1,0, light_c, 0,1};
+            dev->lpVtbl->DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, v, sizeof(BGV_Vertex));
+        }
+    }
+}
+
+/* ── Night Stars (screen-space) ─────────────────────────────── */
+
+static void render_3d_stars(IDirect3DDevice8 *dev)
+{
+    float cycle = g_tod.cycle;
+    if (cycle < 0.55f || cycle > 0.95f) return;
+
+    float alpha_f;
+    if (cycle < 0.65f)       alpha_f = (cycle - 0.55f) / 0.1f;
+    else if (cycle > 0.85f)  alpha_f = 1.0f - (cycle - 0.85f) / 0.1f;
+    else                     alpha_f = 1.0f;
+
+    dev->lpVtbl->SetVertexShader(dev, FVF_SCREEN);
+    dev->lpVtbl->SetStreamSource(dev, 0, NULL, 0);
+    dev->lpVtbl->SetIndices(dev, NULL, 0);
+    dev->lpVtbl->SetTexture(dev, 0, NULL);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_ZENABLE, FALSE);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_ALPHABLENDENABLE, TRUE);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+
+    int num_stars = 40;
+    for (int i = 0; i < num_stars; i++) {
+        uint32_t h = (uint32_t)i * 2654435761u;
+        float sx = (float)((h >> 8) % 620) + 10.0f;
+        float sy = (float)((h >> 16) % 200) + 5.0f;  /* top portion of screen */
+        float size = 0.8f + ((h >> 4) & 3) * 0.3f;
+
+        /* Twinkle */
+        float twinkle = 0.6f + 0.4f * sinf((float)i * 3.7f +
+                        (float)(g_twinkle_seed & 0xFF) * 0.025f);
+        int alpha = (int)(alpha_f * twinkle * 255.0f);
+        if (alpha < 0) alpha = 0;
+        if (alpha > 255) alpha = 255;
+
+        DWORD star_rgb;
+        switch (h & 3) {
+        case 0:  star_rgb = 0x00AACCFF; break;
+        case 1:  star_rgb = 0x00FFFFCC; break;
+        default: star_rgb = 0x00FFFFFF; break;
+        }
+        DWORD sc = ((DWORD)alpha << 24) | star_rgb;
+
+        ScreenVert sv[6] = {
+            {sx - size, sy - size, 0.97f, 1.0f, sc},
+            {sx + size, sy - size, 0.97f, 1.0f, sc},
+            {sx - size, sy + size, 0.97f, 1.0f, sc},
+            {sx + size, sy - size, 0.97f, 1.0f, sc},
+            {sx + size, sy + size, 0.97f, 1.0f, sc},
+            {sx - size, sy + size, 0.97f, 1.0f, sc},
+        };
+        dev->lpVtbl->DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, sv, sizeof(ScreenVert));
+    }
+
+    g_twinkle_seed = g_twinkle_seed * 1103515245 + 12345;
+
+    dev->lpVtbl->SetRenderState(dev, D3DRS_ALPHABLENDENABLE, FALSE);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_ZENABLE, TRUE);
+}
+
+/* ── Rain Weather (screen-space) ────────────────────────────── */
+
+static void render_3d_rain(IDirect3DDevice8 *dev)
+{
+    if (g_rain_intensity < 0.01f) return;
+
+    dev->lpVtbl->SetVertexShader(dev, FVF_SCREEN);
+    dev->lpVtbl->SetStreamSource(dev, 0, NULL, 0);
+    dev->lpVtbl->SetIndices(dev, NULL, 0);
+    dev->lpVtbl->SetTexture(dev, 0, NULL);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_ZENABLE, FALSE);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_ALPHABLENDENABLE, TRUE);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+
+    /* Rain drops */
+    int drop_count = (int)(g_rain_intensity * 30.0f);
+    int alpha = (int)(g_rain_intensity * 120.0f);
+    if (alpha > 255) alpha = 255;
+    DWORD drop_c = ((DWORD)alpha << 24) | 0x00AABBDD;
+    DWORD drop_end = ((DWORD)(alpha / 3) << 24) | 0x00AABBDD;
+
+    for (int i = 0; i < drop_count; i++) {
+        g_rain_seed = g_rain_seed * 1103515245 + 12345;
+        float dx = (float)((g_rain_seed >> 16) & 0x3FF) - 40.0f;
+        g_rain_seed = g_rain_seed * 1103515245 + 12345;
+        float dy = (float)((g_rain_seed >> 16) & 0x1FF) - 20.0f;
+        float streak = 12.0f + (float)((g_rain_seed >> 8) & 0xF);
+
+        /* Diagonal streak: top-left to bottom-right */
+        ScreenVert sv[6] = {
+            {dx,       dy,              0.02f, 1.0f, drop_c},
+            {dx + 2,   dy,              0.02f, 1.0f, drop_c},
+            {dx + 4,   dy + streak,     0.02f, 1.0f, drop_end},
+            {dx + 2,   dy,              0.02f, 1.0f, drop_c},
+            {dx + 6,   dy + streak,     0.02f, 1.0f, drop_end},
+            {dx + 4,   dy + streak,     0.02f, 1.0f, drop_end},
+        };
+        dev->lpVtbl->DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, sv, sizeof(ScreenVert));
+    }
+
+    /* Fog overlay */
+    int fog_alpha = (int)(g_rain_intensity * 40.0f);
+    if (fog_alpha > 255) fog_alpha = 255;
+    DWORD fog_c = ((DWORD)fog_alpha << 24) | 0x00667788;
+    ScreenVert fog[6] = {
+        {0,   0,   0.025f, 1.0f, fog_c},
+        {640, 0,   0.025f, 1.0f, fog_c},
+        {0,   480, 0.025f, 1.0f, fog_c},
+        {640, 0,   0.025f, 1.0f, fog_c},
+        {640, 480, 0.025f, 1.0f, fog_c},
+        {0,   480, 0.025f, 1.0f, fog_c},
+    };
+    dev->lpVtbl->DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, fog, sizeof(ScreenVert));
+
+    dev->lpVtbl->SetRenderState(dev, D3DRS_ALPHABLENDENABLE, FALSE);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_ZENABLE, TRUE);
 }
 
 /* ── HUD (reuses pseudo-3D HUD style) ───────────────────────── */
@@ -969,6 +1474,17 @@ void rw_gameplay_render(void)
     float hdg = RW_MEMF(PHYS_HDG);
     float spd = RW_MEMF(PHYS_SPD);
 
+    /* Update time-of-day and weather */
+    tod_update(py);
+
+    /* Weather cycle (6000-unit period) */
+    float wcyc = fmodf(py / 6000.0f, 1.0f);
+    if (wcyc < 0.0f) wcyc += 1.0f;
+    if (wcyc < 0.67f)       g_rain_intensity = 0.0f;
+    else if (wcyc < 0.75f)  g_rain_intensity = (wcyc - 0.67f) / 0.08f;
+    else if (wcyc < 0.92f)  g_rain_intensity = 1.0f;
+    else                     g_rain_intensity = 1.0f - (wcyc - 0.92f) / 0.08f;
+
     /* Map 2D physics to 3D world.
      * When a track is loaded, offset player position to track world coords.
      * Physics X → lateral, Physics Y → forward distance along track Z. */
@@ -983,8 +1499,13 @@ void rw_gameplay_render(void)
         car_pos[2] = py;
     }
 
+    float road_curve = RW_MEMF(ROAD_CURVE_ADDR);
+
     /* ── Sky gradient (behind everything) ── */
     render_sky_gradient(dev);
+
+    /* ── Night stars (drawn on top of sky, behind everything else) ── */
+    render_3d_stars(dev);
 
     /* ── Set up chase camera ── */
     float chase_dist = 8.0f + spd * 0.05f;  /* pull back at speed */
@@ -1034,6 +1555,8 @@ void rw_gameplay_render(void)
         render_ground_plane(dev, px, py);
         render_road(dev, px, py);
         render_mountains(dev, px, py);
+        render_roadside_objects(dev, px, py, road_curve);
+        render_tunnel(dev, px, py, road_curve);
     }
 
     /* ── Player car (3D model) ── */
@@ -1090,4 +1613,7 @@ void rw_gameplay_render(void)
 
     /* ── HUD overlay ── */
     render_3d_hud(dev);
+
+    /* ── Rain weather (screen-space, drawn last) ── */
+    render_3d_rain(dev);
 }
