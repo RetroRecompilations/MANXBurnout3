@@ -588,11 +588,16 @@ static LONG WINAPI crash_veh(PEXCEPTION_POINTERS info)
                             fflush(stderr);
                             return EXCEPTION_CONTINUE_EXECUTION;
                         } else {
-                            fprintf(stderr, "  [MIRROR-FAIL] view %d at %p "
-                                    "(Xbox VA 0x%08X, error %lu)\n",
-                                    mirror_idx, (void*)view_base,
-                                    fault_xbox_va, GetLastError());
-                            fflush(stderr);
+                            static int mirror_fail_count = 0;
+                            mirror_fail_count++;
+                            if (mirror_fail_count <= 5 || (mirror_fail_count % 1000) == 0) {
+                                fprintf(stderr, "  [MIRROR-FAIL] view %d at %p "
+                                        "(Xbox VA 0x%08X, error %lu) [#%d]\n",
+                                        mirror_idx, (void*)view_base,
+                                        fault_xbox_va, GetLastError(),
+                                        mirror_fail_count);
+                                fflush(stderr);
+                            }
                         }
                     }
                 }
@@ -723,8 +728,8 @@ static LONG WINAPI crash_veh(PEXCEPTION_POINTERS info)
 
 static HWND g_hwnd = NULL;
 static BOOL g_running = TRUE;
-static void *g_xbe_data = NULL;
-static size_t g_xbe_size = 0;
+void *g_xbe_data = NULL;
+size_t g_xbe_size = 0;
 static IDirect3D8 *g_d3d8 = NULL;
 static IDirect3DDevice8 *g_d3d_device = NULL;
 static IDirectSound8 *g_dsound = NULL;

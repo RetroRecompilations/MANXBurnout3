@@ -4,7 +4,7 @@ A project to statically recompile the original Xbox version of **Burnout 3: Take
 
 ## Project Status
 
-**Phase 5: Integration** - The recompiled game boots, loads all resources, and **runs its main gameplay loop continuously in the in-race state (state 4)**. The game's state machine properly transitions through loading → init (state 1) → setup (state 7) → gameplay (state 4). A D3D11 window renders at ~17fps, the full gameplay tick executes each frame (physics, AI, timers), and all ICALLs resolve to valid functions. Active work on enabling the RenderWare 3D rendering pipeline.
+**Phase 5: Integration** - The recompiled game boots, loads all resources, and **runs its main gameplay loop continuously in the in-race state (state 4)**. Two rendering modes: a custom pseudo-3D OutRun-style renderer and a true 3D chase-camera renderer, both with full visual features. Active work on connecting original RenderWare rendering pipeline.
 
 ### What Works
 - Full game boot sequence: RW engine init → resource loading → state machine → gameplay loop
@@ -14,7 +14,15 @@ A project to statically recompile the original Xbox version of **Burnout 3: Take
 - Xbox memory layout faithfully reproduced (64 MB + mirror views via file mapping)
 - D3D11 window creation and rendering (fixed-function pipeline emulation)
 - 22,097 recompiled x86 functions running as native x86-64 C code
-- 30 manually overridden functions (render stubs, vtable fixes, pipeline bridges)
+- 33+ manually overridden functions (render stubs, vtable fixes, pipeline bridges, file loading)
+- **File loading pipeline**: Loads game resources from disk (Global.txd, PrgData.bin, vehicle/track lists, locale data)
+- **Global.txd fixup**: RenderWare binary stream header relocation (191 texture entries)
+- **PrgData.bin relocation**: Full 3-level nested pointer relocation for Criterion binary format
+- **Pseudo-3D renderer** (default): OutRun-style 2.5D with procedural road, traffic, weather, time-of-day
+- **True 3D renderer** (V key): Chase camera, procedural world, roadside scenery, tunnels, night/rain
+- **67 BGV vehicle models** loaded across 7 classes with 3D model viewer (M key)
+- **Physics model**: Heading-based steering, speed-dependent turning, road curve centripetal force
+- **Gameplay systems**: Score/multiplier, takedowns, near-misses, boost, checkpoints, AI traffic
 
 ## Overview
 
@@ -147,7 +155,7 @@ The main executable (`default.xbe`) contains:
 - [x] 22,097 recompiled functions in dispatch table (22,095 auto + 2 manual)
 - [x] Kernel bridge: 55 per-ordinal bridges, 92 stubs (147 total thunk entries)
 - [x] Game entry point (0x001D2807) runs to completion → creates thread → calls RW init → returns
-- [x] Manual function overrides for 30 functions (mid-function entries, SEH, NV2A stubs, Xbox pipeline stubs)
+- [x] Manual function overrides for 33+ functions (mid-function entries, SEH, NV2A stubs, Xbox pipeline stubs, file I/O)
 - [x] Fake TIB/TLS for fs:[N] references (translator drops segment prefix)
 - [x] Single-threaded critical section model (no-op CS for ABI safety)
 - [x] Xbox heap allocator (bump allocator, 55.5 MB, returns Xbox VAs)
@@ -161,12 +169,21 @@ The main executable (`default.xbe`) contains:
 - [x] RenderWare engine initializes, allocates 3 memory pools (~32 MB total)
 - [x] Game enters main loop stably (D3D11 window renders, message pump works)
 - [x] Resource loading pipeline completes (load_state 0x17 = fully loaded)
+- [x] File I/O override: loads game files from disk into Xbox memory (Global.txd, PrgData.bin, locale, vehicle/track lists)
+- [x] Global.txd RW binary stream fixup (191 texture entries, header relocation)
+- [x] PrgData.bin full 3-level pointer relocation (Criterion binary format)
 - [x] Game state machine runs (state transitions 1→7→4, gameplay tick loop)
 - [x] .text section corruption workaround (hardcoded switch tables from XBE)
 - [x] Render orchestrator stubbed (sub_0003D9E0, game_frame_pump via sub_000110E0)
 - [x] Callee-saved register preservation across game loop iterations
-- [ ] RenderWare 3D rendering pipeline (vertex transforms, draw calls)
-- [ ] Input mapping (Xbox controller → PC gamepad/keyboard)
+- [x] Pseudo-3D renderer with full visual features (road, traffic, weather, time-of-day, HUD)
+- [x] True 3D renderer with chase camera, scenery, tunnels, stars, rain
+- [x] BGV vehicle model loader (67 models, 7 classes, triangle strip conversion)
+- [x] 3D model viewer with turntable rotation (M key toggle, N/P to browse)
+- [x] Keyboard + gamepad input (WASD/stick driving, Shift/button boost)
+- [ ] RenderWare 3D rendering pipeline (connect original RW code to D3D11 layer)
+- [ ] Track geometry rendering (streamed.dat loader exists, needs RW world init)
+- [ ] Vehicle textures (.btv format decoding)
 - [ ] Audio playback
 - [ ] Performance profiling and optimization
 - [ ] Gameplay testing and bug fixes
@@ -195,10 +212,15 @@ burnout3/
 │   ├── audio/                # Audio system (DirectSound stubs)
 │   ├── input/                # Input system (XInput)
 │   └── game/                 # Recompiled game code
-│       ├── main.c            # Entry point, VEH handler, window/game loop
+│       ├── main.c            # Entry point, VEH handler, window/game loop, pseudo-3D renderer
+│       ├── bgv_loader.c/h    # BGV vehicle geometry parser (67 models, 7 classes)
+│       ├── txd_loader.c/h    # TXD texture dictionary loader
+│       ├── track_loader.c/h  # Track geometry from streamed.dat
+│       ├── rw_renderer.c/h   # True 3D renderer (chase camera, scene graph)
+│       ├── rw_math.h         # Shared mat4 math utilities
 │       └── recomp/           # Recompiled function infrastructure
 │           ├── recomp_types.h    # Register model, memory macros, ICALL dispatch
-│           ├── recomp_manual.c   # 30 manually implemented function overrides
+│           ├── recomp_manual.c   # 33+ manually implemented function overrides
 │           └── gen/              # Auto-generated code (gitignored, ~4.43M lines)
 └── Burnout 3 Takedown/       # Original game files (gitignored)
 ```

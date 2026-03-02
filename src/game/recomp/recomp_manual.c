@@ -48,6 +48,7 @@ void sub_001D9180(void);
 void sub_001D91B0(void);
 void sub_001D91F0(void);
 void sub_001D9230(void);
+/* sub_00157680 removed from manual overrides - uses gen code with relocated PrgData */
 void sub_001D9280(void);
 void sub_001D9290(void);
 void sub_001D92A0(void);
@@ -141,6 +142,9 @@ void sub_00221F20(void);
 
 /* RW world linked list cleanup (stubbed - world data not initialized) */
 void sub_001C66F0(void);
+
+/* Resource queue handler (override - actually loads files) */
+void sub_00011240(void);
 
 /* Game state notification dispatch (recursion-guarded) */
 void sub_00022660(void);
@@ -273,6 +277,9 @@ static const struct {
     { 0x00018BB0u, (recomp_func_t)sub_00018BB0 },
     /* Car physics force computation (scale factor fallbacks) */
     { 0x000636D0u, (recomp_func_t)sub_000636D0 },
+    /* Resource queue handler (override - actually loads files) */
+    { 0x00011240u, (recomp_func_t)sub_00011240 },
+    /* sub_00157680 removed - using gen code with relocated PrgData */
 };
 #define NUM_MANUAL_FUNCS (sizeof(g_manual_funcs) / sizeof(g_manual_funcs[0]))
 
@@ -2071,30 +2078,92 @@ void sub_00020930(void)
 }
 
 /**
- * sub_00159710 - RW resource pointer relocation (STUB)
+ * sub_00159710 - RW resource pointer relocation (FULL IMPLEMENTATION)
  *
  * Original: 0x00159710 - 0x0015974F (63 bytes, 28 insns)
+ * Calls sub_001596B0 for each item.
  *
  * Adjusts internal pointers in a loaded RW resource by a delta:
  *   esi = struct pointer, eax = delta (base address to add)
- *   +4: pointer to array → adjusted by delta
- *   +8: count of entries → loops calling sub_001596B0
- *   +0xC: another pointer → adjusted by delta
+ *   +0: marker/flags (untouched)
+ *   +4: pointer to item array (adjusted by delta)
+ *   +8: count of items
+ *   +0xC: pointer to section 2 data (adjusted by delta)
  *
- * Stubbed because worker threads are deferred and resource data
- * isn't parsed into the expected RW format. The loop iterates
- * through sub-structures that don't exist, causing hangs.
- *
- * The top-level pointer adjustments are preserved since the
- * caller reads esi+4 after the return.
+ * Item array has entries at stride 8 bytes: {uint32 offset, uint32 count}
+ * Each item's offset field is relocated, then nested structures are relocated:
+ *   - Sub-entries at stride 0x18 from the relocated base, field +0x10 relocated
+ *   - Sub-sub-entries at stride 0x40, field +0x34 relocated
  */
 void sub_00159710(void)
 {
     uint32_t delta = eax;
+    int32_t item_count, i;
+
+    /* 1. Relocate the item array pointer */
     MEM32(esi + 4) = MEM32(esi + 4) + delta;
+
+    /* 2. Get item count */
+    item_count = (int32_t)MEM32(esi + 8);
+
+    fprintf(stderr, "  [RELOC] sub_00159710: esi=0x%08X delta=0x%08X items=%d\n",
+            esi, delta, item_count);
+
+    /* 3. Process each item via the sub_001596B0 algorithm */
+    if (item_count > 0 && item_count < 1000) {
+        for (i = 0; i < item_count; i++) {
+            uint32_t item_va = MEM32(esi + 4) + (uint32_t)(i * 8);
+            uint32_t entry_offset, entry_count;
+            int32_t j;
+
+            /* Read and relocate the entry data pointer */
+            entry_offset = MEM32(item_va);
+            entry_count = (int32_t)MEM32(item_va + 4);
+            entry_offset += delta;
+            MEM32(item_va) = entry_offset;
+
+            fprintf(stderr, "  [RELOC]   item[%d]: va=0x%08X ptr=0x%08X count=%d\n",
+                    i, item_va, entry_offset, entry_count);
+
+            /* Process sub-entries (stride 0x18) */
+            if (entry_count > 0 && entry_count < 10000) {
+                for (j = 0; j < entry_count; j++) {
+                    uint32_t sub_base = entry_offset + (uint32_t)(j * 0x18);
+                    uint32_t nested_ptr;
+                    int32_t sub_count, k;
+
+                    /* Relocate the nested pointer at +0x10 */
+                    nested_ptr = MEM32(sub_base + 0x10);
+                    nested_ptr += delta;
+                    MEM32(sub_base + 0x10) = nested_ptr;
+
+                    /* Get sub-sub-entry count at +0x14 */
+                    sub_count = (int32_t)MEM32(sub_base + 0x14);
+
+                    /* Process sub-sub-entries (stride 0x40) */
+                    if (sub_count > 0 && sub_count < 10000) {
+                        for (k = 0; k < sub_count; k++) {
+                            uint32_t deep_ptr_va = nested_ptr + (uint32_t)(k * 0x40) + 0x34;
+                            MEM32(deep_ptr_va) = MEM32(deep_ptr_va) + delta;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /* 4. Relocate the section 2 pointer */
     MEM32(esi + 0xC) = MEM32(esi + 0xC) + delta;
-    fprintf(stderr, "  [STUB] sub_00159710: esi=0x%08X delta=0x%08X (relocation skipped)\n",
-            esi, delta);
+
+    fprintf(stderr, "  [RELOC]   section2 ptr: 0x%08X\n", MEM32(esi + 0xC));
+
+    /* 5. Set global 0x4D1FE8 to point to the relocated resource.
+     * This address is read by sub_00157680 (PrgData linker) and other code
+     * that expects a parsed/relocated resource structure. Normally set by
+     * the RW stream parser which doesn't run. */
+    MEM32(0x4D1FE8) = esi;
+    fprintf(stderr, "  [RELOC]   set MEM32(0x4D1FE8) = 0x%08X (PrgData root)\n", esi);
+
     esp += 4; return; /* ret */
 }
 
@@ -2153,8 +2222,21 @@ void sub_00135240(void)
 void sub_00062BD0(void)
 {
     static int _62bd0_count = 0;
-    if (_62bd0_count < 3)
-        fprintf(stderr, "  [STUB] sub_00062BD0 (track env loader) - returning 1\n");
+    if (_62bd0_count < 3) {
+        /* Dump diagnostics about what track the game wants to load */
+        const char *path_buf = (const char *)XBOX_PTR(0x38A26C);
+        uint32_t track_slot = MEM32(0x3F9DB4);
+        uint32_t fname_ptr = MEM32(0x3FA644);
+        fprintf(stderr, "  [TRACK] sub_00062BD0: edi=0x%08X state=0x%08X\n",
+                edi, MEM32(edi + 0x6B4));
+        fprintf(stderr, "  [TRACK]   path@0x38A26C: '%.64s'\n", path_buf);
+        fprintf(stderr, "  [TRACK]   0x3F9DB4=%u  0x3FA644=0x%08X\n",
+                track_slot, fname_ptr);
+        if (fname_ptr > 0x100 && fname_ptr < 0x4000000) {
+            const char *fn = (const char *)XBOX_PTR(fname_ptr);
+            fprintf(stderr, "  [TRACK]   filename@0x3FA644: '%.64s'\n", fn);
+        }
+    }
     _62bd0_count++;
     SET_LO8(eax, 1);
     esp += 4; return; /* ret */
@@ -2728,3 +2810,195 @@ phy_epilogue:
     edi = saved_edi;
     esp += 4; return; /* pop dummy return address */
 }
+
+/**
+ * sub_00011240 - Resource load queue handler (OVERRIDE)
+ *
+ * Original: 0x00011240 - 0x000113E4 (420 bytes, 131 insns)
+ * CC: stdcall, ret 20 (5 params)
+ *
+ * Original flow: queues a file load request, then in the game loop tick
+ * (sub_000110E0) the RW stream reader (sub_001B33A0) would process it.
+ * Since the RW stream reader hangs on NV2A, the old patch just set
+ * completion_flag = 1 immediately without loading any data.
+ *
+ * This override actually loads the file from disk into Xbox heap memory,
+ * then stores the pointer in the resource slot so the game's own code
+ * can process the loaded data.
+ *
+ * NOTE: .rdata strings get corrupted at runtime because .rdata is not
+ * write-protected (page boundary issue with .data). We read filenames
+ * from the original XBE data (g_xbe_data) when name_va is in .rdata.
+ *
+ * Stack args (stdcall, 5 params, ret 20):
+ *   arg1 [esp+4]:  queue_ptr  - resource queue object (this)
+ *   arg2 [esp+8]:  name_va    - Xbox VA of file path string
+ *   arg3 [esp+12]: flag_va    - Xbox VA of completion flag byte
+ *   arg4 [esp+16]: resource   - resource slot data pointer (Xbox VA)
+ *   arg5 [esp+20]: param      - parameter (version/tag)
+ */
+void sub_00011240(void)
+{
+    /* Read stack args */
+    uint32_t queue_va    = MEM32(esp + 4);
+    uint32_t name_va     = MEM32(esp + 8);
+    uint32_t flag_va     = MEM32(esp + 12);
+    uint32_t resource_va = MEM32(esp + 16);
+    uint32_t param       = MEM32(esp + 20);
+
+    /* Read the file name string.
+     * .rdata strings get corrupted at runtime, so when name_va is in
+     * the .rdata VA range, read from the original XBE data instead. */
+    extern void *g_xbe_data;
+    extern size_t g_xbe_size;
+    #define RDATA_VA_START  0x0036B7C0
+    #define RDATA_VA_END    0x003B2354
+    #define RDATA_FILE_OFF  0x0035C000
+
+    const char *name_ptr;
+    if (name_va >= RDATA_VA_START && name_va < RDATA_VA_END && g_xbe_data) {
+        /* Read from original XBE data (uncorrupted) */
+        uint32_t file_off = (name_va - RDATA_VA_START) + RDATA_FILE_OFF;
+        name_ptr = (const char *)((uint8_t *)g_xbe_data + file_off);
+    } else {
+        /* Read from Xbox memory (runtime, may be constructed on stack/heap) */
+        name_ptr = (const char *)XBOX_PTR(name_va);
+    }
+
+    char name_buf[128];
+    {
+        int i;
+        for (i = 0; i < 127 && name_ptr[i]; i++)
+            name_buf[i] = name_ptr[i];
+        name_buf[i] = '\0';
+    }
+
+    fprintf(stderr, "  [LOAD] sub_00011240: name_va=0x%08X flag=0x%08X res=0x%08X param=0x%08X\n",
+            name_va, flag_va, resource_va, param);
+    fprintf(stderr, "  [LOAD]   file: '%s'\n", name_buf);
+
+    /* Try to translate the Xbox path and load the file.
+     * Xbox paths like "d:\tracks\..." → "Burnout 3 Takedown\tracks\..."
+     * But the string might also be a relative path within the game dir. */
+    {
+        char win_path[512];
+        FILE *fp = NULL;
+
+        /* Try direct path first (relative to game dir) */
+        snprintf(win_path, sizeof(win_path), "Burnout 3 Takedown\\%s", name_buf);
+        fp = fopen(win_path, "rb");
+
+        if (!fp) {
+            /* Try with d:\ prefix stripped */
+            const char *p = name_buf;
+            if ((p[0] == 'd' || p[0] == 'D') && p[1] == ':' && (p[2] == '\\' || p[2] == '/'))
+                p += 3;
+            else if (p[0] == '\\')
+                p++;
+            snprintf(win_path, sizeof(win_path), "Burnout 3 Takedown\\%s", p);
+            fp = fopen(win_path, "rb");
+        }
+
+        if (!fp) {
+            /* Try the name as-is */
+            fp = fopen(name_buf, "rb");
+        }
+
+        if (fp) {
+            /* Get file size */
+            fseek(fp, 0, SEEK_END);
+            long fsize = ftell(fp);
+            fseek(fp, 0, SEEK_SET);
+
+            fprintf(stderr, "  [LOAD] Opened '%s' (%ld bytes)\n", win_path, fsize);
+
+            if (fsize > 0 && fsize < 64 * 1024 * 1024) {
+                /* The original async loader reads file data directly into the
+                 * resource buffer (resource_va). For simple queue entries (like
+                 * vlist.bin, tlist.bin), resource_va IS the destination buffer
+                 * and param is its size. For complex entries (like Global.txd),
+                 * resource_va is a pre-allocated structure from sub_00018BB0.
+                 *
+                 * In both cases: read data directly into resource_va.
+                 * For safety, if param looks like a reasonable buffer size
+                 * (0 < param <= 64MB), limit the read to that. */
+                size_t max_read = (size_t)fsize;
+                if (param > 0 && param <= 64 * 1024 * 1024 && param < (uint32_t)fsize) {
+                    max_read = param;
+                    fprintf(stderr, "  [LOAD] Clamping read to param=%u bytes\n", param);
+                }
+
+                if (resource_va > 0x100 && resource_va < 0x4000000) {
+                    uint8_t *dest = (uint8_t *)XBOX_PTR(resource_va);
+                    size_t nread = fread(dest, 1, max_read, fp);
+                    fprintf(stderr, "  [LOAD] Read %zu bytes directly into Xbox VA 0x%08X\n",
+                            nread, resource_va);
+                } else {
+                    /* Fallback: allocate heap buffer if resource_va is invalid */
+                    extern uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
+                    uint32_t data_va = xbox_HeapAlloc((uint32_t)fsize + 16, 16);
+                    if (data_va != 0) {
+                        uint8_t *data_ptr = (uint8_t *)XBOX_PTR(data_va);
+                        size_t nread = fread(data_ptr, 1, (size_t)fsize, fp);
+                        fprintf(stderr, "  [LOAD] Read %zu bytes into heap Xbox VA 0x%08X\n",
+                                nread, data_va);
+                    } else {
+                        fprintf(stderr, "  [LOAD] FAILED: xbox_HeapAlloc(%ld) returned 0\n", fsize);
+                    }
+                }
+            }
+            fclose(fp);
+        } else {
+            fprintf(stderr, "  [LOAD] FAILED: could not open '%s' (tried Xbox + relative)\n",
+                    name_buf);
+        }
+    }
+
+    /* Set completion flag = 1 so the game knows the resource is ready */
+    if (flag_va > 0x100 && flag_va < 0x4000000) {
+        MEM8(flag_va) = 1;
+    }
+
+    /* Still need to maintain the queue state.
+     * Run the original queue index management logic. */
+    {
+        uint32_t tail = MEM32(queue_va + 0x78C);
+        /* Entry stride = idx * 80 (0x50) */
+        uint32_t entry_base = queue_va + tail * 80;
+
+        /* Copy filename into queue entry */
+        {
+            int i;
+            for (i = 0; i < 63 && name_buf[i]; i++)
+                MEM8(entry_base + (uint32_t)i) = (uint8_t)name_buf[i];
+            MEM8(entry_base + (uint32_t)i) = 0;
+        }
+
+        /* Store fields */
+        MEM32(entry_base + 0x40) = flag_va;
+        MEM32(entry_base + 0x44) = resource_va;
+        MEM32(entry_base + 0x48) = param;
+
+        /* Version counter */
+        uint32_t ver = MEM32(queue_va + 0x790);
+        MEM32(entry_base + 0x4C) = ver;
+        ver++;
+        if (ver == 0) ver = 1;
+        MEM32(queue_va + 0x790) = ver;
+
+        /* Advance tail index (circular, 24 entries) */
+        tail++;
+        if (tail >= 0x18) tail = 0;
+        MEM32(queue_va + 0x78C) = tail;
+    }
+
+    /* Call sub_000110E0 to process the tick (like original code does) */
+    edi = queue_va;
+    PUSH32(esp, 0); sub_000110E0();
+
+    eax = MEM32(queue_va + 0x790); /* return version like original */
+    esp += 24; return; /* ret 20 */
+}
+
+/* sub_00157680 removed from manual overrides - gen code used directly now
+ * that sub_00159710 implements full pointer relocation for PrgData.bin */
