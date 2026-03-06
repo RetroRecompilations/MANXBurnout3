@@ -12,8 +12,20 @@
 #include <math.h>
 #include <stdio.h>
 
+/* ICALL failure diagnostic (rate-limited) */
+void recomp_icall_fail_log(uint32_t va)
+{
+    (void)va; /* diagnostics disabled - macro early-out handles garbage VAs */
+}
+
 /* D3D8 frame pump (implemented in d3d8_device.c) */
 extern void d3d8_PresentFrame(void);
+
+/* Track spawn state exported from rw_renderer.c */
+extern float g_track_spawn_x;
+extern float g_track_spawn_z;
+extern float g_track_spawn_hdg;
+extern int   g_track_mode;
 
 /* RW linked-list traversal with loop limit */
 void sub_001FE1E0(void);
@@ -1572,15 +1584,35 @@ void sub_000110E0(void)
     if (MEM32(0x4D53B8) == 4) {
         uint32_t phys_ptr = MEM32(0x557880 + 0x1B4);
         if (phys_ptr > 0x100 && phys_ptr < 0x3FFFFFF) {
+            /* Initialize physics on first state-4 entry, and respawn
+             * when track changes (spawn coords updated by renderer). */
             static int _state4_init = 0;
-            if (!_state4_init) {
-                _state4_init = 1;
-                MEMF(phys_ptr + 0x08) = 0.0f;  /* accel */
-                MEMF(phys_ptr + 0x0C) = 0.0f;  /* turn rate */
-                MEMF(phys_ptr + 0x10) = 0.0f;  /* pos_x */
-                MEMF(phys_ptr + 0x14) = 0.0f;  /* pos_y */
-                MEMF(phys_ptr + 0x18) = 0.0f;  /* heading (0 = north) */
-                MEMF(phys_ptr + 0x1C) = 0.0f;  /* speed */
+            static float _last_spawn_x = 0, _last_spawn_z = 0;
+            {
+                int needs_init = !_state4_init;
+                if (g_track_mode) {
+                    if (g_track_spawn_x != _last_spawn_x || g_track_spawn_z != _last_spawn_z)
+                        needs_init = 1;
+                    _last_spawn_x = g_track_spawn_x;
+                    _last_spawn_z = g_track_spawn_z;
+                }
+                if (needs_init) {
+                    _state4_init = 1;
+                    MEMF(phys_ptr + 0x08) = 0.0f;  /* accel */
+                    MEMF(phys_ptr + 0x0C) = 0.0f;  /* turn rate */
+                    if (g_track_mode) {
+                        MEMF(phys_ptr + 0x10) = g_track_spawn_x;
+                        MEMF(phys_ptr + 0x14) = g_track_spawn_z;
+                        MEMF(phys_ptr + 0x18) = g_track_spawn_hdg;
+                        fprintf(stderr, "  [PHY] Spawn on track: pos=(%.1f, %.1f) hdg=%.1f°\n",
+                                g_track_spawn_x, g_track_spawn_z, g_track_spawn_hdg * 57.2958f);
+                    } else {
+                        MEMF(phys_ptr + 0x10) = 0.0f;
+                        MEMF(phys_ptr + 0x14) = 0.0f;
+                        MEMF(phys_ptr + 0x18) = 0.0f;
+                    }
+                    MEMF(phys_ptr + 0x1C) = 0.0f;  /* speed */
+                }
             }
 
             float dt = MEMF(0x4AE1FC);
@@ -1595,12 +1627,13 @@ void sub_000110E0(void)
             speed += accel * dt;
 
             /* Drag: proportional to speed, decelerates when not accelerating.
-             * drag_coeff = 0.8 means speed halves in ~0.87s with no input. */
-            float drag = 0.8f;
+             * Very low drag on tracks for sustained high speed. */
+            float drag = g_track_mode ? 0.15f : 0.8f;
             speed *= (1.0f - drag * dt);
 
-            /* Clamp speed: max ~50 units/s forward, allow small reverse */
-            if (speed > 50.0f) speed = 50.0f;
+            /* Clamp speed: max 500 units/s on track, 50 on procedural road */
+            float max_speed = g_track_mode ? 500.0f : 50.0f;
+            if (speed > max_speed) speed = max_speed;
             if (speed < -10.0f) speed = -10.0f;
             /* Kill very small speeds to prevent creeping */
             if (speed > -0.01f && speed < 0.01f) speed = 0.0f;
@@ -1632,18 +1665,17 @@ void sub_000110E0(void)
             float new_px = MEMF(phys_ptr + 0x10) + dx;
             float new_py = MEMF(phys_ptr + 0x14) + dy;
 
-            /* Centripetal force from road curves.
-             * Road curve value (set by renderer) at 0x5FFD10. Positive = right curve.
-             * Car drifts outward on curves proportional to speed². */
-            {
+            /* Centripetal force from road curves (procedural road only).
+             * On real tracks, car drives freely. */
+            if (!g_track_mode) {
                 float road_curve = MEMF(0x5FFD10);
                 float centripetal = road_curve * speed * speed * 0.0003f;
                 new_px += centripetal * dt;
             }
 
-            /* Road edge collision: road is 30 units wide centered at x=0.
-             * Car half-width is ~1 unit, so effective edge at ±14. */
-            {
+            /* Road edge collision: only for procedural road (no track loaded).
+             * On real tracks, player drives freely in world space. */
+            if (!g_track_mode) {
                 float road_edge = 14.0f;
                 if (new_px > road_edge) {
                     new_px = road_edge;
@@ -1651,7 +1683,6 @@ void sub_000110E0(void)
                     speed *= 0.5f;
                     MEMF(0x5FFD30) = 0.4f; /* spark timer */
                     MEM32(0x5FFD34) = 1; /* spark side: 1=right */
-                    /* Reset multiplier on wall hit */
                     MEMF(0x5FFD28) = 1.0f;
                     MEMF(0x5FFD2C) = 0.0f;
                 } else if (new_px < -road_edge) {
@@ -1704,26 +1735,33 @@ void sub_000110E0(void)
                 /* Store distance for HUD display */
                 MEM32(0x5FFD14) = (uint32_t)new_py;
 
-                /* Initialize obstacles on first call */
+                /* Initialize obstacles on first call.
+                 * Skip traffic on real tracks - traffic math assumes straight road. */
                 if (!_obs_init) {
                     _obs_init = 1;
-                    /* Same-direction traffic (slots 0-7) */
-                    for (oi = 0; oi < OBS_SAME; oi++) {
-                        float lane = ((float)(OBS_RAND() % 5) - 2.0f) * 5.0f;
-                        float ahead = 30.0f + (float)(OBS_RAND() % 80);
-                        MEMF(OBS_ADDR(oi, 0)) = lane;
-                        MEMF(OBS_ADDR(oi, 4)) = new_py + ahead;
-                        MEMF(OBS_ADDR(oi, 8)) = 3.0f + (float)(OBS_RAND() % 5);
-                        MEM32(OBS_ADDR(oi, 0xC)) = 1; /* active, same-dir */
-                    }
-                    /* Oncoming traffic (slots 8-11): left lanes, negative speed */
-                    for (oi = OBS_SAME; oi < OBS_COUNT; oi++) {
-                        float lane = -5.0f - (float)(OBS_RAND() % 3) * 3.0f; /* -5, -8, -11 */
-                        float ahead = 60.0f + (float)(OBS_RAND() % 100);
-                        MEMF(OBS_ADDR(oi, 0)) = lane;
-                        MEMF(OBS_ADDR(oi, 4)) = new_py + ahead;
-                        MEMF(OBS_ADDR(oi, 8)) = -(10.0f + (float)(OBS_RAND() % 8)); /* negative = toward player */
-                        MEM32(OBS_ADDR(oi, 0xC)) = 3; /* active + oncoming */
+                    if (g_track_mode) {
+                        /* Track mode: no traffic (road geometry is too complex) */
+                        for (oi = 0; oi < OBS_COUNT; oi++)
+                            MEM32(OBS_ADDR(oi, 0xC)) = 0; /* inactive */
+                    } else {
+                        /* Same-direction traffic (slots 0-7) */
+                        for (oi = 0; oi < OBS_SAME; oi++) {
+                            float lane = ((float)(OBS_RAND() % 5) - 2.0f) * 5.0f;
+                            float ahead = 30.0f + (float)(OBS_RAND() % 80);
+                            MEMF(OBS_ADDR(oi, 0)) = lane;
+                            MEMF(OBS_ADDR(oi, 4)) = new_py + ahead;
+                            MEMF(OBS_ADDR(oi, 8)) = 3.0f + (float)(OBS_RAND() % 5);
+                            MEM32(OBS_ADDR(oi, 0xC)) = 1; /* active, same-dir */
+                        }
+                        /* Oncoming traffic (slots 8-11): left lanes, negative speed */
+                        for (oi = OBS_SAME; oi < OBS_COUNT; oi++) {
+                            float lane = -5.0f - (float)(OBS_RAND() % 3) * 3.0f;
+                            float ahead = 60.0f + (float)(OBS_RAND() % 100);
+                            MEMF(OBS_ADDR(oi, 0)) = lane;
+                            MEMF(OBS_ADDR(oi, 4)) = new_py + ahead;
+                            MEMF(OBS_ADDR(oi, 8)) = -(10.0f + (float)(OBS_RAND() % 8));
+                            MEM32(OBS_ADDR(oi, 0xC)) = 3; /* active + oncoming */
+                        }
                     }
                 }
 
@@ -2562,16 +2600,17 @@ void sub_000636D0(void)
         int32_t raw_thr = (int32_t)MEM32(0x4D652C)
                         - (int32_t)MEM32(0x4D6B24)
                         - (int32_t)MEM32(0x4D6B20);
-        /* acceleration = raw_input * 0.001
-         *   W key (raw=1000): accel = 1.0 units/s^2
-         *   Gamepad (raw=2040): accel = 2.04 units/s^2 */
-        float accel_f = (float)raw_thr * 0.001f;
+        /* acceleration = raw_input * scale
+         * Track mode: 10x acceleration for world-scale tracks
+         *   W key (raw=1000): accel = 10.0 units/s^2 on track */
+        float accel_scale = g_track_mode ? 0.010f : 0.001f;
+        float accel_f = (float)raw_thr * accel_scale;
 
         int32_t raw_str = (int32_t)MEM32(0x4D6530)
                         - 2 * (int32_t)MEM32(0x4D6B28);
-        /* turn_rate = raw_input * 0.0018 radians/s (scaled by speed in integrator)
-         *   A/D key (raw=1000): base turn rate = 1.8 rad/s */
-        float turn_f = (float)raw_str * 0.0018f;
+        /* turn_rate = raw_input * 0.003 radians/s (scaled by speed in integrator)
+         *   A/D key (raw=1000): base turn rate = 3.0 rad/s */
+        float turn_f = (float)raw_str * 0.003f;
 
         uint32_t vel_ptr = MEM32(esi + 0x1B4);
         MEMF(vel_ptr + 8) = accel_f;

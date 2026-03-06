@@ -85,6 +85,9 @@ extern volatile uint32_t g_icall_trace[ICALL_TRACE_SIZE];
 extern volatile uint32_t g_icall_trace_idx;
 extern volatile uint64_t g_icall_count;
 
+/* ── ICALL failure diagnostic ────────────────────────────── */
+void recomp_icall_fail_log(uint32_t va);
+
 /* ── Memory access helpers ──────────────────────────────── */
 
 /** Translate an Xbox VA to an actual pointer.
@@ -230,11 +233,14 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
     g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
     g_icall_trace_idx++; \
     g_icall_count++; \
+    if (_va >= 0x00400000 && _va < 0xFE000000) { \
+        g_esp += 4; eax = 0; break; /* garbage VA: outside code + kernel range */ \
+    } \
     recomp_func_t _fn = recomp_lookup_manual(_va); \
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
     if (_fn) _fn(); \
-    else { g_esp += 4; eax = 0; } /* pop dummy ret addr; zero return value */ \
+    else { g_esp += 4; eax = 0; } \
 } while(0)
 
 /**
@@ -247,11 +253,14 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
     g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
     g_icall_trace_idx++; \
     g_icall_count++; \
+    if (_va >= 0x00400000 && _va < 0xFE000000) { \
+        g_esp = (saved_esp); eax = 0; break; /* garbage VA: outside code + kernel range */ \
+    } \
     recomp_func_t _fn = recomp_lookup_manual(_va); \
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
     if (_fn) _fn(); \
-    else { g_esp = (saved_esp); eax = 0; } /* restore esp; zero return value */ \
+    else { g_esp = (saved_esp); eax = 0; } \
 } while(0)
 
 /**

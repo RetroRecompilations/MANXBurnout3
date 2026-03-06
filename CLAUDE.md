@@ -34,7 +34,7 @@ The goal is to translate the original x86 Xbox code into a native Windows execut
 - Addresses are always shown as hex with 0x prefix (e.g., 0x001D2807)
 - Xbox kernel function names use their original Xbox names with `xbox_` prefix when reimplemented
 
-## Current Work State (Session 29)
+## Current Work State (Session 30)
 
 ### Status: True 3D renderer with full visual parity to pseudo-3D mode
 Game boots, loads, runs gameplay loop in state 4. **Two rendering modes** toggled with V key:
@@ -139,13 +139,22 @@ Game boots, loads, runs gameplay loop in state 4. **Two rendering modes** toggle
 - Difficulty ramps with distance (traffic density + speed)
 - AI braking when player approaches from behind in same lane
 
+### Session 30 Progress
+- Created **xboxrecomp** toolkit repo (https://github.com/sp00nznet/xboxrecomp)
+  - 4 toolchain modules (xbe_parser, disasm, func_id, recomp)
+  - 6 pipeline guides, 8 technical deep dives, 3 format references
+  - 3 runtime templates (recomp_types.h, xbox_memory.h, kernel_stubs.h)
+  - 15,196 lines across 55 files
+- Cleaned up burnout3 repo: moved generic docs to xboxrecomp, updated README
+- Committed Session 29 ICALL fixes (centralized early-out, vtable guards)
+
 ### Next Steps
 1. Decode .btv vehicle texture format and apply to 3D models
-2. Parse static.dat track geometry and render actual game tracks
-3. Add rain puddles on 3D road surface during rain weather
-4. Write camera matrices to Xbox VAs for recompiled code compatibility
+2. Performance: batch same-texture objects to reduce draw calls (~1400 → ~160)
+3. Write camera matrices to Xbox VAs for recompiled code compatibility
+4. Connect original RW rendering pipeline to D3D11 backend
 5. Long-term: fix the real physics world initialization
-6. Long-term: reconnect original RW code to our renderer
+6. Long-term: audio playback (DirectSound → XAudio2)
 
 ### Key Input Addresses
 - Accumulators: 0x4D652C (throttle), 0x4D6530 (steering) - written by game_frame_pump()
