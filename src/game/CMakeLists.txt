@@ -18,6 +18,7 @@ set(GAME_SOURCES
     txd_loader.c
     bgv_loader.c
     track_loader.c
+    static_textures.c
     rw_renderer.c
     recomp/recomp_test.c
     recomp/recomp_manual.c

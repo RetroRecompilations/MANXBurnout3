@@ -12,6 +12,7 @@
 #include "rw_math.h"
 #include "bgv_loader.h"
 #include "track_loader.h"
+#include "static_textures.h"
 #include "../d3d/d3d8_xbox.h"
 #include "../kernel/xbox_memory_layout.h"
 
@@ -66,6 +67,13 @@ typedef struct {
 } TOD_State;
 
 static TOD_State g_tod;
+
+/* Exported spawn state for physics initialization (recomp_manual.c reads these) */
+float g_track_spawn_x = 0.0f;
+float g_track_spawn_y = 0.0f;
+float g_track_spawn_z = 0.0f;
+float g_track_spawn_hdg = 0.0f;
+int   g_track_mode = 0;  /* 1 = driving on real track geometry */
 
 static void tod_update(float py)
 {
@@ -131,7 +139,7 @@ static uint32_t g_twinkle_seed = 42;
 
 /* ── Module state ────────────────────────────────────────────── */
 
-static int g_3d_mode = 0;              /* 1 = true 3D, 0 = pseudo-3D */
+static int g_3d_mode = 1;              /* always 3D mode */
 static int g_initialized = 0;
 
 /* Player mesh */
@@ -143,7 +151,7 @@ static RW_Mesh *g_traffic_meshes[MAX_TRAFFIC_MESHES];
 static int g_traffic_mesh_count = 0;
 
 /* Track geometry */
-#define MAX_TRACK_CHUNKS 64
+#define MAX_TRACK_CHUNKS 2000
 static TrackData g_track_data;
 static RW_Mesh *g_track_meshes[MAX_TRACK_CHUNKS];
 static BGV_Vertex *g_track_bgv_verts[MAX_TRACK_CHUNKS];  /* CPU-side data (kept alive for mesh) */
@@ -151,6 +159,7 @@ static uint16_t *g_track_bgv_idxs[MAX_TRACK_CHUNKS];
 static int g_track_mesh_count = 0;
 static int g_track_loaded = 0;
 static int g_track_visible = 1;
+static StaticTexDict g_static_textures;
 
 /* Procedural road mesh */
 #define ROAD_SEGMENTS   80
@@ -377,6 +386,10 @@ void rw_render_mesh(RW_Mesh *mesh, const float world_matrix[16])
     /* Bind texture or use vertex-color-only mode */
     if (mesh->texture) {
         dev->lpVtbl->SetTexture(dev, 0, (IDirect3DBaseTexture8 *)mesh->texture);
+        /* COLOROP = MODULATE: texture color * vertex color (vertex provides AO/lighting) */
+        dev->lpVtbl->SetTextureStageState(dev, 0, 1 /*D3DTSS_COLOROP*/, 4 /*D3DTOP_MODULATE*/);
+        dev->lpVtbl->SetTextureStageState(dev, 0, 2 /*D3DTSS_COLORARG1*/, 2 /*D3DTA_TEXTURE*/);
+        dev->lpVtbl->SetTextureStageState(dev, 0, 3 /*D3DTSS_COLORARG2*/, 0 /*D3DTA_DIFFUSE*/);
     } else {
         dev->lpVtbl->SetTexture(dev, 0, NULL);
         /* COLOROP = DISABLE for vertex-color-only (avoids sampling NULL texture) */
@@ -1263,15 +1276,26 @@ static void render_3d_hud(IDirect3DDevice8 *dev)
 
 /* ── Track Geometry ──────────────────────────────────────────── */
 
-/* Color-code vertices by height relative to ground level */
-static DWORD track_height_color(float y, float ground_y)
+/* Color-code vertices by height relative to ground level, modulated by AO */
+static DWORD track_height_color(float y, float ground_y, uint32_t ao_color)
 {
+    /* Bright height-based coloring */
     float rel = y - ground_y;
-    if (rel < -2.0f)  return 0xFF404040;  /* below grade: dark grey */
-    if (rel <  2.0f)  return 0xFF606060;  /* road surface: medium grey */
-    if (rel < 15.0f)  return 0xFF909090;  /* walls/barriers: light grey */
-    if (rel < 40.0f)  return 0xFF806040;  /* buildings: brown */
-    return 0xFF607080;                     /* tall structures: blue-grey */
+    uint8_t base_r, base_g, base_b;
+    if (rel < -2.0f)       { base_r = 130; base_g = 145; base_b = 110; }  /* below grade: earth */
+    else if (rel <  1.0f)  { base_r = 170; base_g = 170; base_b = 180; }  /* road surface: asphalt */
+    else if (rel <  3.0f)  { base_r = 230; base_g = 225; base_b = 215; }  /* curbs: concrete */
+    else if (rel <  8.0f)  { base_r = 200; base_g = 210; base_b = 205; }  /* barriers: metal */
+    else if (rel < 20.0f)  { base_r = 240; base_g = 220; base_b = 190; }  /* walls: sandstone */
+    else if (rel < 50.0f)  { base_r = 245; base_g = 235; base_b = 215; }  /* buildings: pale */
+    else                    { base_r = 210; base_g = 225; base_b = 240; }  /* tall: blue-grey */
+
+    /* Use vertex color directly as tint (full brightness, no AO darkening) */
+    (void)ao_color;
+    uint8_t r = base_r;
+    uint8_t g = base_g;
+    uint8_t b = base_b;
+    return 0xFF000000 | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
 }
 
 int rw_load_track(const char *path)
@@ -1282,15 +1306,35 @@ int rw_load_track(const char *path)
     if (track_load(path, &g_track_data) != 0)
         return -1;
 
+    /* Load textures from static.dat in the same directory */
+    {
+        char static_path[512];
+        strncpy(static_path, path, sizeof(static_path) - 1);
+        static_path[sizeof(static_path) - 1] = 0;
+        /* Replace "streamed.dat" with "static.dat" */
+        char *fname = strrchr(static_path, '\\');
+        if (!fname) fname = strrchr(static_path, '/');
+        if (fname) {
+            strcpy(fname + 1, "static.dat");
+        } else {
+            strcpy(static_path, "static.dat");
+        }
+        IDirect3DDevice8 *dev = xbox_GetD3DDevice();
+        if (dev) {
+            static_tex_load(static_path, dev, &g_static_textures);
+        }
+    }
+
     float ground_y = g_track_data.center[1];
+    (void)ground_y;
 
     int created = 0;
-    for (int i = 0; i < g_track_data.chunk_count && i < MAX_TRACK_CHUNKS; i++) {
+    for (int i = 0; i < g_track_data.chunk_count; i++) {
         TrackChunk *chunk = &g_track_data.chunks[i];
         uint32_t vc = chunk->vertex_count;
-        if (vc < 3) continue;
+        if (vc < 3 || !chunk->indices || chunk->index_count < 3) continue;
 
-        /* Convert TrackVertex -> BGV_Vertex */
+        /* Convert TrackVertex -> BGV_Vertex for this chunk (shared by all objects) */
         BGV_Vertex *bgv = (BGV_Vertex *)calloc(vc, sizeof(BGV_Vertex));
         if (!bgv) continue;
 
@@ -1299,53 +1343,118 @@ int rw_load_track(const char *path)
             bgv[j].x = tv->x;
             bgv[j].y = tv->y;
             bgv[j].z = tv->z;
-            bgv[j].nx = 0.0f;
-            bgv[j].ny = 1.0f;
-            bgv[j].nz = 0.0f;
-            bgv[j].color = track_height_color(tv->y, ground_y);
+            {
+                int raw_x = (int)(tv->packed_normal & 0x7FF);
+                int raw_y = (int)((tv->packed_normal >> 11) & 0x7FF);
+                int raw_z = (int)((tv->packed_normal >> 22) & 0x3FF);
+                if (raw_x & 0x400) raw_x -= 0x800;
+                if (raw_y & 0x400) raw_y -= 0x800;
+                if (raw_z & 0x200) raw_z -= 0x400;
+                bgv[j].nx = raw_x / 1023.0f;
+                bgv[j].ny = raw_y / 1023.0f;
+                bgv[j].nz = raw_z / 511.0f;
+            }
+            /* Vertex color = baked AO/shadow modulated by directional light.
+             * When textured, this provides shadow/lighting; texture provides color. */
+            {
+                uint8_t ao_val = (uint8_t)((tv->color >> 16) & 0xFF);
+                float ao = ao_val / 128.0f;
+                if (ao > 1.0f) ao = 1.0f;
+                float sun_dot = bgv[j].nx * 0.3f + bgv[j].ny * 0.8f + bgv[j].nz * 0.2f;
+                if (sun_dot < 0.0f) sun_dot = 0.0f;
+                float light = 0.55f + 0.45f * sun_dot;
+                float brightness = ao * light;
+                if (brightness > 1.0f) brightness = 1.0f;
+                uint8_t bv = (uint8_t)(brightness * 255.0f);
+                bgv[j].color = 0xFF000000 | (bv << 16) | (bv << 8) | bv;
+            }
             bgv[j].u = tv->u;
             bgv[j].v = tv->v;
         }
 
-        /* Generate triangle strip indices, skipping degenerate triangles */
-        uint32_t max_tris = vc - 2;
-        uint16_t *idxs = (uint16_t *)malloc(max_tris * 3 * sizeof(uint16_t));
-        if (!idxs) { free(bgv); continue; }
+        /* Create one mesh per object (each has its own strip range and texture) */
+        int num_objects = chunk->strip_break_count;
+        if (num_objects <= 0) num_objects = 1;
 
-        uint32_t idx_count = 0;
-        for (uint32_t t = 0; t < max_tris; t++) {
-            BGV_Vertex *a = &bgv[t];
-            BGV_Vertex *b = &bgv[t + 1];
-            BGV_Vertex *c = &bgv[t + 2];
+        for (int si = 0; si < num_objects && created < MAX_TRACK_CHUNKS; si++) {
+            uint32_t strip_start, strip_end;
+            if (chunk->strip_breaks && chunk->strip_break_count > 0) {
+                strip_start = chunk->strip_breaks[si];
+                strip_end = chunk->strip_breaks[si + 1];
+            } else {
+                strip_start = 0;
+                strip_end = chunk->index_count;
+            }
+            if (strip_end > chunk->index_count) strip_end = chunk->index_count;
+            if (strip_end - strip_start < 3) continue;
 
-            /* Skip degenerate triangles (strip restart markers) */
-            if ((a->x == b->x && a->y == b->y && a->z == b->z) ||
-                (a->x == c->x && a->y == c->y && a->z == c->z) ||
-                (b->x == c->x && b->y == c->y && b->z == c->z))
-                continue;
+            /* Convert triangle strip to triangle list */
+            uint32_t max_tris = (strip_end - strip_start) * 3;
+            uint16_t *idxs = (uint16_t *)malloc(max_tris * sizeof(uint16_t));
+            if (!idxs) continue;
+            uint32_t idx_count = 0;
 
-            idxs[idx_count++] = (uint16_t)t;
-            idxs[idx_count++] = (uint16_t)(t + 1);
-            idxs[idx_count++] = (uint16_t)(t + 2);
+            uint32_t winding = 0;
+            for (uint32_t t = strip_start; t + 2 < strip_end; t++) {
+                uint16_t i0 = chunk->indices[t];
+                uint16_t i1 = chunk->indices[t + 1];
+                uint16_t i2 = chunk->indices[t + 2];
+
+                if (i0 == i1 || i0 == i2 || i1 == i2) { winding = 0; continue; }
+                if (i0 >= vc || i1 >= vc || i2 >= vc) continue;
+
+                /* Edge-length filter: skip giant bridging triangles */
+                {
+                    float e1x = bgv[i1].x - bgv[i0].x, e1y = bgv[i1].y - bgv[i0].y, e1z = bgv[i1].z - bgv[i0].z;
+                    float e2x = bgv[i2].x - bgv[i0].x, e2y = bgv[i2].y - bgv[i0].y, e2z = bgv[i2].z - bgv[i0].z;
+                    float e3x = bgv[i2].x - bgv[i1].x, e3y = bgv[i2].y - bgv[i1].y, e3z = bgv[i2].z - bgv[i1].z;
+                    float d1 = e1x*e1x + e1y*e1y + e1z*e1z;
+                    float d2 = e2x*e2x + e2y*e2y + e2z*e2z;
+                    float d3 = e3x*e3x + e3y*e3y + e3z*e3z;
+                    float max_d2 = d1 > d2 ? d1 : d2;
+                    if (d3 > max_d2) max_d2 = d3;
+                    if (max_d2 > 40.0f * 40.0f) { winding++; continue; }
+                }
+
+                if (winding & 1) {
+                    idxs[idx_count++] = i0;
+                    idxs[idx_count++] = i2;
+                    idxs[idx_count++] = i1;
+                } else {
+                    idxs[idx_count++] = i0;
+                    idxs[idx_count++] = i1;
+                    idxs[idx_count++] = i2;
+                }
+                winding++;
+            }
+
+            if (idx_count < 3) { free(idxs); continue; }
+
+            /* Look up texture for this object */
+            IDirect3DTexture8 *tex = NULL;
+            if (chunk->tex_indices && si < chunk->tex_index_count) {
+                uint16_t tex_idx = chunk->tex_indices[si];
+                if (tex_idx < (uint16_t)g_static_textures.count) {
+                    tex = g_static_textures.entries[tex_idx].texture;
+                }
+            }
+
+            /* Create GPU mesh - shares the chunk's vertex buffer, own index buffer */
+            RW_Mesh *mesh = rw_mesh_create_procedural(bgv, vc, idxs, idx_count);
+            if (mesh) {
+                mesh->texture = tex;
+                g_track_meshes[created] = mesh;
+                g_track_bgv_verts[created] = bgv;
+                g_track_bgv_idxs[created] = idxs;
+                created++;
+            } else {
+                free(idxs);
+            }
         }
 
-        if (idx_count < 3) {
+        /* If no objects were created from this chunk, free the bgv */
+        if (created == 0 || g_track_bgv_verts[created - 1] != bgv) {
             free(bgv);
-            free(idxs);
-            continue;
-        }
-
-        /* Create GPU mesh */
-        RW_Mesh *mesh = rw_mesh_create_procedural(bgv, vc, idxs, idx_count);
-        if (mesh) {
-            mesh->bounding_radius = chunk->radius;
-            g_track_meshes[created] = mesh;
-            g_track_bgv_verts[created] = bgv;
-            g_track_bgv_idxs[created] = idxs;
-            created++;
-        } else {
-            free(bgv);
-            free(idxs);
         }
     }
 
@@ -1357,6 +1466,51 @@ int rw_load_track(const char *path)
         /* Increase far plane for large track geometry */
         g_scene.camera.zfar = 5000.0f;
         g_scene.camera.znear = 1.0f;
+
+        /* Set spawn position globals for physics (read by recomp_manual.c) */
+        g_track_spawn_x = g_track_data.spawn[0];
+        g_track_spawn_z = g_track_data.spawn[2];
+        g_track_mode = 1;
+
+        /* Find actual road surface Y at spawn XZ by scanning upward-facing vertices */
+        {
+            float sx = g_track_data.spawn[0];
+            float sz = g_track_data.spawn[2];
+            float road_y = g_track_data.spawn[1]; /* fallback */
+            float best_d2 = 1e30f;
+            for (int i = 0; i < g_track_data.chunk_count; i++) {
+                TrackChunk *chunk = &g_track_data.chunks[i];
+                float cdx = chunk->center[0] - sx;
+                float cdz = chunk->center[2] - sz;
+                if (cdx*cdx + cdz*cdz > 500.0f*500.0f) continue;
+                for (uint32_t v = 0; v < chunk->vertex_count; v += 2) {
+                    /* Check if vertex normal points up (road surface) */
+                    int raw_ny = (int)((chunk->vertices[v].packed_normal >> 11) & 0x7FF);
+                    if (raw_ny & 0x400) raw_ny -= 0x800;
+                    float ny = raw_ny / 1023.0f;
+                    if (ny < 0.5f) continue; /* skip walls/ceilings */
+                    float vdx = chunk->vertices[v].x - sx;
+                    float vdz = chunk->vertices[v].z - sz;
+                    float d2 = vdx*vdx + vdz*vdz;
+                    if (d2 < best_d2) {
+                        best_d2 = d2;
+                        road_y = chunk->vertices[v].y;
+                    }
+                }
+            }
+            g_track_spawn_y = road_y;
+            fprintf(stderr, "[TRACK] Road surface Y at spawn: %.1f (section center Y was %.1f)\n",
+                    road_y, g_track_data.spawn[1]);
+        }
+
+        if (g_track_data.spine && g_track_data.spine_count >= 2) {
+            g_track_spawn_hdg = atan2f(g_track_data.spine[0].dx, g_track_data.spine[0].dz);
+        } else {
+            g_track_spawn_hdg = 0.0f;
+        }
+        fprintf(stderr, "[TRACK] Spawn: X=%.1f Y=%.1f Z=%.1f hdg=%.1f°\n",
+                g_track_spawn_x, g_track_spawn_y, g_track_spawn_z,
+                g_track_spawn_hdg * 57.2958f);
     }
 
     return g_track_loaded ? 0 : -1;
@@ -1364,17 +1518,44 @@ int rw_load_track(const char *path)
 
 void rw_unload_track(void)
 {
+    fprintf(stderr, "[TRACK] Unloading %d meshes...\n", g_track_mesh_count);
+
+    /* Collect unique bgv pointers to free (avoid double-free of shared arrays) */
+    void **unique_bgv = NULL;
+    int unique_count = 0;
+    if (g_track_mesh_count > 0) {
+        unique_bgv = (void **)calloc(g_track_mesh_count, sizeof(void *));
+        for (int i = 0; i < g_track_mesh_count; i++) {
+            void *p = g_track_bgv_verts[i];
+            if (!p) continue;
+            int found = 0;
+            for (int j = 0; j < unique_count; j++) {
+                if (unique_bgv[j] == p) { found = 1; break; }
+            }
+            if (!found) unique_bgv[unique_count++] = p;
+        }
+    }
+
     for (int i = 0; i < g_track_mesh_count; i++) {
+        if (g_track_meshes[i]) g_track_meshes[i]->texture = NULL;
         rw_mesh_destroy(g_track_meshes[i]);
         g_track_meshes[i] = NULL;
-        free(g_track_bgv_verts[i]);
         g_track_bgv_verts[i] = NULL;
         free(g_track_bgv_idxs[i]);
         g_track_bgv_idxs[i] = NULL;
     }
+
+    /* Free unique bgv arrays */
+    for (int i = 0; i < unique_count; i++) {
+        free(unique_bgv[i]);
+    }
+    free(unique_bgv);
+
     g_track_mesh_count = 0;
     g_track_loaded = 0;
     track_free(&g_track_data);
+    static_tex_release(&g_static_textures);
+    fprintf(stderr, "[TRACK] Unload complete\n");
 }
 
 int rw_has_track(void)
@@ -1468,50 +1649,169 @@ void rw_gameplay_render(void)
     IDirect3DDevice8 *dev = xbox_GetD3DDevice();
     if (!dev || !g_initialized) return;
 
-    /* Read physics state */
-    float px = RW_MEMF(PHYS_PX);
-    float py = RW_MEMF(PHYS_PY);     /* forward distance = world Z */
-    float hdg = RW_MEMF(PHYS_HDG);
-    float spd = RW_MEMF(PHYS_SPD);
+    /* ── Dual mode: fly camera (explore) + drive mode (car on track) ── */
+    static float fly_x = 0, fly_y = 50, fly_z = 0;
+    static float fly_yaw = 0, fly_pitch = -0.3f;
+    static int fly_inited = 0;
+    static int drive_mode = 0;  /* 0 = fly, 1 = driving */
 
-    /* Update time-of-day and weather */
-    tod_update(py);
-
-    /* Weather cycle (6000-unit period) */
-    float wcyc = fmodf(py / 6000.0f, 1.0f);
-    if (wcyc < 0.0f) wcyc += 1.0f;
-    if (wcyc < 0.67f)       g_rain_intensity = 0.0f;
-    else if (wcyc < 0.75f)  g_rain_intensity = (wcyc - 0.67f) / 0.08f;
-    else if (wcyc < 0.92f)  g_rain_intensity = 1.0f;
-    else                     g_rain_intensity = 1.0f - (wcyc - 0.92f) / 0.08f;
-
-    /* Map 2D physics to 3D world.
-     * When a track is loaded, offset player position to track world coords.
-     * Physics X → lateral, Physics Y → forward distance along track Z. */
-    float car_pos[3];
-    if (g_track_loaded && g_track_visible) {
-        car_pos[0] = g_track_data.center[0] + px;
-        car_pos[1] = g_track_data.center[1] + 0.5f;
-        car_pos[2] = g_track_data.center[2] + py;
-    } else {
-        car_pos[0] = px;
-        car_pos[1] = 0.5f;
-        car_pos[2] = py;
+    if (!fly_inited && g_track_loaded) {
+        fly_x = g_track_data.center[0];
+        fly_y = g_track_data.center[1] + 200.0f;
+        fly_z = g_track_data.center[2];
+        fly_pitch = -0.5f;
+        fly_yaw = g_track_spawn_hdg;
+        fly_inited = 1;
+        fprintf(stderr, "[FLY] Init at center=(%.0f, %.0f, %.0f)\n", fly_x, fly_y, fly_z);
     }
 
-    float road_curve = RW_MEMF(ROAD_CURVE_ADDR);
+    /* F key: toggle between fly and drive mode.
+     * In fly mode, F drops the car at current position.
+     * In drive mode, F returns to fly mode. */
+    {
+        static int f_prev = 0;
+        int f_now = (GetAsyncKeyState('F') & 0x8000) ? 1 : 0;
+        if (f_now && !f_prev) {
+            if (!drive_mode) {
+                /* Drop car at current fly position */
+                drive_mode = 1;
+                g_track_spawn_x = fly_x;
+                g_track_spawn_y = fly_y;
+                g_track_spawn_z = fly_z;
+                g_track_spawn_hdg = fly_yaw;
+                /* Write spawn to physics */
+                RW_MEMF(PHYS_PX) = fly_x;
+                RW_MEMF(PHYS_PY) = fly_z;
+                RW_MEMF(PHYS_HDG) = fly_yaw;
+                RW_MEMF(PHYS_SPD) = 0.0f;
+                fprintf(stderr, "[FLY] Dropped car at (%.0f, %.0f, %.0f) hdg=%.0f°\n",
+                        fly_x, fly_y, fly_z, fly_yaw * 57.2958f);
+            } else {
+                /* Return to fly mode at current car position */
+                drive_mode = 0;
+                fly_x = RW_MEMF(PHYS_PX);
+                fly_y = g_track_spawn_y + 20.0f;
+                fly_z = RW_MEMF(PHYS_PY);
+                fly_yaw = RW_MEMF(PHYS_HDG);
+                fly_pitch = -0.3f;
+                fprintf(stderr, "[FLY] Returned to fly mode\n");
+            }
+        }
+        f_prev = f_now;
+    }
 
-    /* ── Sky gradient (behind everything) ── */
+    /* T key: cycle tracks (reset to fly mode) */
+    /* (handled in main.c, but reset fly_inited when track changes) */
+    {
+        static float last_cx = 0, last_cz = 0;
+        if (g_track_loaded && (g_track_data.center[0] != last_cx || g_track_data.center[2] != last_cz)) {
+            last_cx = g_track_data.center[0];
+            last_cz = g_track_data.center[2];
+            fly_x = g_track_data.center[0];
+            fly_y = g_track_data.center[1] + 200.0f;
+            fly_z = g_track_data.center[2];
+            fly_pitch = -0.5f;
+            drive_mode = 0;
+        }
+    }
+
+    float car_pos[3], cam_hdg, spd;
+
+    if (drive_mode) {
+        /* ── DRIVE MODE: physics-controlled car ── */
+        float px = RW_MEMF(PHYS_PX);
+        float py = RW_MEMF(PHYS_PY);
+        float hdg = RW_MEMF(PHYS_HDG);
+        spd = RW_MEMF(PHYS_SPD);
+
+        car_pos[0] = px;
+        car_pos[1] = g_track_spawn_y;  /* stay at the Y where we dropped */
+        car_pos[2] = py;
+
+        /* Update Y from nearby upward-facing vertices */
+        if (g_track_loaded) {
+            float best_d2 = 1e30f;
+            for (int i = 0; i < g_track_data.chunk_count; i++) {
+                float cdx = g_track_data.chunks[i].center[0] - px;
+                float cdz = g_track_data.chunks[i].center[2] - py;
+                if (cdx*cdx + cdz*cdz > 300.0f*300.0f) continue;
+                TrackChunk *chunk = &g_track_data.chunks[i];
+                for (uint32_t v = 0; v < chunk->vertex_count; v += 4) {
+                    int raw_ny = (int)((chunk->vertices[v].packed_normal >> 11) & 0x7FF);
+                    if (raw_ny & 0x400) raw_ny -= 0x800;
+                    if (raw_ny < 512) continue; /* ny < 0.5 = not road */
+                    float vdx = chunk->vertices[v].x - px;
+                    float vdz = chunk->vertices[v].z - py;
+                    float d2 = vdx*vdx + vdz*vdz;
+                    if (d2 < best_d2) {
+                        best_d2 = d2;
+                        car_pos[1] = chunk->vertices[v].y + 1.0f;
+                    }
+                }
+            }
+        }
+
+        cam_hdg = hdg;
+
+    } else {
+        /* ── FLY MODE: free camera ── */
+        float fly_speed = 5.0f;
+        if (GetAsyncKeyState(VK_TAB) & 0x8000) fly_speed = 50.0f;
+
+        float dx_fwd = sinf(fly_yaw) * fly_speed;
+        float dz_fwd = cosf(fly_yaw) * fly_speed;
+        float dx_right = cosf(fly_yaw) * fly_speed;
+        float dz_right = -sinf(fly_yaw) * fly_speed;
+
+        if (GetAsyncKeyState('W') & 0x8000) { fly_x += dx_fwd; fly_z += dz_fwd; }
+        if (GetAsyncKeyState('S') & 0x8000) { fly_x -= dx_fwd; fly_z -= dz_fwd; }
+        if (GetAsyncKeyState('A') & 0x8000) { fly_x += dx_right; fly_z += dz_right; }
+        if (GetAsyncKeyState('D') & 0x8000) { fly_x -= dx_right; fly_z -= dz_right; }
+        if (GetAsyncKeyState(VK_SPACE) & 0x8000) fly_y += fly_speed;
+        if (GetAsyncKeyState(VK_CONTROL) & 0x8000) fly_y -= fly_speed;
+
+        if (GetAsyncKeyState(VK_LEFT) & 0x8000) fly_yaw -= 0.03f;
+        if (GetAsyncKeyState(VK_RIGHT) & 0x8000) fly_yaw += 0.03f;
+        if (GetAsyncKeyState(VK_UP) & 0x8000) fly_pitch += 0.02f;
+        if (GetAsyncKeyState(VK_DOWN) & 0x8000) fly_pitch -= 0.02f;
+        if (fly_pitch > 1.5f) fly_pitch = 1.5f;
+        if (fly_pitch < -1.5f) fly_pitch = -1.5f;
+
+        RW_MEMF(PHYS_PX) = fly_x;
+        RW_MEMF(PHYS_PY) = fly_z;
+
+        car_pos[0] = fly_x; car_pos[1] = fly_y; car_pos[2] = fly_z;
+        cam_hdg = fly_yaw;
+        spd = fly_speed;
+    }
+
+    /* Sky */
+    tod_update(car_pos[2]);
     render_sky_gradient(dev);
 
-    /* ── Night stars (drawn on top of sky, behind everything else) ── */
-    render_3d_stars(dev);
-
-    /* ── Set up chase camera ── */
-    float chase_dist = 8.0f + spd * 0.05f;  /* pull back at speed */
-    float chase_height = 3.0f + spd * 0.02f;
-    rw_camera_set_chase(&g_scene.camera, car_pos, hdg, chase_dist, chase_height);
-    rw_camera_update_matrices(&g_scene.camera);
+    /* Camera setup */
+    if (drive_mode) {
+        /* Chase camera behind car */
+        float chase_dist = 12.0f + spd * 0.03f;
+        float chase_height = 5.0f + spd * 0.01f;
+        rw_camera_set_chase(&g_scene.camera, car_pos, cam_hdg, chase_dist, chase_height);
+        rw_camera_update_matrices(&g_scene.camera);
+    } else {
+        /* Free-fly camera with pitch */
+        float look_x = fly_x + sinf(fly_yaw) * cosf(fly_pitch) * 10.0f;
+        float look_y = fly_y + sinf(fly_pitch) * 10.0f;
+        float look_z = fly_z + cosf(fly_yaw) * cosf(fly_pitch) * 10.0f;
+        g_scene.camera.position[0] = fly_x;
+        g_scene.camera.position[1] = fly_y;
+        g_scene.camera.position[2] = fly_z;
+        mat4_lookat(g_scene.camera.view_matrix,
+                    fly_x, fly_y, fly_z,
+                    look_x, look_y, look_z,
+                    0, 1, 0);
+        mat4_perspective(g_scene.camera.proj_matrix,
+                         g_scene.camera.fov_y, g_scene.camera.aspect,
+                         g_scene.camera.znear, g_scene.camera.zfar);
+    }
 
     D3DMATRIX view_mat, proj_mat;
     memcpy(&view_mat, g_scene.camera.view_matrix, 64);
@@ -1548,68 +1848,27 @@ void rw_gameplay_render(void)
             rw_render_mesh(tm, ident);
         }
 
-        /* Ground plane at track ground level */
-        render_ground_plane(dev, car_pos[0], car_pos[2]);
+        /* No ground plane on real tracks — track geometry IS the ground */
     } else {
         /* Procedural road + ground + mountains (no track loaded) */
-        render_ground_plane(dev, px, py);
-        render_road(dev, px, py);
-        render_mountains(dev, px, py);
-        render_roadside_objects(dev, px, py, road_curve);
-        render_tunnel(dev, px, py, road_curve);
+        float rc = RW_MEMF(ROAD_CURVE_ADDR);
+        render_ground_plane(dev, fly_x, fly_z);
+        render_road(dev, fly_x, fly_z);
+        render_mountains(dev, fly_x, fly_z);
+        render_roadside_objects(dev, fly_x, fly_z, rc);
+        render_tunnel(dev, fly_x, fly_z, rc);
     }
 
-    /* ── Player car (3D model) ── */
-    if (g_player_mesh) {
+    /* ── Player car (only in drive mode) ── */
+    if (drive_mode && g_player_mesh) {
         float rot_m[16], trans_m[16], world_m[16];
-        mat4_rotation_y(rot_m, hdg);
+        mat4_rotation_y(rot_m, cam_hdg);
         mat4_translation(trans_m, car_pos[0], car_pos[1], car_pos[2]);
         mat4_multiply(world_m, trans_m, rot_m);
         rw_render_mesh(g_player_mesh, world_m);
     }
 
-    /* ── Traffic cars (3D models) ── */
-    if (g_traffic_mesh_count > 0) {
-        for (int i = 0; i < OBS_COUNT; i++) {
-            uint32_t flags = RW_MEM32(OBS_ADDR(i, 0xC));
-            if (!(flags & 1)) continue;  /* not active */
-
-            float ox = RW_MEMF(OBS_ADDR(i, 0));
-            float oy = RW_MEMF(OBS_ADDR(i, 4));   /* forward distance */
-            (void)RW_MEMF(OBS_ADDR(i, 8));  /* speed - unused for now */
-
-            /* Map traffic to track coords if loaded */
-            float tpos[3];
-            if (g_track_loaded && g_track_visible) {
-                tpos[0] = g_track_data.center[0] + ox;
-                tpos[1] = g_track_data.center[1] + 0.5f;
-                tpos[2] = g_track_data.center[2] + oy;
-            } else {
-                tpos[0] = ox;
-                tpos[1] = 0.5f;
-                tpos[2] = oy;
-            }
-
-            /* Skip if too far from camera */
-            float dz = tpos[2] - g_scene.camera.position[2];
-            float dxx = tpos[0] - g_scene.camera.position[0];
-            if (dz * dz + dxx * dxx > 200.0f * 200.0f) continue;
-
-            /* Pick mesh variant */
-            int mesh_idx = i % g_traffic_mesh_count;
-            RW_Mesh *tmesh = g_traffic_meshes[mesh_idx];
-            if (!tmesh) continue;
-
-            /* Traffic heading: same direction as player for same-dir, opposite for oncoming */
-            float traffic_hdg = (flags & 2) ? hdg + 3.14159f : hdg;
-
-            float rot_m[16], trans_m[16], world_m[16];
-            mat4_rotation_y(rot_m, traffic_hdg);
-            mat4_translation(trans_m, tpos[0], tpos[1], tpos[2]);
-            mat4_multiply(world_m, trans_m, rot_m);
-            rw_render_mesh(tmesh, world_m);
-        }
-    }
+    /* Traffic disabled in fly-cam mode */
 
     /* ── HUD overlay ── */
     render_3d_hud(dev);

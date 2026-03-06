@@ -930,6 +930,79 @@ static void build_vehicle_catalog(void)
     fprintf(stderr, "  Vehicle catalog: %d models found\n", g_vehicle_count);
 }
 
+/* Track catalog for track cycling (T key in 3D mode) */
+#define MAX_TRACKS 64
+static char g_track_paths[MAX_TRACKS][128];
+static int g_track_count = 0;
+static int g_track_index = 0;
+
+static void build_track_catalog(void)
+{
+    static const char *regions[] = { "AS", "EU", "US", NULL };
+    static const char *codes[] = {
+        "C1_V1", "C1_V2", "C2_V1", "C2_V2", "C3_V1", "C3_V2",
+        "C4_V1", "C4_V2", "C5_V1", "C5_V2",
+        "M1_V1", "M1_V2", "M2_V1", "M2_V2",
+        "P1_V1", "P1_V2", "P2_V1", "P2_V2", NULL
+    };
+    g_track_count = 0;
+    for (int r = 0; regions[r] && g_track_count < MAX_TRACKS; r++) {
+        for (int c = 0; codes[c] && g_track_count < MAX_TRACKS; c++) {
+            char path[128];
+            snprintf(path, sizeof(path),
+                     "Burnout 3 Takedown\\Tracks\\%s\\%s\\streamed.dat",
+                     regions[r], codes[c]);
+            FILE *test = fopen(path, "rb");
+            if (test) {
+                fclose(test);
+                strncpy(g_track_paths[g_track_count], path, 127);
+                g_track_count++;
+            }
+        }
+    }
+    fprintf(stderr, "  Track catalog: %d tracks found\n", g_track_count);
+}
+
+static void load_track_by_index(int index)
+{
+    if (index < 0 || index >= g_track_count) return;
+    fprintf(stderr, "  [TRACK] Loading track %d/%d: %s\n",
+            index + 1, g_track_count, g_track_paths[index]);
+    if (rw_load_track(g_track_paths[index]) == 0) {
+        fprintf(stderr, "  [TRACK] Track loaded OK\n");
+        /* Update window title with track info */
+        if (g_hwnd) {
+            /* Extract region/code from path like "...\EU\C1_V1\..." */
+            const char *p = g_track_paths[index];
+            const char *region = NULL, *code = NULL;
+            for (const char *s = p; *s; s++) {
+                if ((*s == '\\' || *s == '/') && s[1] && s[2] && (s[3] == '\\' || s[3] == '/')) {
+                    region = s + 1;
+                }
+            }
+            if (region) {
+                code = region + 3; /* skip "XX\" */
+            }
+            char title[128];
+            if (region && code) {
+                char reg[4] = {0}, cod[8] = {0};
+                memcpy(reg, region, 2);
+                for (int i = 0; i < 7 && code[i] && code[i] != '\\' && code[i] != '/'; i++)
+                    cod[i] = code[i];
+                snprintf(title, sizeof(title),
+                         "Burnout 3 (Track %d/%d: %s %s)",
+                         index + 1, g_track_count, reg, cod);
+            } else {
+                snprintf(title, sizeof(title),
+                         "Burnout 3 (Track %d/%d)", index + 1, g_track_count);
+            }
+            SetWindowTextA(g_hwnd, title);
+        }
+    } else {
+        fprintf(stderr, "  [TRACK] Failed to load track\n");
+    }
+}
+
 static void load_vehicle_model(int index)
 {
     if (index < 0 || index >= g_vehicle_count) return;
@@ -1360,11 +1433,11 @@ static BOOL init_subsystems(void)
                                      g_traffic_models, TRAFFIC_MODEL_COUNT);
     }
 
-    /* 4e. Load track geometry from streamed.dat */
+    /* 4e. Build track catalog and load first track */
+    build_track_catalog();
     {
-        const char *track_path = "Burnout 3 Takedown/Tracks/EU/C1_V1/streamed.dat";
-        if (rw_load_track(track_path) == 0) {
-            fprintf(stderr, "  Track geometry loaded: %s\n", track_path);
+        if (g_track_count > 0) {
+            load_track_by_index(0);
         } else {
             fprintf(stderr, "  Track geometry not available (proceeding with procedural road)\n");
         }
@@ -1877,8 +1950,8 @@ void game_frame_pump(void)
             /* Keyboard: WASD for driving, Shift for boost */
             if (GetAsyncKeyState('W') & 0x8000) throttle += 1000;
             if (GetAsyncKeyState('S') & 0x8000) throttle -= 1000;
-            if (GetAsyncKeyState('A') & 0x8000) steering -= 1000;
-            if (GetAsyncKeyState('D') & 0x8000) steering += 1000;
+            if (GetAsyncKeyState('A') & 0x8000) steering += 1000;
+            if (GetAsyncKeyState('D') & 0x8000) steering -= 1000;
             XINP_MEM32(0x5FFD0C) = (GetAsyncKeyState(VK_SHIFT) & 0x8000) ? 1 : 0;
 
             /* XInput gamepad (port 0) */
@@ -1944,22 +2017,17 @@ void game_frame_pump(void)
             if (GetAsyncKeyState(VK_RETURN) & 0x8000)  XINP_MEM8(0x4A1C75) = 1;
             if (GetAsyncKeyState(VK_ESCAPE) & 0x8000)  XINP_MEM8(0x4A1C79) = 1;
 
-            /* V key: toggle true 3D rendering mode */
+            /* V key: (reserved, 3D mode is always on now) */
             {
-                static int v_key_prev = 0;
-                int v_key_now = (GetAsyncKeyState('V') & 0x8000) ? 1 : 0;
-                if (v_key_now && !v_key_prev) {
-                    rw_toggle_3d_mode();
-                }
-                v_key_prev = v_key_now;
             }
 
-            /* T key: toggle track geometry visibility (in 3D mode) */
+            /* T key: cycle to next track (in 3D mode) */
             {
                 static int t_key_prev = 0;
                 int t_key_now = (GetAsyncKeyState('T') & 0x8000) ? 1 : 0;
-                if (t_key_now && !t_key_prev) {
-                    rw_toggle_track();
+                if (t_key_now && !t_key_prev && g_track_count > 0) {
+                    g_track_index = (g_track_index + 1) % g_track_count;
+                    load_track_by_index(g_track_index);
                 }
                 t_key_prev = t_key_now;
             }
@@ -2036,14 +2104,12 @@ void game_frame_pump(void)
         if (g_show_3d_model && g_car_model_loaded) {
             render_3d_model_view(g_d3d_device, 1.0f / 60.0f);
         }
-        else if (rw_is_3d_mode()) {
-            /* True 3D rendering mode (toggle with V key) */
+        else {
+            /* 3D rendering mode (always on) */
             rw_gameplay_render();
         }
-        else
-        /* Pseudo-3D perspective road rendering (OutRun-style).
-         * Camera is behind and above the car, looking forward.
-         * Road rendered as horizontal trapezoid segments with perspective. */
+#if 0  /* Pseudo-3D mode removed - 3D is always on */
+        if (0)
         {
             extern ptrdiff_t g_xbox_mem_offset;
             #define _R_MEMF(a) (*(volatile float*)((uintptr_t)(a) + g_xbox_mem_offset))
@@ -4302,6 +4368,7 @@ void game_frame_pump(void)
             #undef _R_MEMF
             #undef _R_MEM32
         }
+#endif  /* end of #if 0 pseudo-3D removed */
 
         g_d3d_device->lpVtbl->EndScene(g_d3d_device);
         g_d3d_device->lpVtbl->Present(g_d3d_device, NULL, NULL, NULL, NULL);

@@ -4,7 +4,9 @@ A project to statically recompile the original Xbox version of **Burnout 3: Take
 
 ## Project Status
 
-**Phase 5: Integration** - The recompiled game boots, loads all resources, and **runs its main gameplay loop continuously in the in-race state (state 4)**. Two rendering modes: a custom pseudo-3D OutRun-style renderer and a true 3D chase-camera renderer, both with full visual features. Active work on connecting original RenderWare rendering pipeline.
+**Phase 5: Integration** - The recompiled game boots, loads all resources, and **runs its main gameplay loop continuously in the in-race state (state 4)**. Renders actual track geometry from game files with real textures. 37 tracks loadable with fly camera and drive mode. Active work on connecting original RenderWare rendering pipeline.
+
+![Textured track geometry from Bangkok (AS/C1_V1)](docs/screenshots/textured_track.png)
 
 ### What Works
 - Full game boot sequence: RW engine init → resource loading → state machine → gameplay loop
@@ -18,8 +20,9 @@ A project to statically recompile the original Xbox version of **Burnout 3: Take
 - **File loading pipeline**: Loads game resources from disk (Global.txd, PrgData.bin, vehicle/track lists, locale data)
 - **Global.txd fixup**: RenderWare binary stream header relocation (191 texture entries)
 - **PrgData.bin relocation**: Full 3-level nested pointer relocation for Criterion binary format
-- **Pseudo-3D renderer** (default): OutRun-style 2.5D with procedural road, traffic, weather, time-of-day
-- **True 3D renderer** (V key): Chase camera, procedural world, roadside scenery, tunnels, night/rain
+- **Track geometry**: Loads streamed.dat world geometry (per-section vertex/index buffers, triangle strip conversion)
+- **Track textures**: Loads 160 DXT1/DXT3/DXT5 textures from static.dat, per-object texture mapping
+- **37 tracks**: Cycle with T key (Asia, Europe, US regions with multiple variants)
 - **67 BGV vehicle models** loaded across 7 classes with 3D model viewer (M key)
 - **Physics model**: Heading-based steering, speed-dependent turning, road curve centripetal force
 - **Gameplay systems**: Score/multiplier, takedowns, near-misses, boost, checkpoints, AI traffic
@@ -181,8 +184,8 @@ The main executable (`default.xbe`) contains:
 - [x] BGV vehicle model loader (67 models, 7 classes, triangle strip conversion)
 - [x] 3D model viewer with turntable rotation (M key toggle, N/P to browse)
 - [x] Keyboard + gamepad input (WASD/stick driving, Shift/button boost)
+- [x] Track geometry rendering (streamed.dat loader, triangle strip conversion, per-object textures from static.dat)
 - [ ] RenderWare 3D rendering pipeline (connect original RW code to D3D11 layer)
-- [ ] Track geometry rendering (streamed.dat loader exists, needs RW world init)
 - [ ] Vehicle textures (.btv format decoding)
 - [ ] Audio playback
 - [ ] Performance profiling and optimization
@@ -216,6 +219,7 @@ burnout3/
 │       ├── bgv_loader.c/h    # BGV vehicle geometry parser (67 models, 7 classes)
 │       ├── txd_loader.c/h    # TXD texture dictionary loader
 │       ├── track_loader.c/h  # Track geometry from streamed.dat
+│       ├── static_textures.c/h # DXT texture loader for static.dat
 │       ├── rw_renderer.c/h   # True 3D renderer (chase camera, scene graph)
 │       ├── rw_math.h         # Shared mat4 math utilities
 │       └── recomp/           # Recompiled function infrastructure

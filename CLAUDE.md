@@ -34,7 +34,7 @@ The goal is to translate the original x86 Xbox code into a native Windows execut
 - Addresses are always shown as hex with 0x prefix (e.g., 0x001D2807)
 - Xbox kernel function names use their original Xbox names with `xbox_` prefix when reimplemented
 
-## Current Work State (Session 24)
+## Current Work State (Session 29)
 
 ### Status: True 3D renderer with full visual parity to pseudo-3D mode
 Game boots, loads, runs gameplay loop in state 4. **Two rendering modes** toggled with V key:
@@ -156,6 +156,7 @@ Game boots, loads, runs gameplay loop in state 4. **Two rendering modes** toggle
 ### Controls
 - **Keyboard**: WASD = drive, Shift = boost, ESC = quit
 - **V key**: toggle true 3D rendering mode (chase camera)
+- **T key**: cycle through 37 tracks (loads track geometry in 3D mode)
 - **M key**: toggle 3D model viewer (turntable view)
 - **N/P keys**: next/previous vehicle model (in model viewer)
 - **Gamepad**: Left stick = steer, RT/LT = gas/brake, A or RB = boost
@@ -164,7 +165,7 @@ Game boots, loads, runs gameplay loop in state 4. **Two rendering modes** toggle
 1. **recomp_0000.c**: extern g_tick_110e0_count, sub_000165F0 entry/ESP traces, sub_00015570 vtable guard, sub_0003D9E0 #if 0, **sub_000636D0 #if 0**, jump table→C switch (replace_all), state traces, exit path traces, case 3 traces
 2. **recomp_0002.c**: #if 0 around sub_00135040, sub_00135240
 3. **recomp_0003.c**: extern g_tick_110e0_count, flag clear, ESP+callee-saved save/restore, game loop traces
-4. **recomp_0004.c**: #if 0 around sub_001CFDD0, sub_001BEFF0, sub_001C1670, sub_001C1740, sub_001C66F0
+4. **recomp_0004.c**: #if 0 around sub_001CFDD0, sub_001BEFF0, sub_001C1670, sub_001C1740, sub_001C66F0; vtable guards in sub_001B4170, sub_001B41F0, sub_001AEE20
 5. **recomp_0005.c**: #if 0 around 35 functions
 6. **recomp_0006.c**: #if 0 around sub_001FE1E0, sub_00221F20
 7. **recomp_0007.c**: #if 0 around sub_00244C51, sub_00249B7C, sub_00249B9C
