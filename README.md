@@ -123,20 +123,18 @@ Through reverse engineering during this project, we've documented several previo
 
 ## Technical Deep Dives
 
-Detailed documentation on the major subsystems (stubs — to be filled in):
+### Burnout 3-Specific Documentation
 
 | Topic | Description | Doc |
 |-------|-------------|-----|
-| **Xbox Memory Layout** | 64 MB reproduction with CreateFileMapping, mirror views, NV2A regions | [docs/technical/memory-layout.md](docs/technical/memory-layout.md) |
-| **Static Recompilation** | x86→C lifting, register model, stack simulation, flag emulation | [docs/technical/static-recomp.md](docs/technical/static-recomp.md) |
-| **Indirect Call Dispatch** | RECOMP_ICALL, vtable guards, garbage pointer detection | [docs/technical/indirect-calls.md](docs/technical/indirect-calls.md) |
-| **D3D8→D3D11 Translation** | COM vtable emulation, fixed-function shaders, render states | [docs/technical/d3d-translation.md](docs/technical/d3d-translation.md) |
-| **Xbox Kernel Replacement** | 147 kernel imports, file I/O, threading, memory management | [docs/technical/kernel-replacement.md](docs/technical/kernel-replacement.md) |
 | **RenderWare Engine** | Criterion's custom RW 3.7 fork, binary stream format, world/texture pipeline | [docs/technical/renderware.md](docs/technical/renderware.md) |
 | **Track Geometry Pipeline** | streamed.dat parsing, triangle strip conversion, texture mapping | [docs/technical/track-geometry.md](docs/technical/track-geometry.md) |
 | **Vehicle Model Pipeline** | BGV format, packed normals, LOD system, draw call extraction | [docs/technical/vehicle-models.md](docs/technical/vehicle-models.md) |
 | **Game State Machine** | Boot sequence, state transitions, load queue, gameplay tick | [docs/technical/game-states.md](docs/technical/game-states.md) |
-| **Lessons Learned** | What worked, what didn't, and what we'd do differently | [docs/technical/lessons-learned.md](docs/technical/lessons-learned.md) |
+
+### Generic Xbox Static Recomp Documentation
+
+For the recompilation pipeline, register model, memory layout, ICALL dispatch, D3D translation, kernel replacement, and lessons learned, see the **[xboxrecomp](https://github.com/sp00nznet/xboxrecomp)** toolkit repository — the generic tools and documentation that power this project.
 
 ## Target Game
 
@@ -165,13 +163,12 @@ burnout3/
 │   ├── screenshots/          # Progress screenshots
 │   ├── formats/              # Reverse-engineered file format docs
 │   └── technical/            # Deep dive technical documentation
-├── tools/                    # Analysis & recompilation toolchain
+├── tools/                    # Toolchain (also in github.com/sp00nznet/xboxrecomp)
 │   ├── xbe_parser/           # XBE file parser
 │   ├── disasm/               # Disassembly and function detection
 │   ├── func_id/              # Function identification (RW, CRT, vtable)
 │   ├── recomp/               # x86→C static recompiler
-│   ├── asset_tools/          # Asset extraction & conversion
-│   └── dump_*.py             # Format analysis scripts
+│   └── dump_*.py             # Burnout 3 format analysis scripts
 ├── src/                      # Runtime source code
 │   ├── kernel/               # Xbox kernel → Win32 (147 imports)
 │   ├── d3d/                  # D3D8 → D3D11 translation layer
