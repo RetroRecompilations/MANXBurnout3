@@ -302,6 +302,37 @@ ISO: D:\recomp\xbox\Burnout 3 - Takedown (USA).iso
     Event data at 0x44D160:
       +0x00=5(type?), +0x1C=55(aggressive), +0x30=70, +0x44=48
 
+36. Road Rage Mode:
+    Timer at 0x411BF8 counts down (same as other race modes)
+    Boost at 0x40FD7C: 5-100 range (lower than Burning Lap's 1400+)
+    B8 briefly = 4 at race start, then stays 5 during gameplay
+    Race control: E0=1, E8=0xFFFFFFFF (unlimited laps?)
+
+37. Takedown Tracking:
+    Career totals (CUMULATIVE, not per-race):
+      0x44D14C: gold takedowns (was 5, went to 7 after Road Rage)
+      0x44D154: silver takedowns (3)
+      0x44D150: bronze takedowns (1)
+      0x44D160: 5 (unclear - possibly a category)
+      0x5502A8: total career takedowns (9 = 5+3+1)
+    Per-AI-car damage state:
+      Base: 0x410600, stride: 0xF0 (240 bytes per car)
+      +0x04: frame/tick counter (40, 41, 25, 63 — different per car)
+      +0x50: hit/damage count (all jumped 2->7 simultaneously = +5)
+      +0x94/+0x98: (2, 3) on all cars — takedown type flags?
+    Other increment candidates:
+      0x40B33C: 10->11 (+1) — possibly per-race takedown counter
+      0x557A64: 5->6 (+1) — event counter?
+      0x4D0038: 1->3 (+2) — game event counter (vtable neighbors)
+
+38. AI Car State Block (0x410600):
+    4 AI cars visible, stride 0xF0 (240 bytes each)
+    Car 0: base 0x410600
+    Car 1: base 0x4106F0
+    Car 2: base 0x4107E0 (approx)
+    Car 3: base 0x4108D0 (approx)
+    Contains: tick counter, hit count, damage state, takedown flags
+
 35. Track Loading Evidence:
     Load queue at 0x4AEF00+ shows track files loaded:
       tracks/US/C2_V1/enviro.dat (Downtown)
