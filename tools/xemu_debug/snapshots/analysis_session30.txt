@@ -275,10 +275,40 @@ ISO: D:\recomp\xbox\Burnout 3 - Takedown (USA).iso
       +0x0C: value (21, 22, 21, 23, 72 — IDs?)
       Each racer entry is 0x30 (48) bytes
 
-32. Max Speed Cap is Dynamic:
-    0x40FD7C fluctuates during gameplay: observed 99.9, 85.4, 78.2, 91.4
-    Changes based on game conditions (drafting? boost? car state?)
-    NOT a fixed per-car value as initially assumed
+32. 0x40FD7C is Boost/Performance Meter (NOT max speed cap):
+    Observed values: 99.9 (normal), 1461-1889 (during Burning Lap with boost)
+    Climbs steadily during aggressive driving (near-misses, oncoming, rubbing)
+    In Burning Lap: went from 1461 → 1889 over 30 seconds of aggressive driving
+    NOT a fixed per-car max speed — it's a cumulative boost/performance value
+
+33. Burning Lap Mode:
+    Solo time trial, 2 laps, countdown timer
+    B8 stays at 5 (not crash mode)
+    Race control block identical structure to regular race
+    +0x3C = 29 (checkpoint count, was 24 for regular race track)
+    +0xF4 = 5 (race parameter, was 22 for regular race)
+    +0xDC = current lap (2), +0xE8 = total laps (2)
+    Standings array (0x550520) is STALE from previous race in solo mode
+    Track: tracks/US/C3_V1/enviro.dat (Waterfront)
+    Car speed ~50-72 game units/s at full boost
+
+34. Scoring System Summary:
+    Display buffer at 0x5566E0-0x556720 (rewritten per results screen):
+      Burnout Points: +0x14=aggressive, +0x1C=driving, +0x20=subtotal,
+                      +0x24=total, +0x28=target (10000 for car unlock)
+      Takedowns:      +0x00=total, +0x04=target (15 for car unlock)
+    Score breakdown at 0x463C80 (persistent):
+      +0x04=category_count, +0x24=aggressive, +0x2C=driving_skills
+    Event data at 0x44D160:
+      +0x00=5(type?), +0x1C=55(aggressive), +0x30=70, +0x44=48
+
+35. Track Loading Evidence:
+    Load queue at 0x4AEF00+ shows track files loaded:
+      tracks/US/C2_V1/enviro.dat (Downtown)
+      tracks/US/C3_V1/enviro.dat (Waterfront)
+      tracks/US/C5_V1/enviro.dat (seen in S30)
+    Track env pointer (0x464018) = Xbox contiguous RAM address
+    Track table at 0x464014+ has chunk size/offset pairs
 
 == Updated Implications for Recomp ==
 
