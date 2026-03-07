@@ -249,6 +249,37 @@ ISO: D:\recomp\xbox\Burnout 3 - Takedown (USA).iso
     Stays at 0.0 during regular races!
     The regular race timer must be stored elsewhere
 
+31. Race Data Structure (CONFIRMED):
+    Race Timer:     0x411BF8  (float, countdown in seconds)
+    Current Lap:    0x411BDC  (uint32, 1-based)
+    Current Lap 2:  0x411B30  (uint32, duplicate/backup)
+    Player Position: 0x550520  (uint32, 1=1st, 6=last)
+    Standings:      0x550524  (uint32 array, car IDs in position order)
+    Player Car ID:  8         (6th of 6 in test race)
+
+    Race Control Block at 0x411B00:
+      +0x20: active flag (1)
+      +0x2C: fluctuating value (AI-related?)
+      +0x30: current lap (matches +0xDC)
+      +0x34: 1 (flag)
+      +0x3C: 24 (checkpoint count?)
+      +0xD8: 23 (constant)
+      +0xDC: current lap
+      +0xE0: 5 (race type?)
+      +0xF4: 22 (integer timer/counter)
+      +0xF8: countdown timer (float)
+
+    Racer Table at 0x550300 (stride 0x30 per racer):
+      +0x04: value (10, 2, 2, 19, 8 — racer-specific)
+      +0x08: value (16, 6, 3, 20, 18 — racer-specific)
+      +0x0C: value (21, 22, 21, 23, 72 — IDs?)
+      Each racer entry is 0x30 (48) bytes
+
+32. Max Speed Cap is Dynamic:
+    0x40FD7C fluctuates during gameplay: observed 99.9, 85.4, 78.2, 91.4
+    Changes based on game conditions (drafting? boost? car state?)
+    NOT a fixed per-car value as initially assumed
+
 == Updated Implications for Recomp ==
 
 1. Our B8==4 check for gameplay is WRONG for regular races (B8 stays 5)
@@ -257,3 +288,6 @@ ISO: D:\recomp\xbox\Burnout 3 - Takedown (USA).iso
 3. Track env IS loaded (0xA837C000) but in Xbox contiguous RAM we can't reach
 4. The crash physics parts system at 0x5492B0 is fully functional
 5. 0x4D53AC distinguishes race modes (1=race, 2=crash)
+6. Race timer is countdown (0x411BF8), not elapsed — resets each lap
+7. Player position at 0x550520, standings table at 0x550524+
+8. Player is car ID 8 in the standings array
