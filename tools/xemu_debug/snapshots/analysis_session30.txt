@@ -1,0 +1,161 @@
+xemu Debug Session 30 Analysis
+===============================
+
+Date: 2026-03-06
+Game: Burnout 3: Takedown (USA) in xemu 0.8.131
+ISO: D:\recomp\xbox\Burnout 3 - Takedown (USA).iso
+
+== Key Discoveries ==
+
+1. sub_000636D0 is INPUT NORMALIZATION, not physics
+   - Reads raw integer input accumulators:
+     0x4D652C = throttle (integer, e.g. 640)
+     0x4D6530 = steering (integer, e.g. 480)
+   - Uses timing delta: 0x4AE1FC = 0.0167 (1/60s)
+   - Multiplies by screen constants: 0x557870=640.0, 0x5592C8=480.0
+   - WRITES normalized float results to vel_ptr+8 and vel_ptr+C
+   - vel_ptr = car_object+0x1B4 = 0x466DF0
+   - vel_ptr+8 = 1.0 (full throttle), vel_ptr+C = 0.933 (steering)
+
+2. Car object at 0x557880 is a COLOR/MATERIAL PALETTE
+   - Contains values in 0.0-1.0 range (RGB-like)
+   - Does NOT change during gameplay
+   - NOT the runtime car physics object
+
+3. Real physics body is NOT at 0x5FFF00
+   - 0x5FFF00 is all zeros in xemu (our recomp fabricated this)
+   - The real physics is deep in the game's object hierarchy
+
+4. Game Manager Object
+   - Pointer at 0x4AED9C = 0x3F9040
+   - +0x00: vtable at 0x3AAD78 (state machine function table)
+   - +0x40: 0x1E59000 (large heap alloc, possibly game world)
+   - +0x48: 0x3C0800 (sub-object)
+   - +0x6C: 0x83EEE200 (Xbox contiguous RAM, GPU/D3D)
+
+5. Load Queue (0x4AEDDC)
+   Files loaded during session:
+   - Data/Global.txd
+   - Data/GlobalUs.bin
+   - Data/HeadUs.bin
+   - pveh/vlist.bin
+   - Tracks/tlist.bin
+   - Data/Frontend.txd
+   - tracks/US/C5_V1/enviro.dat
+   - tracks/US/C5_V1/static.dat
+   - pveh/COMP/CAR3.bgv
+   - pveh/COMP/CAR2.bgv
+   - tracks/US/C3_V1/enviro.dat
+
+6. sub_000110E0 (frame pump)
+   - Only direct memory ref: 0x4AED9C (game manager ptr)
+   - Everything else accessed via pointer dereferences
+   - Operates through the game manager hierarchy
+
+7. Game State Area (0x4D53B0-0x4D53C0)
+   - 0x4D53B4 = 5 (could be a state value)
+   - 0x4D53B8 = 5
+   - 0x4D53BC = 1
+   - 0x4D53BE = 0 (our "game state" byte)
+   - 0x4D53C0 = float (22.35...) NOT an integer state
+
+8. Xbox Kernel addresses
+   - Idle loop: 0x002CD8E5 / 0x8001B030
+   - D3D device NOT at 0x4A2340 (NULL in xemu)
+   - NV2A GPU registers at 0xFD000000
+
+== Active Gameplay Findings (Crash Junction) ==
+
+9. Car World Transform Matrix at 0x4D6850:
+   [-0.8457  -0.1901  -0.4986   0.0000]
+   [ 0.0000   0.9344  -0.3563   0.0000]
+   [-0.5336   0.3014   0.7902   0.0000]
+   [1271.50  -53.75   146.72    1.0000]
+   This is a proper 4x4 world matrix with rotation and position!
+
+10. Camera/Viewport at 0x4D9180-0x4D9240:
+    - 0x4D9160: FOV = 60.0
+    - 0x4D9190: viewport height = 480.0
+    - 0x4D9194: near clip = 0.001
+    - 0x4D9198: camera world X = 12619.06
+    - 0x4D919C: camera world Y = -1439.40
+    - 0x4D91A0: camera world Z = 1928.95
+    - 0x4D9200: screen width = 640.0
+    - 0x4D9204: screen height = 480.0
+
+11. View Matrix at 0x4D6200:
+    Row 0: [0.646, -0.055, -0.113]
+    Row 1: [-0.008, -0.950, -0.015]
+    Row 2: [-0.577, -0.483, -0.994]
+    Position: (-344, 481, 791)
+
+12. Car Physics Parts Array at 0x5492B0-0x549800:
+    17+ copies of the same 4x4 matrix (80 bytes stride)
+    All at position (1271.50, -53.75, 146.72) with identical rotation
+    This is a per-body-part transform array (crash junction has breakable cars)
+    Each entry is 80 bytes: 64B matrix + 16B metadata
+
+13. AI/Traffic Car Transforms:
+    0x40FC90: (1131.05, 93.34, 590.84)
+    0x40FDC0: (1131.50, 97.15, 595.22)
+    0x40FEF0: (1131.05, 97.17, 590.18)
+    These are clustered around the same position - the target traffic
+
+14. Changed Memory Pages (47 of 1520 total):
+    Most active: 0x4DB000-0x4E0000 (1600+ bytes each)
+    Also active: 0x4D9000, 0x549000, 0x40F000, 0x4D6000, 0x35E000
+    The 0x4DB-4E0 region is likely the physics simulation particle buffer
+
+15. RW Camera Pointer:
+    0x4D5370 = 0x4D45D0 during gameplay (was 0x4D4008 in menus)
+    The pointer changes when entering a race
+
+== Implications for Recomp ==
+
+1. Our fake physics body at 0x5FFF00 is completely wrong - the real game
+   stores input in vel_ptr+8/+C and physics state elsewhere in the object graph
+
+2. sub_000636D0 output (vel_ptr+8, +C) feeds into the real physics engine
+   which integrates position/velocity/heading
+
+3. The game manager at 0x3F9040 is the key entry point to find all game state
+
+4. Car world matrix is at 0x4D6850 - could write our position here for rendering
+
+5. Camera viewport/frustum is at 0x4D9180 area - matches RenderWare camera struct
+
+6. Physics parts array at 0x549000 area has per-body-part transforms
+
+7. The 0x4DB000-0x4E0000 region is the hot physics simulation area
+
+== Speed and Vehicle Tuning (Confirmed) ==
+
+16. Car Speed at 0x40FB18:
+    Confirmed: increases smoothly 28→49 during acceleration
+    Game units per second (internal speed value)
+
+17. Max Speed Cap at 0x40FD7C:
+    Constant 99.9 during race — the car's top speed limit
+
+18. Race Timer at 0x40FB20:
+    Elapsed time in seconds (152.9 observed)
+
+19. Vehicle Tuning Table at 0x40F800-0x40F990:
+    0x40F804: 500.0 (max speed parameter)
+    0x40F808-0x40F814: acceleration rates (0.01, 0.04, 0.02, 0.015)
+    0x40F818-0x40F83C: friction/grip (0.4-1.0 range)
+    0x40F880-0x40F89C: tire parameters (99.0, 100.0)
+    0x40F8B0-0x40F8B4: distance thresholds (800, 1500)
+    0x40F8D0-0x40F8D4: more thresholds (800, 5000)
+    0x40F8F0-0x40F8F4: yet more (1000, 2500)
+    0x40F910-0x40F914: steering/gear (6.0, 22.0)
+    0x40F928-0x40F92C: LOD distances (5000, 10000)
+    0x40F940-0x40F944: physics distances (700, 4000)
+    0x40F970-0x40F974: view distances (100, 5000)
+    All values are floats, organized in parameter pairs/groups
+
+20. Car Runtime State (0x40FA80-0x40FE00):
+    Multiple pointers to sub-objects at 0x7Fxxxx (heap allocations)
+    0x40FAB0-0x40FAF4: pointers to car components
+    0x40FCA0: 0x6319B0 → vehicle model/mesh data?
+    0x40FD60-0x40FD74: more component pointers
