@@ -18,6 +18,7 @@ The script polls (halt/read/continue) so expect some slowdown.
 """
 
 import os
+import socket
 import sys
 import time
 import struct
@@ -206,27 +207,55 @@ def main():
 
             else:
                 # Polling mode: halt, read state, resume
-                client.halt()
-                time.sleep(0.03)
+                try:
+                    client.halt()
+                    time.sleep(0.1)  # Give CPU time to fully stop
+
+                    # Drain any pending data
+                    client.sock.settimeout(0.3)
+                    try:
+                        client.sock.recv(4096)
+                    except socket.timeout:
+                        pass
+                    client.sock.settimeout(5.0)
+                except Exception as e:
+                    log_and_print(log_file, f"[{ts}] halt error: {e}")
+                    time.sleep(1)
+                    iteration += 1
+                    continue
 
                 # Read outer state
-                outer_state = client.read_memory(OUTER_STATE_ADDR, 1)[0]
+                try:
+                    outer_state = client.read_memory(OUTER_STATE_ADDR, 1)[0]
+                except Exception as e:
+                    log_and_print(log_file, f"[{ts}] read error: {e}")
+                    try:
+                        client.continue_execution()
+                    except Exception:
+                        pass
+                    time.sleep(1)
+                    iteration += 1
+                    continue
 
-                # Find game manager base
-                game_mgr = read_game_manager_base(client)
-
-                # Read inner phase
-                inner_phase = read_inner_phase(client, game_mgr) if game_mgr else -1
-
-                # Read other pointers
-                rw_world = client.read_u32(RW_WORLD_PTR)
-                cam_menu = client.read_u32(CAMERA_PTR_MENU)
-                cam_game = client.read_u32(CAMERA_PTR_GAME)
-                track_env = client.read_u32(TRACK_ENV)
-
-                # Read registers for context
-                regs = client.read_registers()
-                eip = regs.get('eip', 0)
+                # Read all state in one block
+                try:
+                    game_mgr = read_game_manager_base(client)
+                    inner_phase = read_inner_phase(client, game_mgr) if game_mgr else -1
+                    rw_world = client.read_u32(RW_WORLD_PTR)
+                    cam_menu = client.read_u32(CAMERA_PTR_MENU)
+                    cam_game = client.read_u32(CAMERA_PTR_GAME)
+                    track_env = client.read_u32(TRACK_ENV)
+                    regs = client.read_registers()
+                    eip = regs.get('eip', 0)
+                except Exception as e:
+                    log_and_print(log_file, f"[{ts}] bulk read error: {e}")
+                    try:
+                        client.continue_execution()
+                    except Exception:
+                        pass
+                    time.sleep(1)
+                    iteration += 1
+                    continue
 
                 # Detect changes
                 changed = False
