@@ -32,6 +32,7 @@ static struct {
     bool initialized;
     bool show_settings;
     bool show_debug;
+    bool show_about;
     int  settings_tab;  /* 0=General, 1=Display, 2=Input, 3=Audio */
 
     /* Settings values */
@@ -46,8 +47,9 @@ static struct {
     bool  show_wireframe;
     float camera_fov;
     float camera_distance;
+    bool  skip_intro;
 } g_menu = {
-    false, false, false, 0,
+    false, false, false, false, 0,
     /* defaults */
     1,     /* 1280x960 */
     true,  /* vsync */
@@ -60,6 +62,7 @@ static struct {
     false, /* wireframe */
     60.0f, /* fov */
     12.0f, /* camera distance */
+    true,  /* skip_intro */
 };
 
 /* ================================================================
@@ -138,9 +141,9 @@ static void apply_theme(void)
  * ================================================================ */
 
 static const char *settings_tabs[] = {
-    "General", "Display", "Input", "Audio", "About"
+    "General", "Display", "Input", "Audio"
 };
-static const int num_tabs = 5;
+static const int num_tabs = 4;
 
 static void draw_settings_sidebar(void)
 {
@@ -298,9 +301,30 @@ static void draw_settings_menu(void)
         case 1: draw_tab_display(); break;
         case 2: draw_tab_input();   break;
         case 3: draw_tab_audio();   break;
-        case 4: draw_tab_about();   break;
         }
         ImGui::EndChild();
+    }
+    ImGui::End();
+}
+
+/* ================================================================
+ * About window (standalone)
+ * ================================================================ */
+
+static void draw_about_window(void)
+{
+    UINT w = d3d8_GetBackbufferWidth();
+    UINT h = d3d8_GetBackbufferHeight();
+
+    float aw = 420.0f, ah = 340.0f;
+    ImGui::SetNextWindowPos(ImVec2((w - aw) * 0.5f, (h - ah) * 0.5f), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(aw, ah), ImGuiCond_Always);
+
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove
+                           | ImGuiWindowFlags_NoCollapse;
+
+    if (ImGui::Begin("About", &g_menu.show_about, flags)) {
+        draw_tab_about();
     }
     ImGui::End();
 }
@@ -317,6 +341,10 @@ static void draw_debug_menu(void)
     ImGui::SetNextWindowSize(ImVec2(350.0f, 500.0f), ImGuiCond_FirstUseEver);
 
     if (ImGui::Begin("Debug", &g_menu.show_debug)) {
+        if (ImGui::CollapsingHeader("Boot", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::Checkbox("Skip intro videos", &g_menu.skip_intro);
+        }
+
         if (ImGui::CollapsingHeader("Game State", ImGuiTreeNodeFlags_DefaultOpen)) {
             /* Read from Xbox memory */
             /* g_xbox_mem_offset declared at file scope */
@@ -432,7 +460,7 @@ extern "C" void menu_gui_shutdown(void)
 extern "C" int menu_gui_wndproc(void *hwnd, unsigned int msg, unsigned long long wparam, long long lparam)
 {
     if (!g_menu.initialized) return 0;
-    if (!g_menu.show_settings && !g_menu.show_debug) return 0;
+    if (!g_menu.show_settings && !g_menu.show_debug && !g_menu.show_about) return 0;
 
     LRESULT result = ImGui_ImplWin32_WndProcHandler((HWND)hwnd, msg, (WPARAM)wparam, (LPARAM)lparam);
     return result ? 1 : 0;
@@ -441,7 +469,7 @@ extern "C" int menu_gui_wndproc(void *hwnd, unsigned int msg, unsigned long long
 extern "C" void menu_gui_begin_frame(void)
 {
     if (!g_menu.initialized) return;
-    if (!g_menu.show_settings && !g_menu.show_debug) return;
+    if (!g_menu.show_settings && !g_menu.show_debug && !g_menu.show_about) return;
 
     ImGui_ImplDX11_NewFrame();
     ImGui_ImplWin32_NewFrame();
@@ -451,11 +479,12 @@ extern "C" void menu_gui_begin_frame(void)
 extern "C" void menu_gui_render(void)
 {
     if (!g_menu.initialized) return;
-    if (!g_menu.show_settings && !g_menu.show_debug) return;
+    if (!g_menu.show_settings && !g_menu.show_debug && !g_menu.show_about) return;
 
     /* Draw active menus */
     if (g_menu.show_settings) draw_settings_menu();
     if (g_menu.show_debug)    draw_debug_menu();
+    if (g_menu.show_about)    draw_about_window();
 
     /* Render */
     ImGui::Render();
@@ -486,5 +515,15 @@ extern "C" void menu_gui_toggle_debug(void)
 
 extern "C" int menu_gui_is_active(void)
 {
-    return (g_menu.show_settings || g_menu.show_debug) ? 1 : 0;
+    return (g_menu.show_settings || g_menu.show_debug || g_menu.show_about) ? 1 : 0;
+}
+
+extern "C" void menu_gui_show_about(void)
+{
+    g_menu.show_about = !g_menu.show_about;
+}
+
+extern "C" int menu_gui_skip_intro(void)
+{
+    return g_menu.skip_intro ? 1 : 0;
 }

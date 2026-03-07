@@ -723,10 +723,16 @@ static LONG WINAPI crash_veh(PEXCEPTION_POINTERS info)
 #define DEFAULT_XBE_PATH "Burnout 3 Takedown\\default.xbe"
 
 /* Window properties */
-#define WINDOW_TITLE "Burnout 3: Takedown (Recompiled)"
+#define WINDOW_TITLE "Burnout 3: Takedown Recompiled"
 #define WINDOW_CLASS "Burnout3RecompClass"
 #define DEFAULT_WIDTH 640
 #define DEFAULT_HEIGHT 480
+
+/* Win32 menu bar item IDs */
+#define IDM_FILE_QUIT       1001
+#define IDM_CONFIG_SETTINGS 1002
+#define IDM_CONFIG_DEBUG    1003
+#define IDM_HELP_ABOUT      1004
 
 /* ── Global state ───────────────────────────────────────────── */
 
@@ -987,20 +993,15 @@ static void load_track_by_index(int index)
             if (region) {
                 code = region + 3; /* skip "XX\" */
             }
-            char title[128];
+            /* Track info logged to stderr, title bar stays clean */
             if (region && code) {
                 char reg[4] = {0}, cod[8] = {0};
                 memcpy(reg, region, 2);
                 for (int i = 0; i < 7 && code[i] && code[i] != '\\' && code[i] != '/'; i++)
                     cod[i] = code[i];
-                snprintf(title, sizeof(title),
-                         "Burnout 3 (Track %d/%d: %s %s)",
-                         index + 1, g_track_count, reg, cod);
-            } else {
-                snprintf(title, sizeof(title),
-                         "Burnout 3 (Track %d/%d)", index + 1, g_track_count);
+                fprintf(stderr, "  [TRACK] Loaded track %d/%d: %s %s\n",
+                        index + 1, g_track_count, reg, cod);
             }
-            SetWindowTextA(g_hwnd, title);
         }
     } else {
         fprintf(stderr, "  [TRACK] Failed to load track\n");
@@ -1207,6 +1208,25 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg,
         }
         return 0;
 
+    case WM_COMMAND:
+        switch (LOWORD(wParam)) {
+        case IDM_FILE_QUIT:
+            g_running = FALSE;
+            PostQuitMessage(0);
+            return 0;
+        case IDM_CONFIG_SETTINGS:
+            menu_gui_toggle_settings();
+            return 0;
+        case IDM_CONFIG_DEBUG:
+            menu_gui_toggle_debug();
+            return 0;
+        case IDM_HELP_ABOUT:
+            menu_gui_toggle_settings();
+            menu_gui_show_about();
+            return 0;
+        }
+        break;
+
     case WM_SIZE:
         /* TODO: Notify D3D layer of resize */
         return 0;
@@ -1215,11 +1235,33 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg,
     return DefWindowProcA(hwnd, msg, wParam, lParam);
 }
 
+static HMENU create_menu_bar(void)
+{
+    HMENU menubar = CreateMenu();
+    HMENU file_menu = CreatePopupMenu();
+    HMENU config_menu = CreatePopupMenu();
+    HMENU help_menu = CreatePopupMenu();
+
+    AppendMenuA(file_menu, MF_STRING, IDM_FILE_QUIT, "Quit\tESC");
+
+    AppendMenuA(config_menu, MF_STRING, IDM_CONFIG_SETTINGS, "Settings...\tF1");
+    AppendMenuA(config_menu, MF_STRING, IDM_CONFIG_DEBUG, "Debug...\tF2");
+
+    AppendMenuA(help_menu, MF_STRING, IDM_HELP_ABOUT, "About...");
+
+    AppendMenuA(menubar, MF_POPUP, (UINT_PTR)file_menu, "File");
+    AppendMenuA(menubar, MF_POPUP, (UINT_PTR)config_menu, "Config");
+    AppendMenuA(menubar, MF_POPUP, (UINT_PTR)help_menu, "About");
+
+    return menubar;
+}
+
 static HWND create_window(HINSTANCE hInstance, int width, int height)
 {
     WNDCLASSEXA wc = {0};
     RECT rect;
     HWND hwnd;
+    HMENU menubar;
 
     wc.cbSize = sizeof(wc);
     wc.style = CS_HREDRAW | CS_VREDRAW;
@@ -1230,19 +1272,21 @@ static HWND create_window(HINSTANCE hInstance, int width, int height)
     wc.lpszClassName = WINDOW_CLASS;
     RegisterClassExA(&wc);
 
-    /* Adjust window size for client area */
+    menubar = create_menu_bar();
+
+    /* Adjust window size for client area (TRUE = has menu) */
     rect.left = 0;
     rect.top = 0;
     rect.right = width;
     rect.bottom = height;
-    AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
+    AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, TRUE);
 
     hwnd = CreateWindowExA(
         0, WINDOW_CLASS, WINDOW_TITLE,
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT,
         rect.right - rect.left, rect.bottom - rect.top,
-        NULL, NULL, hInstance, NULL
+        NULL, menubar, hInstance, NULL
     );
 
     if (hwnd) {
@@ -4477,7 +4521,7 @@ void game_frame_pump(void)
             extern ptrdiff_t g_xbox_mem_offset;
             #define XMEM32(a) (*(volatile uint32_t*)((uintptr_t)(a) + g_xbox_mem_offset))
             #define XMEMF(a)  (*(volatile float*)((uintptr_t)(a) + g_xbox_mem_offset))
-            char title[256];
+            /* Game state read for debug menu (title bar no longer updated) */
             /* Read physics state for display */
             uint32_t phys_ptr = XMEM32(0x557880 + 0x1B4);
             float spd = 0.0f, hdg = 0.0f;
@@ -4494,22 +4538,10 @@ void game_frame_pump(void)
             uint32_t score = XMEM32(0x5FFD24);
             float mult = XMEMF(0x5FFD28);
             if (mult < 1.0f) mult = 1.0f;
-            if (g_show_3d_model && g_vehicle_count > 0) {
-                snprintf(title, sizeof(title),
-                    "Burnout 3 | MODEL: %s/Car%d (%d/%d) %uv %ut | Arrows=orbit +/-=zoom Space=spin N/P=car M=back",
-                    g_vehicle_list[g_vehicle_index].class_name,
-                    g_vehicle_list[g_vehicle_index].car_number,
-                    g_vehicle_index + 1, g_vehicle_count,
-                    g_car_model.vertex_count,
-                    g_car_model.index_count / 3);
-            } else {
-                snprintf(title, sizeof(title),
-                    "Burnout 3 | spd=%.0f dist=%um TD=%u boost=%.0f%% score=%u x%.1f",
-                    spd, dist_m, takedowns, boost, score, mult);
-            }
+            (void)spd; (void)hdg; (void)px; (void)py;
+            (void)takedowns; (void)boost; (void)dist_m; (void)score; (void)mult;
             #undef XMEM32
             #undef XMEMF
-            SetWindowTextA(g_hwnd, title);
         }
     }
 }

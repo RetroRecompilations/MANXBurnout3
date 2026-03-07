@@ -27,6 +27,7 @@
 #pragma comment(lib, "ole32.lib")
 
 #include "video_player.h"
+#include "menu_gui.h"
 #include "d3d/d3d8_xbox.h"
 #include "d3d/d3d8_internal.h"
 
@@ -581,6 +582,15 @@ int boot_get_phase(void)
 
 int boot_update(float dt, int skip)
 {
+    /* Skip intro videos if debug option is set — go straight to gameplay */
+    if (menu_gui_skip_intro() && g_boot.phase < BOOT_PHASE_GAMEPLAY) {
+        video_close();
+        g_boot.phase = BOOT_PHASE_GAMEPLAY;
+        g_boot.video_started = 0;
+        fprintf(stderr, "  [BOOT] Skipping intro (debug option) -> Gameplay\n");
+        return g_boot.phase;
+    }
+
     switch (g_boot.phase) {
     case BOOT_PHASE_CRITERION_LOGO:
     case BOOT_PHASE_EA_LOGO:

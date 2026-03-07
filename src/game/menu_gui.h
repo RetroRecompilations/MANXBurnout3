@@ -37,6 +37,12 @@ void menu_gui_toggle_debug(void);
 /* Returns 1 if any menu is currently visible (blocks game input) */
 int menu_gui_is_active(void);
 
+/* Open settings and jump to the About tab */
+void menu_gui_show_about(void);
+
+/* Returns 1 if user has chosen to skip intro videos */
+int menu_gui_skip_intro(void);
+
 #ifdef __cplusplus
 }
 #endif
