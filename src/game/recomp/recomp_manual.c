@@ -1703,6 +1703,46 @@ void sub_000110E0(void)
             MEMF(phys_ptr + 0x18) = heading;
             MEMF(phys_ptr + 0x1C) = speed;
 
+            /* ── Write to real Xbox addresses (discovered via xemu Session 30) ──
+             * The original game stores physics state at these addresses during
+             * gameplay. Writing here lets any original recompiled code that reads
+             * these addresses (rendering, AI, camera, HUD) work correctly.
+             *
+             * Car speed:        0x40FB18 (float, game units/s)
+             * Race timer:       0x40FB20 (float, elapsed seconds)
+             * Max speed cap:    0x40FD7C (float, top speed limit)
+             * Car world matrix: 0x4D6850 (4x4 float, row-major)
+             * Camera position:  0x4D9198/9C/A0 (float3 world XYZ)
+             */
+            MEMF(0x40FB18) = speed;
+
+            /* Build 4x4 world transform matrix at 0x4D6850.
+             * Row 0-2: rotation from heading, Row 3: position + w=1 */
+            {
+                float sh = sinf(heading);
+                float ch = cosf(heading);
+                /* Row 0: right vector */
+                MEMF(0x4D6850 + 0x00) = ch;
+                MEMF(0x4D6850 + 0x04) = 0.0f;
+                MEMF(0x4D6850 + 0x08) = -sh;
+                MEMF(0x4D6850 + 0x0C) = 0.0f;
+                /* Row 1: up vector */
+                MEMF(0x4D6850 + 0x10) = 0.0f;
+                MEMF(0x4D6850 + 0x14) = 1.0f;
+                MEMF(0x4D6850 + 0x18) = 0.0f;
+                MEMF(0x4D6850 + 0x1C) = 0.0f;
+                /* Row 2: forward vector */
+                MEMF(0x4D6850 + 0x20) = sh;
+                MEMF(0x4D6850 + 0x24) = 0.0f;
+                MEMF(0x4D6850 + 0x28) = ch;
+                MEMF(0x4D6850 + 0x2C) = 0.0f;
+                /* Row 3: position + w=1 */
+                MEMF(0x4D6850 + 0x30) = new_px;
+                MEMF(0x4D6850 + 0x34) = 0.0f;  /* Y (height) */
+                MEMF(0x4D6850 + 0x38) = new_py;
+                MEMF(0x4D6850 + 0x3C) = 1.0f;
+            }
+
             /* ── Traffic obstacles ──────────────────────────────────── */
             /* Obstacle array at 0x5FFE00: 12 slots × 16 bytes each.
              * Layout per slot: +0 pos_x (float), +4 pos_y (float),
