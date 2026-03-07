@@ -104,8 +104,12 @@ void d3d8_PresentFrame(void)
  * Internal accessors (used by d3d8_resources/shaders/states)
  * ================================================================ */
 
+IDirect3DDevice8    *d3d8_GetDevice(void) { return &g_device; }
 ID3D11Device        *d3d8_GetD3D11Device(void) { return g_device_state.d3d11_device; }
 ID3D11DeviceContext *d3d8_GetD3D11Context(void) { return g_device_state.d3d11_context; }
+IDXGISwapChain      *d3d8_GetSwapChain(void) { return g_device_state.swap_chain; }
+ID3D11RenderTargetView *d3d8_GetDefaultRTV(void) { return g_device_state.default_rtv; }
+HWND                 d3d8_GetHWND(void) { return g_device_state.hwnd; }
 UINT                 d3d8_GetBackbufferWidth(void) { return g_device_state.width; }
 UINT                 d3d8_GetBackbufferHeight(void) { return g_device_state.height; }
 const DWORD         *d3d8_GetRenderStates(void) { return g_device_state.render_states; }

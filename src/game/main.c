@@ -41,6 +41,10 @@
 /* 3D renderer */
 #include "rw_renderer.h"
 
+/* Video player (boot sequence) */
+#include "video_player.h"
+#include "menu_gui.h"
+
 /* Recompiled code */
 #include "recomp/gen/recomp_funcs.h"
 
@@ -1181,6 +1185,10 @@ static BOOL load_xbe(const char *path)
 static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg,
                                      WPARAM wParam, LPARAM lParam)
 {
+    /* Let ImGui handle input when menus are open */
+    if (menu_gui_wndproc(hwnd, msg, (unsigned long long)wParam, (long long)lParam))
+        return 0;
+
     switch (msg) {
     case WM_CLOSE:
         g_running = FALSE;
@@ -1188,9 +1196,14 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg,
         return 0;
 
     case WM_KEYDOWN:
+        if (wParam == VK_F1) { menu_gui_toggle_settings(); return 0; }
+        if (wParam == VK_F2) { menu_gui_toggle_debug(); return 0; }
         if (wParam == VK_ESCAPE) {
-            g_running = FALSE;
-            PostQuitMessage(0);
+            if (!menu_gui_is_active()) {
+                g_running = FALSE;
+                PostQuitMessage(0);
+            }
+            /* When menu is active, ESC is handled by ImGui (closes window) */
         }
         return 0;
 
@@ -1454,6 +1467,22 @@ static BOOL init_subsystems(void)
     xbox_DirectSoundCreate(NULL, &g_dsound, NULL);
     xbox_InputInit();
 
+    /* 6. Video player (for boot sequence) */
+    fprintf(stderr, "[6/6] Video player...\n");
+    if (video_init() == 0) {
+        fprintf(stderr, "  Video player initialized (Media Foundation)\n");
+    } else {
+        fprintf(stderr, "  WARNING: Video player failed to init (boot videos will be skipped)\n");
+    }
+
+    /* 7. ImGui menu system */
+    fprintf(stderr, "[7/7] Menu system...\n");
+    if (menu_gui_init() == 0) {
+        fprintf(stderr, "  Menu system initialized (ImGui)\n");
+    } else {
+        fprintf(stderr, "  WARNING: Menu system failed to init\n");
+    }
+
     fprintf(stderr, "=== All subsystems initialized ===\n\n");
     return TRUE;
 }
@@ -1463,6 +1492,8 @@ static void shutdown_subsystems(void)
     fprintf(stderr, "\n=== Shutting down ===\n");
 
     /* Reverse order of initialization */
+    menu_gui_shutdown();
+    video_shutdown();
     rw_renderer_shutdown();
     if (g_paint_tex) { g_paint_tex->lpVtbl->Release(g_paint_tex); g_paint_tex = NULL; }
     if (g_road_tex) { g_road_tex->lpVtbl->Release(g_road_tex); g_road_tex = NULL; }
@@ -2092,8 +2123,59 @@ void game_frame_pump(void)
         #undef XINP_MEM8
     }
 
-    /* Render frame with car indicator */
+    /* ── Boot sequence / gameplay rendering ── */
     if (g_d3d_device) {
+        int boot_phase = boot_get_phase();
+
+        /* During boot video phases, render video fullscreen instead of gameplay */
+        if (boot_phase < BOOT_PHASE_GAMEPLAY) {
+            /* Real wall-clock dt for accurate video playback speed */
+            static LARGE_INTEGER boot_last_time = {0};
+            static LARGE_INTEGER boot_freq = {0};
+            float boot_dt;
+            if (boot_freq.QuadPart == 0) {
+                QueryPerformanceFrequency(&boot_freq);
+                QueryPerformanceCounter(&boot_last_time);
+            }
+            {
+                LARGE_INTEGER now;
+                QueryPerformanceCounter(&now);
+                boot_dt = (float)(now.QuadPart - boot_last_time.QuadPart) / (float)boot_freq.QuadPart;
+                boot_last_time = now;
+                if (boot_dt > 0.1f) boot_dt = 0.1f; /* clamp to avoid jumps */
+            }
+
+            /* Check for skip input (any key or gamepad button) */
+            int skip = 0;
+            if (GetAsyncKeyState(VK_RETURN) & 0x8000) skip = 1;
+            if (GetAsyncKeyState(VK_SPACE) & 0x8000) skip = 1;
+            if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) skip = 1;
+            /* Gamepad: any button */
+            {
+                XINPUT_STATE xstate;
+                if (XInputGetState(0, &xstate) == ERROR_SUCCESS) {
+                    if (xstate.Gamepad.wButtons) skip = 1;
+                    if (xstate.Gamepad.bLeftTrigger > 30) skip = 1;
+                    if (xstate.Gamepad.bRightTrigger > 30) skip = 1;
+                }
+            }
+
+            boot_update(boot_dt, skip);
+
+            g_d3d_device->lpVtbl->BeginScene(g_d3d_device);
+            g_d3d_device->lpVtbl->Clear(g_d3d_device, 0, NULL,
+                D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER,
+                0xFF000000, /* Black background for videos */
+                1.0f, 0);
+            boot_render();
+            g_d3d_device->lpVtbl->EndScene(g_d3d_device);
+            menu_gui_begin_frame();
+            menu_gui_render();
+            g_d3d_device->lpVtbl->Present(g_d3d_device, NULL, NULL, NULL, NULL);
+            return; /* Skip gameplay rendering during boot */
+        }
+
+        /* === Gameplay rendering === */
         g_d3d_device->lpVtbl->BeginScene(g_d3d_device);
         g_d3d_device->lpVtbl->Clear(g_d3d_device, 0, NULL,
             D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER,
@@ -4374,6 +4456,8 @@ void game_frame_pump(void)
 #endif  /* end of #if 0 pseudo-3D removed */
 
         g_d3d_device->lpVtbl->EndScene(g_d3d_device);
+        menu_gui_begin_frame();
+        menu_gui_render();
         g_d3d_device->lpVtbl->Present(g_d3d_device, NULL, NULL, NULL, NULL);
         {
             extern volatile uint32_t g_present_count;
@@ -4465,6 +4549,8 @@ static void game_loop(void)
                 0xFF001030,  /* Dark blue */
                 1.0f, 0);
             g_d3d_device->lpVtbl->EndScene(g_d3d_device);
+            menu_gui_begin_frame();
+            menu_gui_render();
             g_d3d_device->lpVtbl->Present(g_d3d_device, NULL, NULL, NULL, NULL);
         }
         Sleep(16); /* ~60 FPS target */

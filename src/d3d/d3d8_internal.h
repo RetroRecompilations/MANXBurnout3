@@ -18,8 +18,12 @@
  * D3D11 device accessors (implemented in d3d8_device.c)
  * ================================================================ */
 
+IDirect3DDevice8    *d3d8_GetDevice(void);
 ID3D11Device        *d3d8_GetD3D11Device(void);
 ID3D11DeviceContext *d3d8_GetD3D11Context(void);
+IDXGISwapChain      *d3d8_GetSwapChain(void);
+ID3D11RenderTargetView *d3d8_GetDefaultRTV(void);
+HWND                 d3d8_GetHWND(void);
 UINT                 d3d8_GetBackbufferWidth(void);
 UINT                 d3d8_GetBackbufferHeight(void);
 

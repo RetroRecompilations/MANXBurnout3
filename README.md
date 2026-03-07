@@ -4,7 +4,8 @@
 
 This project takes the original Xbox binary of **Burnout 3: Takedown** (2004, Criterion Games / EA) — all 2.73 MB of raw x86 machine code — and translates every single function into native C code that compiles and runs on modern Windows. No emulation. No interpreter. Just 22,097 recompiled functions executing as a native x86-64 binary.
 
-![Textured track geometry from Bangkok (AS/C1_V1)](docs/screenshots/textured_track.png)
+![Title intro video playing through the boot sequence](docs/screenshots/title.png)
+![Intro video - racing footage from the original XMV videos](docs/screenshots/introvideo.png)
 
 ## Why This Is Interesting
 
@@ -26,6 +27,7 @@ The technical challenges are fascinating: translating x86 to x86-64 with a globa
 **Phase 5: Integration** — The game boots, loads all resources, enters its main gameplay loop, and renders textured 3D track geometry from the actual game files.
 
 ### What's Working
+- **Boot video sequence** — Criterion logo, EA logo, and title intro videos play from pre-converted XMV→MP4 files via Media Foundation
 - Full game boot sequence through the original RenderWare engine init
 - Game state machine: loading → init → gameplay (state 4) — running continuously
 - **37 playable tracks** loaded from game files with fly camera and drive mode
@@ -180,6 +182,7 @@ burnout3/
 │       ├── txd_loader.c/h    # RenderWare texture dictionaries
 │       ├── track_loader.c/h  # Track geometry from streamed.dat
 │       ├── static_textures.c/h # Track textures from static.dat
+│       ├── video_player.c/h  # Boot video playback (MF Source Reader)
 │       ├── rw_renderer.c/h   # 3D renderer (camera, scene, HUD)
 │       ├── rw_math.h         # Matrix math utilities
 │       └── recomp/           # Recompiled code infrastructure
