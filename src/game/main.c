@@ -1941,9 +1941,12 @@ void game_frame_pump(void)
         #define XINP_MEMF(a)  (*(volatile float*)((uintptr_t)(a) + g_xbox_mem_offset))
         #define XINP_MEM8(a)  (*(volatile uint8_t*)((uintptr_t)(a) + g_xbox_mem_offset))
 
-        /* Only inject input when game is in state 4 (gameplay) */
+        /* Only inject input during gameplay. xemu Session 31: B8 stays at 5
+         * during regular races (only crash mode sets B8=4). The real gameplay
+         * indicator is camera ptr: 0x4D45D0 = gameplay, 0x4D4008 = menus. */
         uint32_t game_st = XINP_MEM32(0x4D53B8);
-        if (game_st == 4) {
+        uint32_t cam_ptr = XINP_MEM32(0x4D5370);
+        if (game_st == 4 || cam_ptr == 0x4D45D0) {
             int32_t throttle = 0;  /* positive = gas */
             int32_t steering = 0;  /* positive = right */
 

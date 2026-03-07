@@ -1579,9 +1579,14 @@ void sub_000110E0(void)
      *   +0x18: heading (radians, 0=up/north, CW positive)
      *   +0x1C: speed (scalar forward speed, units/s)
      *
-     * Only integrate during gameplay (state 4) to avoid garbage from
-     * uninitialized accumulators during loading states. */
-    if (MEM32(0x4D53B8) == 4) {
+     * Only integrate during gameplay to avoid garbage from
+     * uninitialized accumulators during loading states.
+     *
+     * xemu Session 31 discovery: B8 stays at 5 during regular races!
+     * Only crash mode sets B8=4. The real gameplay indicator is the
+     * camera pointer: 0x4D45D0 = gameplay, 0x4D4008 = menus/loading.
+     * Accept either B8==4 (crash mode) or camera==gameplay. */
+    if (MEM32(0x4D53B8) == 4 || MEM32(0x4D5370) == 0x4D45D0) {
         uint32_t phys_ptr = MEM32(0x557880 + 0x1B4);
         if (phys_ptr > 0x100 && phys_ptr < 0x3FFFFFF) {
             /* Initialize physics on first state-4 entry, and respawn
@@ -1741,6 +1746,42 @@ void sub_000110E0(void)
                 MEMF(0x4D6850 + 0x34) = 0.0f;  /* Y (height) */
                 MEMF(0x4D6850 + 0x38) = new_py;
                 MEMF(0x4D6850 + 0x3C) = 1.0f;
+            }
+
+            /* ── Write race state to real Xbox addresses ──
+             * Discovered in xemu Session 31. These addresses are read by the
+             * original game's HUD, AI, and camera systems. */
+            {
+                static float _race_timer = 120.0f;
+                static uint32_t _lap = 1;
+                static float _last_lap_y = 0.0f;
+                static uint32_t _takedowns_this_race = 0;
+
+                /* Race countdown timer (real game uses countdown, not elapsed) */
+                _race_timer -= dt;
+                if (_race_timer < 0.0f) _race_timer = 0.0f;
+                MEMF(0x411BF8) = _race_timer;
+
+                /* Lap tracking: increment when player crosses origin in +Y dir */
+                if (new_py > 0.0f && _last_lap_y <= 0.0f && speed > 5.0f) {
+                    _lap++;
+                    _race_timer = 120.0f; /* reset timer on lap */
+                }
+                _last_lap_y = new_py;
+                MEM32(0x411BDC) = _lap;
+                MEM32(0x411B30) = _lap; /* duplicate */
+
+                /* Player position (always 1st in our solo mode) */
+                MEM32(0x550520) = 1;
+
+                /* Boost meter: mirror our 0-100 value to the real address.
+                 * Real game uses much larger values (100-1800+), so scale up. */
+                MEMF(0x40FD7C) = MEMF(0x5FFD08) * 10.0f;
+
+                /* Race control block sane defaults */
+                MEM32(0x411B20) = 1;    /* active flag */
+                MEM32(0x411BE0) = 5;    /* race type */
+                MEM32(0x411BE8) = 2;    /* total laps */
             }
 
             /* ── Traffic obstacles ──────────────────────────────────── */

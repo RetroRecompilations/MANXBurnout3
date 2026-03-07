@@ -34,10 +34,10 @@ The goal is to translate the original x86 Xbox code into a native Windows execut
 - Addresses are always shown as hex with 0x prefix (e.g., 0x001D2807)
 - Xbox kernel function names use their original Xbox names with `xbox_` prefix when reimplemented
 
-## Current Work State (Session 30)
+## Current Work State (Session 31)
 
-### Status: True 3D renderer with full visual parity to pseudo-3D mode
-Game boots, loads, runs gameplay loop in state 4. **Two rendering modes** toggled with V key:
+### Status: xemu-verified gameplay state + race data writeback
+Game boots, loads, runs gameplay loop. **Two rendering modes** toggled with V key:
 1. **Pseudo-3D** (default): OutRun-style 2.5D rendering (unchanged from Session 21)
 2. **True 3D** (V key): Full 3D world-space rendering with chase camera, time-of-day cycling, roadside scenery, tunnels, night stars, rain weather, and 3D vehicle models.
 
@@ -139,22 +139,34 @@ Game boots, loads, runs gameplay loop in state 4. **Two rendering modes** toggle
 - Difficulty ramps with distance (traffic density + speed)
 - AI braking when player approaches from behind in same lane
 
+### Session 31: xemu Live Debugging (NEW)
+- **xemu GDB stub analysis**: Connected to running game via GDB RSP on port 1234
+- **Game state machine discovered**: 0x4D53B8 values: 5=menus AND regular racing, 4=crash mode only, 7=loading
+- **Camera pointer as gameplay indicator**: 0x4D5370 == 0x4D45D0 means gameplay (any mode), 0x4D4008 means menus
+- **Gameplay detection FIXED**: Changed `B8==4` check to `B8==4 || cam_ptr==0x4D45D0` in both recomp_manual.c and main.c
+- **Race state writeback**: Countdown timer (0x411BF8), lap counter (0x411BDC/0x411B30), position (0x550520)
+- **Boost meter**: 0x40FD7C is performance accumulator (100→1800+ range), NOT max speed cap
+- **Race control block**: 0x411B20 active flag, 0x411BE0 race type, 0x411BE8 total laps
+- **Standings array**: Player position at 0x550520, car IDs at 0x550524+ (player = car 8)
+- **Career takedowns**: Cumulative gold/silver/bronze at 0x44D14C/0x44D154/0x44D150
+- **AI car state**: Base 0x410600, stride 0xF0 (240 bytes/car), contains hit/damage counts
+- **Crash physics**: Parts array at 0x5492B0 (80B stride), spreads 3000+ units during explosions
+- **Scoring display**: 0x5566E0-0x556708, rewritten per results screen
+- Tested across 5 game modes: menus, crash junction, regular race, burning lap, road rage
+
 ### Session 30 Progress
 - Created **xboxrecomp** toolkit repo (https://github.com/sp00nznet/xboxrecomp)
   - 4 toolchain modules (xbe_parser, disasm, func_id, recomp)
   - 6 pipeline guides, 8 technical deep dives, 3 format references
   - 3 runtime templates (recomp_types.h, xbox_memory.h, kernel_stubs.h)
   - 15,196 lines across 55 files
-- Cleaned up burnout3 repo: moved generic docs to xboxrecomp, updated README
-- Committed Session 29 ICALL fixes (centralized early-out, vtable guards)
 
 ### Next Steps
 1. Decode .btv vehicle texture format and apply to 3D models
-2. Performance: batch same-texture objects to reduce draw calls (~1400 → ~160)
-3. Write camera matrices to Xbox VAs for recompiled code compatibility
-4. Connect original RW rendering pipeline to D3D11 backend
-5. Long-term: fix the real physics world initialization
-6. Long-term: audio playback (DirectSound → XAudio2)
+2. Populate AI car state block (0x410600) for traffic interactions
+3. Connect original RW rendering pipeline to D3D11 backend
+4. Long-term: fix the real physics world initialization
+5. Long-term: audio playback (DirectSound → XAudio2)
 
 ### Key Input Addresses
 - Accumulators: 0x4D652C (throttle), 0x4D6530 (steering) - written by game_frame_pump()
