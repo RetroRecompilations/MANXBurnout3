@@ -159,3 +159,101 @@ ISO: D:\recomp\xbox\Burnout 3 - Takedown (USA).iso
     0x40FAB0-0x40FAF4: pointers to car components
     0x40FCA0: 0x6319B0 → vehicle model/mesh data?
     0x40FD60-0x40FD74: more component pointers
+
+== Session 31 Discoveries (Menu States & Crash Mode) ==
+
+21. Game State Machine (B8 values):
+    B8=5: Frontend AND regular racing (NOT just menus!)
+    B8=4: Crash mode only (crash junctions)
+    B8=7: Loading/transition (brief, camera resets to 0x4D4008, model goes NULL)
+    B4 mirrors B8 in all observations
+    0x4D53AC: Changes between modes (1=racing, 2=crash results)
+    The B8 state does NOT change during menu navigation (stays 5 throughout)
+    IMPORTANT: Our recomp checked B8==4 for gameplay — this is WRONG for races!
+
+22. Camera Pointer Behavior (0x4D5370):
+    0x4D4008 = menu/loading camera
+    0x4D45D0 = gameplay camera (both race AND crash mode)
+    Switches to 0x4D45D0 when entering any gameplay
+    Stays at 0x4D45D0 during crash replay screens (B8=5 but still gameplay cam)
+
+23. Game Manager Object (0x3F9040) in detail:
+    +0x00: vtable (0x3AAD78)
+    +0x04: 1 (active flag?)
+    +0x0C: 5 (mirrors B8 initial state, may not update during races)
+    +0x10: 8, +0x14: 16, +0x18: 24 (fixed stride values)
+    +0x1C: self-pointer to +0x30 sub-object (0x3F9070)
+    +0x20: 1
+    +0x24: 0x000214B0 (callback/function ptr?)
+    +0x30: vtable (0x3AAD58, different from main vtable)
+    +0x38: back-pointer to self (0x3F9040)
+    +0x40: world/scene ptr (changes: 0x052DB000 menu, 0x00F70800 crash mode)
+    +0x48: streaming buffer ptr (increments by 0x20000 every ~6s)
+    +0x50: 1
+    +0x58: 16
+    +0x5C: 2
+    +0x60: object count? (64 in menu, 88 in crash mode)
+    +0x6C: GPU/kernel address (0x83EEE200 / 0x83E6D0E0)
+    +0x84: frame counter or ID
+
+24. Vehicle Identity in Crash Mode:
+    Crash event loads TSPC (Traffic Special) class car, not player's race car
+    Load queue shows: pveh/COMP/CAR1.bgv (geometry) + pveh/HEVY/CAR27.btv (texture)
+    Model ptr at 0x40FCA0 cycles during crash replay (different view angles)
+    Max speed cap differs: 78.0-78.2 (crash TSPC) vs 99.9 (race COMP)
+
+25. Tuning Table is GLOBAL (0x40F800):
+    Values are IDENTICAL between Compact Type 1 and Compact Type 2
+    max_speed_param=500, accel=(0.01,0.04,0.02,0.015), grip=(0.6,0.4,0.5,0.8)
+    Per-vehicle differences come from max speed cap at 0x40FD7C, not tuning table
+    Additional params discovered:
+      +0x028-0x044: 8 more floats (0.8, 0.8, 1.0, 1.0, 0.8, 0.8, 0.8, 1.2)
+      +0x088-0x08C: tire params (0.12, 0.12)
+
+26. Track Environment Pointer (0x464018):
+    In crash mode: 0xA837C000 — Xbox contiguous RAM (physical mapping)
+    NOT null! The track IS loaded, just in Xbox physical memory we can't map
+    Track file size table at 0x464020: pairs of (chunk_size, cumulative_offset)
+    at stride 0x10 — this is the track streaming index
+
+27. Crash Physics Data:
+    Parts Array (0x5492B0): 80-byte stride per part (64B matrix + 16B metadata)
+    During crash: parts spread to 3000+ units (car exploding)
+    Max observed spread: 3096.8 units at t=24.5s
+    Speed during crash approach: 0 → 59.0 units/s in ~7 seconds
+    Impact drops speed: 59 → 14.7 instantly
+
+28. Physics Simulation Buffer (0x4DB000):
+    Regular pattern: 0x20-byte stride entries
+    Each entry: (pad, 1.0, 1.0, pad, distance_val, velocity_val, ~0.93, 1.0)
+    The ~0.93 value is likely a friction/restitution coefficient
+    80+ active float values in first 512 bytes
+
+29. Game State Block Details (0x4D5300-0x4D5400):
+    0x4D5310-0x4D531C: lookup tables (0x03020100, 0x07060504 repeating)
+    0x4D5328: 1 (flag)
+    0x4D5344: frame/screen counter (42→75 during session)
+    0x4D534C: counter (40→3 changed)
+    0x4D5360: 1 (during gameplay)
+    0x4D5388: 23 (constant across all states)
+    0x4D5394: 3
+    0x4D53AC: mode flag (1=race, 2=crash results)
+    0x4D53C0: 22.352 (timing constant)
+    0x4D53D0: 5.0 (fixed)
+    0x4D53DC: 36.0, 0x4D53E0: 480.0 (screen dimensions)
+    0x4D53E8: 60.0, 0x4D53EC: 420.0 (viewport)
+    0x4D53F0: 123.7237 (computed value)
+
+30. Race Timer (0x40FB20) is crash-mode only:
+    Shows elapsed time during crash junctions (152.9 observed in S30)
+    Stays at 0.0 during regular races!
+    The regular race timer must be stored elsewhere
+
+== Updated Implications for Recomp ==
+
+1. Our B8==4 check for gameplay is WRONG for regular races (B8 stays 5)
+   Need to use camera pointer (0x4D45D0) or speed > 0 as gameplay indicator
+2. Tuning table is global — per-vehicle tuning comes from max speed cap only
+3. Track env IS loaded (0xA837C000) but in Xbox contiguous RAM we can't reach
+4. The crash physics parts system at 0x5492B0 is fully functional
+5. 0x4D53AC distinguishes race modes (1=race, 2=crash)
