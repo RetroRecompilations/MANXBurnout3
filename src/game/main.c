@@ -1527,6 +1527,12 @@ static BOOL init_subsystems(void)
         fprintf(stderr, "  WARNING: Menu system failed to init\n");
     }
 
+    /* 8. RW display driver function pointer table */
+    {
+        extern void rw_init_display_driver_table(void);
+        rw_init_display_driver_table();
+    }
+
     fprintf(stderr, "=== All subsystems initialized ===\n\n");
     return TRUE;
 }

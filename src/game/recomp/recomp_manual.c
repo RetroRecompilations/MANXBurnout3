@@ -21,6 +21,72 @@ void recomp_icall_fail_log(uint32_t va)
 /* D3D8 frame pump (implemented in d3d8_device.c) */
 extern void d3d8_PresentFrame(void);
 
+/**
+ * RW Display Driver Function Pointer Table
+ *
+ * The RW engine stores display driver callbacks in a table at 0x7592E8.
+ * sub_001DE190 normally populates this during RW device initialization,
+ * but it's called via ICALL which may fail. We populate it manually.
+ *
+ * Table layout: MEM32(0x7592E8 + id*4) = function_address
+ * Known entries (from xemu analysis session 33):
+ *   ID 0x01 -> 0x001DD910  (display open/start)
+ *   ID 0x0A -> 0x001DDAE0  (display reset)
+ *   ID 0x14 -> 0x001DDAF0  (render callback) [0x759338]
+ *   ID 0x0C -> 0x001DCF50  (viewport setup)  [0x759318]
+ *   ...and ~25 more entries
+ */
+void rw_init_display_driver_table(void)
+{
+    /* Populate the function pointer table that sub_001DE190 would fill.
+     * Base address: 0x7592E8 (confirmed: 0x7592E8 + 0x14*4 = 0x759338) */
+    static const struct { uint32_t id; uint32_t func; } entries[] = {
+        { 0x01, 0x1DD910 },   /* display start */
+        { 0x0A, 0x1DDAE0 },   /* display reset */
+        { 0x15, 0x1DE0F0 },   /* device close */
+        { 0x14, 0x1DDAF0 },   /* render callback (the key one!) */
+        { 0x02, 0x1E48E0 },
+        { 0x03, 0x1E4BE0 },
+        { 0x07, 0x1E5870 },
+        { 0x06, 0x1E52C0 },
+        { 0x05, 0x1DCDC0 },
+        { 0x04, 0x1DCB70 },
+        { 0x09, 0x1E5AE0 },
+        { 0x08, 0x1DCF40 },
+        { 0x0F, 0x1DBDE0 },
+        { 0x10, 0x1DC150 },
+        { 0x17, 0x1DC2D0 },
+        { 0x18, 0x1DC360 },
+        { 0x0E, 0x1E7AD0 },
+        { 0x0D, 0x1E7AB0 },
+        { 0x11, 0x1E7730 },
+        { 0x12, 0x1E7770 },
+        { 0x13, 0x1E7750 },
+        { 0x0B, 0x1E7B10 },
+        { 0x0C, 0x1DCF50 },   /* viewport setup */
+        { 0x19, 0x1E6710 },
+        { 0x1B, 0x1E67B0 },
+        { 0x1A, 0x1E6A60 },
+        { 0x1C, 0x1DCEB0 },
+    };
+    uint32_t table_base = 0x7592E8;
+    int i;
+
+    /* First fill with default handler (0x24B90 = RW default stub) */
+    for (i = 0; i < 0x20; i++) {
+        MEM32(table_base + i * 4) = 0x24B90;
+    }
+
+    /* Then populate known entries */
+    for (i = 0; i < (int)(sizeof(entries)/sizeof(entries[0])); i++) {
+        MEM32(table_base + entries[i].id * 4) = entries[i].func;
+    }
+
+    fprintf(stderr, "  [RW] Display driver table populated at 0x%08X\n", table_base);
+    fprintf(stderr, "  [RW]   [0x759338] (render cb) = 0x%08X\n", MEM32(0x759338));
+    fprintf(stderr, "  [RW]   [0x759318] (viewport)  = 0x%08X\n", MEM32(0x759318));
+}
+
 /* Track spawn state exported from rw_renderer.c */
 extern float g_track_spawn_x;
 extern float g_track_spawn_z;
@@ -29,6 +95,10 @@ extern int   g_track_mode;
 
 /* RW linked-list traversal with loop limit */
 void sub_001FE1E0(void);
+
+void sub_00351090(void);
+void sub_00351490(void);
+void sub_00350C10(void);
 
 /* Forward declarations for manually implemented functions */
 void sub_0002DDF0(void);
@@ -62,6 +132,7 @@ void sub_001D91F0(void);
 void sub_001D9230(void);
 /* sub_00157680 removed from manual overrides - uses gen code with relocated PrgData */
 void sub_001D9280(void);
+void sub_001DDAF0(void);
 void sub_001D9290(void);
 void sub_001D92A0(void);
 void sub_001D92EF(void);
@@ -218,6 +289,8 @@ static const struct {
     { 0x001D7D50u, (recomp_func_t)sub_001D7D50 },
     { 0x001D7D70u, (recomp_func_t)sub_001D7D70 },
     { 0x001D9700u, (recomp_func_t)sub_001D9700 },
+    { 0x001DDAF0u, (recomp_func_t)sub_001DDAF0 },
+    { 0x00351090u, (recomp_func_t)sub_00351090 },
     { 0x001D9A50u, (recomp_func_t)sub_001D9A50 },
     { 0x001D9AF0u, (recomp_func_t)sub_001D9AF0 },
     { 0x001D9BC0u, (recomp_func_t)sub_001D9BC0 },
@@ -1287,18 +1360,180 @@ void sub_001D93AF(void)
  */
 volatile uint32_t g_present_count = 0;
 void sub_001D9420(void) {
-    /* RW driver "Present" - forward to our D3D11 backend.
-     * Original: passes device context through sub_001DE7E0.
-     * We intercept here and call our frame pump directly. */
+    /* RW driver "Present" - calls sub_001DE7E0 (display submit).
+     * sub_001DE7E0 does:
+     *   1. sub_001E1CD0 (RW render queue management)
+     *   2. ICALL([0x759338]) = RW render callback with 3 params
+     *
+     * Lazy-init: RW init code runs after our early init and clears the
+     * function pointer table. Re-populate it on first call if needed. */
+    static int table_inited = 0;
+
     g_present_count++;
-    if (g_present_count <= 5 || (g_present_count % 1000) == 0)
-        fprintf(stderr, "  [PRESENT] sub_001D9420 called #%u\n", g_present_count);
+
+    /* Lazy-init the RW display driver function pointer table */
+    if (!table_inited || MEM32(0x759338) == 0) {
+        rw_init_display_driver_table();
+        table_inited = 1;
+    }
+
+    if (g_present_count <= 5 || (g_present_count % 1000) == 0) {
+        uint32_t rw_cb = MEM32(0x759338);
+        fprintf(stderr, "  [PRESENT] #%u: [0x759338]=0x%08X esi_param=0x%08X\n",
+                g_present_count, rw_cb, MEM32(esp + 4));
+    }
+
+    /* Call through to real gen code: reads 3 stack params, calls sub_001DE7E0 */
+    eax = MEM32(esp + 0xC);
+    ecx = MEM32(esp + 8);
+    PUSH32(esp, esi);
+    esi = MEM32(esp + 8);
+    edx = MEM32(esi + 0x60);
+    PUSH32(esp, eax);
+    PUSH32(esp, ecx);
+    PUSH32(esp, edx);
+    PUSH32(esp, 0); sub_001DE7E0();
+
+    /* loc_001D9438: cleanup */
+    esp = esp + 0xC;
+    eax = 0;
+    POP32(esp, esi);
+
+    /* Always do our D3D11 Present */
     d3d8_PresentFrame();
+
     esp += 4; return;
 }
 void sub_001D9450(void) { esp += 4; return; }
+
+/*
+ * sub_001DDAF0 - RW display driver render callback
+ *
+ * This is the function pointer stored at [0x759338] = table[0x14].
+ * Called by sub_001DE7E0 via indirect call with 3 params.
+ * Original: drives NV2A GPU rendering for the current frame.
+ *
+ * For now, stub with tracing. This is where we'd hook D3D11 rendering
+ * of the RW scene graph (menus, fonts, 2D elements).
+ */
+void sub_001DDAF0(void)
+{
+    /* Original code from XBE (80 bytes at 0x1DDAF0):
+     *   1. Gamma state management using [0x41AB40]
+     *   2. Call sub_00351090(0) - RW camera begin update / scene render
+     *   3. Return 1
+     *
+     * The gamma calls go to sub_001D7130 (set_gamma) which we skip.
+     * The key call is sub_00351090 which drives the scene render. */
+    static uint32_t call_count = 0;
+    uint32_t param3 = MEM32(esp + 0xC);  /* 3rd param, bit 0 = gamma flag */
+
+    call_count++;
+    if (call_count <= 5 || (call_count % 1000) == 0) {
+        fprintf(stderr, "  [RW-RENDER] sub_001DDAF0 #%u: p3=0x%08X cam=[0x35FB48]=0x%08X\n",
+                call_count, param3, MEM32(0x35FB48));
+    }
+
+    /* Skip gamma logic (sub_001D7130 touches NV2A gamma ramp).
+     * Just set the state variable like the original does. */
+    if (param3 & 1) {
+        if (MEM32(0x41AB40) == 0x80000000u)
+            MEM32(0x41AB40) = 1;
+    } else {
+        if (MEM32(0x41AB40) != 0x80000000u)
+            MEM32(0x41AB40) = 0x80000000u;
+    }
+
+    /* Call sub_00351090(0) - RW camera scene render */
+    PUSH32(esp, 0);
+    PUSH32(esp, 0); sub_00351090();
+
+    eax = 1;
+    esp += 4; return;
+}
 void sub_001D94A0(void) { esp += 4; return; }
 void sub_001D94D0(void) { esp += 4; return; }
+
+/*
+ * sub_00351090 - RW camera scene render (RwCameraShowRaster equivalent)
+ *
+ * Original: 0x00351090 - 0x00351173 (227 bytes)
+ * Source: RenderWare camera update / scene render orchestrator
+ *
+ * Original flow:
+ *   1. esi = [0x35FB48] (RW current camera)
+ *   2. Pre-render hook (sub_00359740) if state flags set
+ *   3. If camera active (flags bit 14):
+ *      a. sub_00351490(0) - begin camera update
+ *      b. sub_00351770(render_list) - RENDER THE SCENE (62K NV2A function)
+ *      c. sub_00350C10(swap_flag) - end camera update + show raster
+ *   4. Increment frame counter at camera+0x2478
+ *   5. Post-render hook if needed
+ *
+ * Our override: skip the NV2A rendering (sub_00351490/sub_00351770/sub_00350C10)
+ * but maintain the state the game expects (frame counter, flags).
+ * The actual D3D11 rendering happens in game_frame_pump() via sub_000110E0.
+ *
+ * Convention: cdecl, 1 param on stack (swap_flag), ret 4
+ */
+extern ptrdiff_t g_xbox_mem_offset;
+
+void sub_00351090(void)
+{
+    uint32_t camera_xbox_va;
+    uint32_t swap_flag;
+    static uint32_t call_count = 0;
+
+    call_count++;
+
+    /* Read RW global camera pointer from [0x35FB48].
+     * This may be a native pointer (from heap alloc) rather than an Xbox VA.
+     * If it's > 0x4000000 (64MB), it's likely a native address that needs
+     * to be converted to Xbox VA by subtracting g_xbox_mem_offset. */
+    camera_xbox_va = MEM32(0x35FB48);
+
+    swap_flag = MEM32(esp + 4);
+
+    /* Check if camera pointer is a native address and convert */
+    if (camera_xbox_va > 0x4000000 && g_xbox_mem_offset > 0) {
+        /* The RW code stored a native pointer - convert back to Xbox VA */
+        uint32_t maybe_xbox_va = (uint32_t)(camera_xbox_va - (uint32_t)g_xbox_mem_offset);
+        if (maybe_xbox_va < 0x4000000) {
+            camera_xbox_va = maybe_xbox_va;
+        }
+    }
+
+    if (call_count <= 5 || (call_count % 500) == 0) {
+        fprintf(stderr, "  [RW-CAM] sub_00351090 #%u: raw=0x%08X xbox_va=0x%08X swap=%u",
+                call_count, MEM32(0x35FB48), camera_xbox_va, swap_flag);
+        if (camera_xbox_va > 0x10000 && camera_xbox_va < 0x4000000) {
+            uint32_t flags = MEM32(camera_xbox_va + 8);
+            uint32_t frame = MEM32(camera_xbox_va + 0x2478);
+            uint32_t s1 = MEM32(camera_xbox_va + 0x8D4);
+            uint32_t s2 = MEM32(camera_xbox_va + 0x8D8);
+            fprintf(stderr, " flags=0x%08X frame=%u s1=%u s2=%u",
+                    flags, frame, s1, s2);
+        }
+        fprintf(stderr, "\n");
+    }
+
+    /* Maintain camera state: increment frame counter if camera is valid */
+    if (camera_xbox_va > 0x10000 && camera_xbox_va < 0x4000000) {
+        uint32_t flags = MEM32(camera_xbox_va + 8);
+
+        /* Check camera active flag (bit 14 = 0x4000) */
+        if (flags & 0x4000) {
+            MEM32(camera_xbox_va + 0x2478) = MEM32(camera_xbox_va + 0x2478) + 1;
+        }
+    }
+
+    /* Original uses RET 4 (callee cleans 1 param) */
+    eax = (camera_xbox_va > 0x10000 && camera_xbox_va < 0x4000000)
+          ? MEM32(camera_xbox_va + 0x2478) : 0;
+    esp += 4; /* pop return address */
+    esp += 4; /* clean 1 param (ret 4) */
+    return;
+}
 
 /*
  * sub_001D9510 - RW camera create (rw_core, src/bacamera.c)
@@ -2598,11 +2833,61 @@ void sub_00022660(void)
  * Implicit register params: esi = game object base (0x4D6170), edi = mode (0)
  * Calling convention: cdecl, caller pushes dummy ret addr
  */
+void sub_0002F330(void);
+void sub_00040660(void);
+
 void sub_0003D9E0(void)
 {
-    /* If 3D renderer is active and game is in gameplay state, render 3D scene.
-     * The actual rendering happens in game_frame_pump() which checks rw_is_3d_mode(). */
-    esp += 4; return; /* pop dummy return address */
+    /* Render orchestrator: called from loc_00016C42 with esi=0x4D6170, edi=0.
+     * Original calls:
+     *   1. sub_0002F330 (render state init, uses ecx=edi, eax=esi)
+     *   2. sub_0034D530 (D3D viewport/camera setup) - SKIP, uses Xbox D3D
+     *   3. sub_00040660 (copies camera/matrix data from RW tables)
+     *
+     * Try calling sub_0002F330 and sub_00040660 with guards.
+     * Skip sub_0034D530 (touches Xbox D3D device). */
+    static uint32_t call_count = 0;
+    call_count++;
+
+    esp = esp - 0x18;  /* Original stack frame */
+
+    /* sub_0002F330: sets render state pointers (ecx=edi, eax=esi) */
+    ecx = edi;
+    eax = esi;
+    PUSH32(esp, 0); sub_0002F330();
+
+    /* Skip sub_0034D530 (D3D viewport setup - needs Xbox D3D device) */
+
+    /* sub_00040660: copies camera/matrix from RW tables */
+    /* Only call if esi looks valid (should be 0x4D6170) */
+    if (esi > 0x10000 && esi < 0x800000) {
+        eax = MEM32(esi + 0x3B0);
+        if (eax > 0x10000 && eax < 0x800000) {
+            edx = MEM32(eax + 0x58);
+            if (edx > 0x10000 && edx < 0x800000) {
+                ecx = MEM32(edx + 0x68);
+                MEM32(esi + 0x9A0) = ecx;
+                edx = MEM32(eax + 0x58);
+                ecx = MEM32(edx + 0x6C);
+                MEM32(esi + 0x9A4) = ecx;
+                MEM32(esi + 0x990) = 0;
+                MEM32(esi + 0x994) = 0;
+                edx = MEM32(eax + 0x78);
+                MEM32(esi + 0x998) = edx;
+                eax = MEM32(eax + 0x7C);
+                edx = esi + 0x500;
+                PUSH32(esp, esi);
+                PUSH32(esp, 0); sub_00040660();
+
+                if (call_count <= 3)
+                    fprintf(stderr, "  [RENDER] sub_0003D9E0 #%u: esi=0x%08X, called 0002F330+00040660\n",
+                            call_count, esi);
+            }
+        }
+    }
+
+    esp = esp + 0x18;
+    esp += 4; return;
 }
 
 /**
