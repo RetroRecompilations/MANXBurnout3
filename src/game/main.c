@@ -485,6 +485,16 @@ static LONG WINAPI crash_veh(PEXCEPTION_POINTERS info)
                     /* Decode failed - fall through to zero page allocation */
                 }
 
+                /* APU MMIO registers: 0xFE800000-0xFE87FFFF (512KB) */
+                if (fault_xbox_va >= 0xFE800000u && fault_xbox_va < 0xFE880000u) {
+                    extern bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
+                                                     uint32_t fault_xbox_va, int is_write);
+                    if (apu_hook_handle_mmio(info->ContextRecord, fault_addr,
+                                             fault_xbox_va, is_write)) {
+                        return EXCEPTION_CONTINUE_EXECUTION;
+                    }
+                }
+
                 /* Framebuffer / push buffer / other GPU memory */
                 static int nv2a_page_count = 0;
                 uintptr_t alloc_base = fault_addr & ~(uintptr_t)0xFFFF; /* 64KB align */
@@ -1547,6 +1557,21 @@ static BOOL init_subsystems(void)
         nv2a_hook_init(g_xbox_mem_offset);
     }
 
+    /* 10. MCPX APU audio emulation (xemu-based register handlers) */
+    {
+        typedef struct MCPXAPUState MCPXAPUState;
+        extern MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr);
+        extern MCPXAPUState *g_apu_state;
+        /* The APU reads voice data from physical RAM (0x00000000-0x03FFFFFF).
+         * Our Xbox RAM is mapped at g_xbox_mem_offset, so the base of physical
+         * RAM is at native address (g_xbox_mem_offset + 0). */
+        uint8_t *phys_ram = (uint8_t *)(uintptr_t)g_xbox_mem_offset;
+        g_apu_state = mcpx_apu_init_standalone(phys_ram);
+        if (g_apu_state) {
+            fprintf(stderr, "[APU] Press U to toggle 440Hz test tone\n");
+        }
+    }
+
     fprintf(stderr, "=== All subsystems initialized ===\n\n");
     return TRUE;
 }
@@ -2169,6 +2194,22 @@ void game_frame_pump(void)
                     nv2a_pb_test_set_active(!nv2a_pb_test_is_active());
                 }
                 g_key_prev = g_key_now;
+            }
+
+            /* U key: play APU test tone (440Hz sine) */
+            {
+                static int u_key_prev = 0;
+                int u_key_now = (GetAsyncKeyState('U') & 0x8000) ? 1 : 0;
+                if (u_key_now && !u_key_prev) {
+                    extern void mcpx_apu_play_test_tone(void *d);
+                    extern void *g_apu_state;
+                    if (g_apu_state) {
+                        mcpx_apu_play_test_tone(g_apu_state);
+                    } else {
+                        fprintf(stderr, "[APU-TEST] No APU state - can't play test tone\n");
+                    }
+                }
+                u_key_prev = u_key_now;
             }
 
             /* Debug: log input state */

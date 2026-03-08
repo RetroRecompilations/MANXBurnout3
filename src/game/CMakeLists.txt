@@ -60,6 +60,7 @@ target_link_libraries(burnout3 PRIVATE
     d3d8_compat
     dsound_compat
     input_compat
+    apu_emu
 )
 
 # System libraries

@@ -24,7 +24,7 @@ The technical challenges are fascinating: translating x86 to x86-64 with a globa
 
 ## Current Status
 
-**Phase 5: Integration** — The game boots, loads all resources, enters its main gameplay loop, and renders textured 3D track geometry from the actual game files.
+**Phase 5: Integration** — The game boots, loads all resources, enters its main gameplay loop, and renders textured 3D track geometry from the actual game files. Audio output pipeline is now functional.
 
 ### What's Working
 - **Boot video sequence** — Criterion logo, EA logo, and title intro videos play from pre-converted XMV→MP4 files via Media Foundation
@@ -33,6 +33,12 @@ The technical challenges are fascinating: translating x86 to x86-64 with a globa
 - **37 playable tracks** loaded from game files with fly camera and drive mode
 - **160 DXT textures per track** loaded from `static.dat` and mapped to geometry
 - **67 vehicle models** across 7 classes (Compact, Coupe, Heavy, etc.)
+- **MCPX APU audio emulation** — xemu's Voice Processor extracted and running standalone
+  - waveOut audio output (48kHz stereo 16-bit, 4-buffer ring)
+  - VP voice processing pipeline (256 voices, ADPCM decode, SGE page tables, envelope/filter)
+  - GP/EP DSP stubbed with direct mixbin passthrough
+  - Test tone generator (U key) confirms end-to-end audio pipeline
+- **NV2A GPU register emulation** — PMC, PBUS, PTIMER, PFB, PCRTC, PRAMDAC, PFIFO, PGRAPH handlers from xemu
 - File loading pipeline reads game resources into Xbox memory space
 - Physics model with heading-based steering and road interaction
 - Keyboard + gamepad input (XInput)
@@ -40,8 +46,8 @@ The technical challenges are fascinating: translating x86 to x86-64 with a globa
 
 ### What's Left
 - [ ] Connect original RenderWare rendering pipeline to our D3D11 backend
+- [ ] Connect game's DirectSound calls to APU voice processor for real audio
 - [ ] Vehicle textures (`.btv` paint variant format)
-- [ ] Audio playback (DirectSound → XAudio2 exists but unused)
 - [ ] Full collision / physics world initialization
 - [ ] Performance optimization (currently ~18 FPS with 1400+ draw calls per track)
 - [ ] Menu system and UI rendering through original code paths
@@ -174,6 +180,7 @@ burnout3/
 ├── src/                      # Runtime source code
 │   ├── kernel/               # Xbox kernel → Win32 (147 imports)
 │   ├── d3d/                  # D3D8 → D3D11 translation layer
+│   ├── apu/                  # MCPX APU audio emulation (from xemu)
 │   ├── audio/                # DirectSound → XAudio2 stubs
 │   ├── input/                # Xbox input → XInput
 │   └── game/                 # Game executable
@@ -221,8 +228,10 @@ bin/burnout3.exe
 | Tab | Sprint (fly mode) |
 | T | Cycle tracks (37 available) |
 | F | Toggle fly/drive mode |
+| U | Toggle 440Hz audio test tone |
 | M | Toggle 3D model viewer |
 | N/P | Next/previous vehicle model |
+| F1/F2 | Settings / Debug menu (ImGui) |
 | ESC | Quit |
 | Gamepad | Left stick steer, RT/LT gas/brake, A/RB boost |
 

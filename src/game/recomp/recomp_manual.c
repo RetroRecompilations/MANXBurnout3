@@ -3523,3 +3523,15 @@ void sub_00011240(void)
 
 /* sub_00157680 removed from manual overrides - gen code used directly now
  * that sub_00159710 implements full pointer relocation for PrgData.bin */
+
+/* =================================================================
+ * RW Software Rasterizer Stubs
+ * These are overlapping entry points into the 162KB RW software
+ * pixel-processing code (0x002CC30D-0x002F3F34). Not needed with
+ * our D3D11 hardware rendering backend.
+ * ================================================================= */
+void sub_002CC30D(void) { /* RW software rasterizer - stubbed */ }
+void sub_002CC851(void) { /* RW software rasterizer - stubbed */ }
+void sub_002CC935(void) { /* RW software rasterizer - stubbed */ }
+void sub_002CC951(void) { /* RW software rasterizer - stubbed */ }
+void sub_002CCB1C(void) { /* RW software rasterizer - stubbed */ }

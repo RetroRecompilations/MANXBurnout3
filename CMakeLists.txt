@@ -27,5 +27,11 @@ add_subdirectory(src/audio)
 # Xbox input → XInput controller abstraction
 add_subdirectory(src/input)
 
+# NV2A GPU emulation (extracted from xemu)
+# Note: nv2a is compiled as part of src/game, no separate CMakeLists
+
+# MCPX APU audio emulation (extracted from xemu)
+add_subdirectory(src/apu)
+
 # ── Recompiled game executable ─────────────────────────────────
 add_subdirectory(src/game)
