@@ -94,8 +94,34 @@ void recomp_icall_fail_log(uint32_t va);
  *  Mask to 32-bit first: Xbox addresses are 32-bit and arithmetic
  *  in the recompiled code can overflow. Without the mask, a 64-bit
  *  uintptr_t cast preserves the overflow bits, landing us 4GB+ past
- *  our mapping and causing access violations. */
-#define XBOX_PTR(addr) ((uintptr_t)(uint32_t)(addr) + g_xbox_mem_offset)
+ *  our mapping and causing access violations.
+ *
+ *  Native pointer detection: RenderWare's internal allocator (and some
+ *  kernel functions) may store native heap pointers in Xbox memory.
+ *  When recompiled code reads these back and uses them as addresses,
+ *  adding g_xbox_mem_offset would cause a double-offset fault. We detect
+ *  this by checking if the address already falls within our mapped
+ *  native region and skip the offset addition in that case.
+ *
+ *  This is safe because Xbox mirror views all alias the same physical
+ *  memory, so a native pointer to any mirror correctly accesses the
+ *  right underlying data. */
+static __forceinline uintptr_t xbox_ptr_resolve(uint32_t addr)
+{
+    /* Fast path: most addresses are Xbox VAs below the mapping base.
+     * The mapped native region spans [offset, offset + 29*64MB).
+     * Any address in this range is already a native pointer and
+     * should NOT have the offset added again. */
+    uint32_t offset32 = (uint32_t)g_xbox_mem_offset;
+    if (offset32 != 0) {
+        uint32_t rel = addr - offset32;  /* wraps if addr < offset32 */
+        if (rel < 0x74000000u) {  /* 29 * 64MB = total mapped region */
+            return (uintptr_t)addr;
+        }
+    }
+    return (uintptr_t)addr + g_xbox_mem_offset;
+}
+#define XBOX_PTR(addr) xbox_ptr_resolve((uint32_t)(addr))
 
 /** Read N bytes from a flat memory address. */
 #define MEM8(addr)   (*(volatile uint8_t  *)XBOX_PTR(addr))
