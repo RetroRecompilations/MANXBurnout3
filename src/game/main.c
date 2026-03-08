@@ -2159,6 +2159,18 @@ void game_frame_pump(void)
                 p_key_prev = p_key_now;
             }
 
+            /* G key: toggle NV2A push buffer test */
+            {
+                static int g_key_prev = 0;
+                int g_key_now = (GetAsyncKeyState('G') & 0x8000) ? 1 : 0;
+                if (g_key_now && !g_key_prev) {
+                    extern int nv2a_pb_test_is_active(void);
+                    extern void nv2a_pb_test_set_active(int active);
+                    nv2a_pb_test_set_active(!nv2a_pb_test_is_active());
+                }
+                g_key_prev = g_key_now;
+            }
+
             /* Debug: log input state */
             {
                 static int _inp_dbg = 0;
@@ -4518,6 +4530,12 @@ void game_frame_pump(void)
             #undef _R_MEM32
         }
 #endif  /* end of #if 0 pseudo-3D removed */
+
+        /* NV2A push buffer test (toggle with G key) */
+        {
+            extern void nv2a_pb_test_frame(void);
+            nv2a_pb_test_frame();
+        }
 
         g_d3d_device->lpVtbl->EndScene(g_d3d_device);
         menu_gui_begin_frame();

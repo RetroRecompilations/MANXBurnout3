@@ -31,6 +31,7 @@ set(NV2A_DIR "${CMAKE_SOURCE_DIR}/src/nv2a")
 set(NV2A_SOURCES
     ${NV2A_DIR}/nv2a_core.c
     ${NV2A_DIR}/nv2a_mmio_hook.c
+    ${NV2A_DIR}/nv2a_pb_test.c
 )
 
 # Game executable sources

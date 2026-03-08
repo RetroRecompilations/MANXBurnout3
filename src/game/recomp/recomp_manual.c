@@ -1053,14 +1053,84 @@ void sub_00249B9C(void)
 }
 
 /**
+ * NV2A push buffer statistics (shared across push buffer functions)
+ */
+static volatile uint32_t g_pb_flush_count = 0;
+static volatile uint32_t g_pb_kick_count = 0;
+static volatile uint32_t g_pb_alloc_count = 0;
+static volatile uint32_t g_pb_total_dwords = 0;
+static volatile uint32_t g_pb_method_count = 0;
+
+/**
+ * nv2a_parse_push_buffer - Parse and log NV2A push buffer commands
+ *
+ * Reads commands from base..write_ptr, decodes the NV2A command format:
+ *   - Increasing methods:     (word & 0xe0030003) == 0
+ *   - Non-increasing methods: (word & 0xe0030003) == 0x40000000
+ *   - Jump:  (word & 3) == 1
+ *   - Call:  (word & 3) == 2
+ *   - Return: word == 0x00020000
+ */
+static void nv2a_parse_push_buffer(uint32_t base, uint32_t write_ptr)
+{
+    if (write_ptr <= base) return;
+
+    uint32_t num_dwords = (write_ptr - base) / 4;
+    g_pb_total_dwords += num_dwords;
+
+    /* Parse commands to count methods */
+    uint32_t pos = base;
+    uint32_t method_count_local = 0;
+    while (pos < write_ptr) {
+        uint32_t word = MEM32(pos);
+        pos += 4;
+
+        if ((word & 0xe0030003) == 0) {
+            /* increasing methods */
+            uint32_t count = (word >> 18) & 0x7ff;
+            uint32_t method = word & 0x1ffc;
+            (void)method;
+            method_count_local += count;
+            pos += count * 4; /* skip data words */
+        } else if ((word & 0xe0030003) == 0x40000000) {
+            /* non-increasing methods */
+            uint32_t count = (word >> 18) & 0x7ff;
+            method_count_local += count;
+            pos += count * 4;
+        } else if ((word & 3) == 1) {
+            /* jump */
+        } else if ((word & 3) == 2) {
+            /* call */
+        } else if (word == 0x00020000) {
+            /* return */
+        } else if (word == 0) {
+            /* NOP / padding */
+        } else {
+            /* unknown command */
+            break;
+        }
+    }
+    g_pb_method_count += method_count_local;
+
+    /* Log periodically */
+    static uint32_t last_log_flush = 0;
+    if (g_pb_flush_count <= 5 ||
+        g_pb_flush_count - last_log_flush >= 1000) {
+        fprintf(stderr, "  [PB] flush #%u: %u dwords, %u methods (total: %u dwords, %u methods)\n",
+                g_pb_flush_count, num_dwords, method_count_local,
+                g_pb_total_dwords, g_pb_method_count);
+        fflush(stderr);
+        last_log_flush = g_pb_flush_count;
+    }
+}
+
+/**
  * sub_00351A20 - D3D8 push buffer flush
  *
  * On Xbox, this submits the current push buffer contents to the NV2A GPU
  * via DMA and resets the write pointer for the next batch of commands.
  *
- * In our recompilation, there's no real GPU. We just reset the write pointer
- * back to the buffer base so the caller can continue writing commands.
- * The commands are silently discarded.
+ * NV2A-aware: parses and logs push buffer commands before reset.
  *
  * The buffer base is stored at Xbox VA 0x35D69C (set during init in main.c).
  * The write pointer is at 0x35D6A0, end pointer at 0x35D6A4.
@@ -1070,8 +1140,18 @@ void sub_00249B9C(void)
  */
 void sub_00351A20(void)
 {
+    uint32_t base = MEM32(0x35D69C);
+    uint32_t write_ptr = MEM32(0x35D6A0);
+
+    g_pb_flush_count++;
+
+    /* Parse push buffer commands before discarding */
+    if (write_ptr > base) {
+        nv2a_parse_push_buffer(base, write_ptr);
+    }
+
     /* Reset write pointer to buffer base */
-    MEM32(0x35D6A0) = MEM32(0x35D69C);
+    MEM32(0x35D6A0) = base;
 
     /* Pop dummy return address (simulated x86 'ret') */
     esp += 4;
@@ -1080,7 +1160,7 @@ void sub_00351A20(void)
 
 
 /**
- * sub_003518E0 - NV2A push buffer kickoff (STUB)
+ * sub_003518E0 - NV2A push buffer kickoff
  *
  * Original: 0x003518E0 (D3D8LTCG section)
  *
@@ -1088,39 +1168,57 @@ void sub_00351A20(void)
  * GPU commands to the NV2A via DMA. It updates the PUT pointer, waits
  * for the GPU GET pointer to advance, and handles ring buffer wrapping.
  *
- * The function has spin-wait loops that poll NV2A hardware registers
- * (0xFC000000 range) which don't exist in our recompilation, causing
- * infinite loops and native stack overflow.
+ * NV2A-aware: logs kick events. In the future, this will write the PUT
+ * pointer to PFIFO registers to trigger command processing.
  *
  * Calling convention: ret 8 (2 params on stack).
- * Called as: PUSH32(esp, arg1); PUSH32(esp, arg2); PUSH32(esp, 0); sub_003518E0();
  */
 void sub_003518E0(void)
 {
-    eax = 0;      /* no GPU address to return */
+    g_pb_kick_count++;
+    eax = MEM32(0x35D6A0);  /* return current write pointer as GPU address */
     esp += 12;    /* ret 8: pop return addr (4) + 2 params (8) */
     return;
 }
 
 
 /**
- * sub_00351770 - NV2A push buffer space allocation (STUB)
+ * sub_00351770 - NV2A push buffer space allocation
  *
  * Original: 0x00351770 (D3D8LTCG section)
  *
  * On Xbox, this allocates space in the push buffer ring, potentially
  * triggering a kickoff (sub_003518E0) if insufficient space remains.
- * It also reads the GPU GET pointer and spins waiting for the GPU
- * to free space.
  *
- * Contains spin-wait loops on NV2A registers that cause hangs/overflow.
+ * NV2A-aware: returns the current write pointer so D3D8 functions
+ * can actually write push buffer commands. Auto-flushes when near
+ * the end of the buffer.
  *
  * Calling convention: ret 4 (1 param on stack).
- * Returns eax = allocated push buffer address (we return 0 = no allocation).
+ * Returns eax = allocated push buffer address.
  */
 void sub_00351770(void)
 {
-    eax = 0;      /* no push buffer space allocated */
+    uint32_t requested_dwords = MEM32(esp + 4); /* param: dwords needed */
+    uint32_t write_ptr = MEM32(0x35D6A0);
+    uint32_t end_ptr = MEM32(0x35D6A4);
+    uint32_t base = MEM32(0x35D69C);
+
+    g_pb_alloc_count++;
+
+    /* Check if we have space */
+    uint32_t remaining = (end_ptr - write_ptr) / 4;
+    if (remaining < requested_dwords + 16) {
+        /* Near end of buffer - flush and reset */
+        if (write_ptr > base) {
+            g_pb_flush_count++;
+            nv2a_parse_push_buffer(base, write_ptr);
+        }
+        MEM32(0x35D6A0) = base;
+        write_ptr = base;
+    }
+
+    eax = write_ptr;  /* return allocated address */
     esp += 8;     /* ret 4: pop return addr (4) + 1 param (4) */
     return;
 }

@@ -512,6 +512,32 @@ void pgraph_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 }
 
 /* ============================================================
+ * PGRAPH method dispatch
+ * Called when push buffer commands are parsed.
+ * Routes method calls into PGRAPH register writes.
+ * ============================================================ */
+
+static uint32_t g_pgraph_method_count = 0;
+
+void pgraph_method(NV2AState *d, uint32_t subchannel,
+                   uint32_t method, uint32_t param)
+{
+    g_pgraph_method_count++;
+
+    /* Log first 20 method calls and then every 1000th */
+    if (g_pgraph_method_count <= 20 || (g_pgraph_method_count % 1000) == 0) {
+        fprintf(stderr, "[PGRAPH] #%u method sub=%u 0x%04X = 0x%08X\n",
+                g_pgraph_method_count, subchannel, method, param);
+    }
+
+    /* Store method parameters in PGRAPH register space for future use.
+     * NV097 methods map into the 0x0000-0x1FFF range. */
+    if (method < 0x2000 * 4) {
+        d->pgraph.regs[method / 4] = param;
+    }
+}
+
+/* ============================================================
  * PFIFO - command FIFO (stub for Phase 1)
  * Full PFIFO with push buffer processing comes in Phase 2-3.
  * ============================================================ */
