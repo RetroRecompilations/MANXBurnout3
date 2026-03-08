@@ -1078,7 +1078,13 @@ static void nv2a_parse_push_buffer(uint32_t base, uint32_t write_ptr)
     uint32_t num_dwords = (write_ptr - base) / 4;
     g_pb_total_dwords += num_dwords;
 
-    /* Parse commands to count methods */
+    /* Get NV2A state for PGRAPH dispatch */
+    extern void *nv2a_get_state(void);
+    extern void pgraph_method(void *d, uint32_t subchannel,
+                               uint32_t method, uint32_t param);
+    void *nv2a = nv2a_get_state();
+
+    /* Parse commands and dispatch to PGRAPH */
     uint32_t pos = base;
     uint32_t method_count_local = 0;
     while (pos < write_ptr) {
@@ -1089,14 +1095,28 @@ static void nv2a_parse_push_buffer(uint32_t base, uint32_t write_ptr)
             /* increasing methods */
             uint32_t count = (word >> 18) & 0x7ff;
             uint32_t method = word & 0x1ffc;
-            (void)method;
-            method_count_local += count;
-            pos += count * 4; /* skip data words */
+            uint32_t subchan = (word >> 13) & 7;
+            for (uint32_t i = 0; i < count && pos < write_ptr; i++) {
+                uint32_t param = MEM32(pos);
+                pos += 4;
+                method_count_local++;
+                if (nv2a) {
+                    pgraph_method(nv2a, subchan, method + i * 4, param);
+                }
+            }
         } else if ((word & 0xe0030003) == 0x40000000) {
             /* non-increasing methods */
             uint32_t count = (word >> 18) & 0x7ff;
-            method_count_local += count;
-            pos += count * 4;
+            uint32_t method = word & 0x1ffc;
+            uint32_t subchan = (word >> 13) & 7;
+            for (uint32_t i = 0; i < count && pos < write_ptr; i++) {
+                uint32_t param = MEM32(pos);
+                pos += 4;
+                method_count_local++;
+                if (nv2a) {
+                    pgraph_method(nv2a, subchan, method, param);
+                }
+            }
         } else if ((word & 3) == 1) {
             /* jump */
         } else if ((word & 3) == 2) {
