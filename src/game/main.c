@@ -464,20 +464,28 @@ static LONG WINAPI crash_veh(PEXCEPTION_POINTERS info)
          * NV2A GPU / hardware I/O address space (0xF0000000+):
          *   0xF0000000-0xF3FFFFFF  GPU framebuffer / texture memory
          *   0xF4000000-0xFCFFFFFF  AGP aperture, push buffer DMA, misc HW
-         *   0xFD000000-0xFDFFFFFF  GPU MMIO registers
+         *   0xFD000000-0xFDFFFFFF  GPU MMIO registers (→ NV2A state machine)
          *   0xFE000000+            Flash ROM, misc
          *
-         * On Xbox, the NV2A GPU and other hardware is mapped above 0xF0000000.
-         * The statically-linked D3D8 library accesses these during init and
-         * at runtime for push buffer submission, register queries, etc.
-         *
-         * We map pages on demand filled with zeros. For registers, zero
-         * means "feature not present" (safe default). For framebuffer and
-         * push buffers, the writes are silently absorbed (no real GPU).
+         * MMIO registers (0xFD000000+) are routed through xemu's NV2A
+         * register handlers via instruction decoding in the VEH.
+         * Other GPU ranges get zero-filled pages as before.
          */
         {
             uint32_t fault_xbox_va = (uint32_t)(fault_addr - g_xbox_mem_offset);
             if (fault_xbox_va >= 0xF0000000u) {
+                /* GPU MMIO registers: decode instruction, route to NV2A */
+                if (fault_xbox_va >= 0xFD000000u && fault_xbox_va < 0xFE000000u) {
+                    extern bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
+                                                      uint32_t fault_xbox_va, int is_write);
+                    if (nv2a_hook_handle_mmio(info->ContextRecord, fault_addr,
+                                              fault_xbox_va, is_write)) {
+                        return EXCEPTION_CONTINUE_EXECUTION;
+                    }
+                    /* Decode failed - fall through to zero page allocation */
+                }
+
+                /* Framebuffer / push buffer / other GPU memory */
                 static int nv2a_page_count = 0;
                 uintptr_t alloc_base = fault_addr & ~(uintptr_t)0xFFFF; /* 64KB align */
                 LPVOID result = VirtualAlloc((LPVOID)alloc_base, 0x10000,
@@ -1531,6 +1539,12 @@ static BOOL init_subsystems(void)
     {
         extern void rw_init_display_driver_table(void);
         rw_init_display_driver_table();
+    }
+
+    /* 9. NV2A GPU emulation (xemu-based register handlers) */
+    {
+        extern void nv2a_hook_init(ptrdiff_t xbox_mem_offset);
+        nv2a_hook_init(g_xbox_mem_offset);
     }
 
     fprintf(stderr, "=== All subsystems initialized ===\n\n");

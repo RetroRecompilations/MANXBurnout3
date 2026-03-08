@@ -26,6 +26,13 @@ file(GLOB RECOMP_GEN_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/recomp/gen/recomp_*.c"
 )
 
+# ── NV2A GPU emulation (from xemu) ──────────────────────────────
+set(NV2A_DIR "${CMAKE_SOURCE_DIR}/src/nv2a")
+set(NV2A_SOURCES
+    ${NV2A_DIR}/nv2a_core.c
+    ${NV2A_DIR}/nv2a_mmio_hook.c
+)
+
 # Game executable sources
 set(GAME_SOURCES
     main.c
@@ -38,6 +45,7 @@ set(GAME_SOURCES
     menu_gui.cpp
     recomp/recomp_test.c
     recomp/recomp_manual.c
+    ${NV2A_SOURCES}
     ${RECOMP_GEN_SOURCES}
     ${IMGUI_SOURCES}
 )
@@ -74,6 +82,7 @@ target_include_directories(burnout3 PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/recomp
     ${CMAKE_CURRENT_SOURCE_DIR}/recomp/gen
     ${CMAKE_SOURCE_DIR}/src
+    ${NV2A_DIR}
     ${IMGUI_DIR}
     ${IMGUI_DIR}/backends
 )
@@ -90,6 +99,9 @@ if(MSVC)
         COMPILE_FLAGS "/w"
     )
     set_source_files_properties(${IMGUI_SOURCES} PROPERTIES
+        COMPILE_FLAGS "/w"
+    )
+    set_source_files_properties(${NV2A_SOURCES} PROPERTIES
         COMPILE_FLAGS "/w"
     )
     target_compile_definitions(burnout3 PRIVATE

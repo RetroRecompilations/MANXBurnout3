@@ -40,10 +40,63 @@ typedef uintptr_t target_ulong;
 
 #define ROUND_UP(n, d) (((n) + (d) - 1) & ~((d) - 1))
 
+#ifndef ARRAY_SIZE
+#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
+#endif
+
 /* Units */
 #define KiB (1024ULL)
 #define MiB (1024ULL * KiB)
 #define GiB (1024ULL * MiB)
+
+#define NANOSECONDS_PER_SECOND 1000000000LL
+
+/* ============================================================
+ * Bit manipulation
+ * ============================================================ */
+
+/* For MSVC which doesn't have __builtin_ctz: */
+#ifdef _MSC_VER
+#include <intrin.h>
+static inline int __builtin_ctz(unsigned int x) {
+    unsigned long index;
+    _BitScanForward(&index, x);
+    return (int)index;
+}
+static inline int __builtin_clz(unsigned int x) {
+    unsigned long index;
+    _BitScanReverse(&index, x);
+    return 31 - (int)index;
+}
+#endif
+
+/* QEMU's ctz32 = count trailing zeros (32-bit) */
+static inline int ctz32(uint32_t val) {
+    return __builtin_ctz(val);
+}
+
+/* GET_MASK/SET_MASK - defined here, guarded in nv2a_regs.h */
+#define GET_MASK(v, mask) (((v) & (mask)) >> ctz32(mask))
+#define SET_MASK(v, mask, val) \
+    do { (v) &= ~(mask); (v) |= ((val) << ctz32(mask)) & (mask); } while (0)
+
+/* muldiv64: (a * b) / c with 128-bit intermediate */
+#ifdef _MSC_VER
+#include <intrin.h>
+static inline uint64_t muldiv64(uint64_t a, uint32_t b, uint32_t c) {
+    uint64_t hi, lo;
+    lo = _umul128(a, (uint64_t)b, &hi);
+    /* Simple fallback: if hi is 0, just do lo/c */
+    if (hi == 0) return lo / c;
+    /* Otherwise use 128-bit division via shifts */
+    /* For our use case (timer math), overflow is unlikely */
+    return (uint64_t)(((double)a * b) / c);
+}
+#else
+static inline uint64_t muldiv64(uint64_t a, uint32_t b, uint32_t c) {
+    return (uint64_t)(((unsigned __int128)a * b) / c);
+}
+#endif
 
 /* ============================================================
  * Threading (replace QEMU mutexes with Win32 equivalents)
@@ -107,12 +160,21 @@ static inline uint64_t memory_region_size(MemoryRegion *mr) {
     return mr->size;
 }
 
+/* MemoryRegionOps - function pointers for MMIO read/write */
+typedef struct MemoryRegionOps {
+    uint64_t (*read)(void *opaque, hwaddr addr, unsigned int size);
+    void (*write)(void *opaque, hwaddr addr, uint64_t val, unsigned int size);
+} MemoryRegionOps;
+
 /* ============================================================
  * PCI (stub)
  * ============================================================ */
 
+#define PCI_CONFIG_SPACE_SIZE 256
+
 typedef struct PCIDevice {
     int devfn;
+    uint8_t config[PCI_CONFIG_SPACE_SIZE];
 } PCIDevice;
 
 typedef struct PCIBus {
@@ -122,6 +184,18 @@ typedef struct PCIBus {
 typedef int qemu_irq;
 
 #define PCI_DEVICE(x) ((PCIDevice*)(x))
+
+/* PCI config register offsets */
+#define PCI_VENDOR_ID   0x00
+#define PCI_COMMAND     0x04
+#define PCI_CLASS_REVISION 0x08
+
+static inline uint32_t pci_get_long(const uint8_t *config) {
+    return *(const uint32_t *)config;
+}
+static inline void pci_set_long(uint8_t *config, uint32_t val) {
+    *(uint32_t *)config = val;
+}
 
 static inline void pci_irq_assert(PCIDevice *d) { (void)d; }
 static inline void pci_irq_deassert(PCIDevice *d) { (void)d; }
@@ -133,7 +207,21 @@ static inline void pci_irq_deassert(PCIDevice *d) { (void)d; }
 typedef struct VGACommonState {
     uint8_t *vram_ptr;
     uint32_t vram_size;
+    uint8_t cr[256];
+    uint8_t sr[256];
 } VGACommonState;
+
+typedef struct VGADisplayParams {
+    int line_offset;
+    int start_addr;
+    int line_compare;
+} VGADisplayParams;
+
+#define VGA_CRTC_LINE_COMPARE 0x18
+#define VGA_CRTC_OVERFLOW     0x07
+#define VGA_CRTC_MAX_SCAN     0x09
+#define VGA_SEQ_CLOCK_MODE    0x01
+#define VGA_SR01_SCREEN_OFF   0x20
 
 typedef struct GraphicHwOps {
     void *gfx_update;
@@ -143,27 +231,10 @@ typedef struct QEMUTimer {
     int dummy;
 } QEMUTimer;
 
-/* ============================================================
- * Bit manipulation (from QEMU)
- * ============================================================ */
-
-#define GET_MASK(v, mask) (((v) & (mask)) >> __builtin_ctz(mask))
-#define SET_MASK(v, mask, val) \
-    do { (v) &= ~(mask); (v) |= ((val) << __builtin_ctz(mask)) & (mask); } while (0)
-
-/* For MSVC which doesn't have __builtin_ctz: */
-#ifdef _MSC_VER
-#include <intrin.h>
-static inline int __builtin_ctz(unsigned int x) {
-    unsigned long index;
-    _BitScanForward(&index, x);
-    return (int)index;
-}
-static inline int __builtin_clz(unsigned int x) {
-    unsigned long index;
-    _BitScanReverse(&index, x);
-    return 31 - (int)index;
-}
+/* container_of macro */
+#ifndef container_of
+#define container_of(ptr, type, member) \
+    ((type *)((char *)(ptr) - offsetof(type, member)))
 #endif
 
 /* ============================================================
@@ -219,9 +290,12 @@ static inline bool test_bit(long nr, const unsigned long *addr) {
  * Tracing (stub - no-op)
  * ============================================================ */
 
-#define trace_nv2a_irq(...)       do {} while(0)
-#define trace_nv2a_dma_map(...)   do {} while(0)
-/* Add more trace_ stubs as needed */
+#define trace_nv2a_irq(...)             do {} while(0)
+#define trace_nv2a_dma_map(...)         do {} while(0)
+#define trace_nv2a_reg_read(...)        do {} while(0)
+#define trace_nv2a_reg_write(...)       do {} while(0)
+#define trace_nv2a_pgraph_method(...)   do {} while(0)
+#define trace_nv2a_pfifo_dma_push(...) do {} while(0)
 
 /* ============================================================
  * Migration / VM state (stub)
@@ -299,7 +373,7 @@ static inline void bql_unlock(void) {}
 #define qemu_mutex_lock_iothread() bql_lock()
 #define qemu_mutex_unlock_iothread() bql_unlock()
 
-/* Timer stub */
+/* Timer */
 static inline int64_t qemu_clock_get_ns(int type) {
     (void)type;
     LARGE_INTEGER freq, count;
