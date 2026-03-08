@@ -2974,8 +2974,6 @@ void sub_0003D9E0(void)
     eax = esi;
     PUSH32(esp, 0); sub_0002F330();
 
-    /* Skip sub_0034D530 (D3D viewport setup - needs Xbox D3D device) */
-
     /* sub_00040660: copies camera/matrix from RW tables */
     /* Only call if esi looks valid (should be 0x4D6170) */
     if (esi > 0x10000 && esi < 0x800000) {

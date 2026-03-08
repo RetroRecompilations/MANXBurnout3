@@ -518,6 +518,28 @@ void pgraph_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
  * ============================================================ */
 
 static uint32_t g_pgraph_method_count = 0;
+static uint32_t g_pgraph_draw_count = 0;
+static uint32_t g_pgraph_clear_count = 0;
+static uint32_t g_pgraph_flip_count = 0;
+static uint32_t g_pgraph_inline_verts = 0;
+static int g_pgraph_in_begin = 0;
+
+/* NV097 method constants for dispatch */
+#define M_NO_OPERATION          0x0100
+#define M_SET_SURFACE_FORMAT    0x0208
+#define M_SET_SURFACE_PITCH     0x020C
+#define M_SET_SURFACE_COLOR_OFF 0x0210
+#define M_SET_SURFACE_ZETA_OFF  0x0214
+#define M_SET_SURFACE_CLIP_H    0x0200
+#define M_SET_SURFACE_CLIP_V    0x0204
+#define M_CLEAR_SURFACE         0x01D0
+#define M_SET_COLOR_CLEAR_VALUE 0x01D4
+#define M_SET_BEGIN_END         0x17FC
+#define M_INLINE_ARRAY          0x1818
+#define M_FLIP_INCREMENT_WRITE  0x0114
+#define M_FLIP_STALL            0x0118
+#define M_SET_VIEWPORT_OFFSET   0x0A20
+#define M_SET_VIEWPORT_SCALE    0x0AF0
 
 void pgraph_method(NV2AState *d, uint32_t subchannel,
                    uint32_t method, uint32_t param)
@@ -530,10 +552,47 @@ void pgraph_method(NV2AState *d, uint32_t subchannel,
                 g_pgraph_method_count, subchannel, method, param);
     }
 
-    /* Store method parameters in PGRAPH register space for future use.
-     * NV097 methods map into the 0x0000-0x1FFF range. */
+    /* Store method parameters in PGRAPH register space */
     if (method < 0x2000 * 4) {
         d->pgraph.regs[method / 4] = param;
+    }
+
+    /* Track high-level operations */
+    switch (method) {
+    case M_CLEAR_SURFACE:
+        g_pgraph_clear_count++;
+        break;
+
+    case M_SET_BEGIN_END:
+        if (param != 0) {
+            /* Begin draw */
+            g_pgraph_in_begin = 1;
+            g_pgraph_draw_count++;
+        } else {
+            /* End draw */
+            g_pgraph_in_begin = 0;
+        }
+        break;
+
+    case M_INLINE_ARRAY:
+        if (g_pgraph_in_begin) {
+            g_pgraph_inline_verts++;
+        }
+        break;
+
+    case M_FLIP_INCREMENT_WRITE:
+        g_pgraph_flip_count++;
+        /* Log frame summary */
+        if (g_pgraph_flip_count <= 5 || (g_pgraph_flip_count % 300) == 0) {
+            fprintf(stderr, "[PGRAPH] Frame %u: %u methods, %u draws, %u clears, %u inline verts\n",
+                    g_pgraph_flip_count, g_pgraph_method_count,
+                    g_pgraph_draw_count, g_pgraph_clear_count,
+                    g_pgraph_inline_verts);
+        }
+        break;
+
+    default:
+        break;
     }
 }
 
