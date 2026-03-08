@@ -43,6 +43,7 @@ set(GAME_SOURCES
     static_textures.c
     rw_renderer.c
     video_player.c
+    awd_loader.c
     menu_gui.cpp
     recomp/recomp_test.c
     recomp/recomp_manual.c

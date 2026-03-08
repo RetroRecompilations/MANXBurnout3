@@ -13,9 +13,11 @@
  */
 
 #include "dsound_xbox.h"
+#include "../apu/apu.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
 
 /* ================================================================
  * Sound buffer stub implementation
@@ -33,6 +35,9 @@ typedef struct DSoundBuffer {
     DWORD   status;  /* DSBSTATUS_* flags */
     LONG    volume;  /* hundredths of dB */
     DWORD   frequency;
+    WORD    channels;     /* 1=mono, 2=stereo */
+    WORD    bits_per_sample;
+    int     mixer_slot;   /* APU mixer voice slot, -1 = none */
 } DSoundBuffer;
 
 static DSoundBuffer *buf_from_iface(IDirectSoundBuffer8 *iface)
@@ -56,6 +61,10 @@ static ULONG __stdcall buf_Release(IDirectSoundBuffer8 *self)
     DSoundBuffer *buf = buf_from_iface(self);
     LONG ref = InterlockedDecrement(&buf->ref_count);
     if (ref <= 0) {
+        if (buf->mixer_slot >= 0) {
+            apu_mixer_stop(buf->mixer_slot);
+            apu_mixer_free_voice(buf->mixer_slot);
+        }
         free(buf->buffer_data);
         free(buf);
     }
@@ -72,6 +81,17 @@ static HRESULT __stdcall buf_SetBufferData(IDirectSoundBuffer8 *self, const void
         buf->buffer_data = malloc(dwBufferBytes);
         if (buf->buffer_data)
             memcpy(buf->buffer_data, pvBufferData, dwBufferBytes);
+    }
+
+    /* Update mixer voice with new buffer data */
+    if (buf->mixer_slot >= 0 && buf->buffer_data && buf->bits_per_sample == 16) {
+        APUMixerVoice *v = apu_mixer_get_voice(buf->mixer_slot);
+        if (v) {
+            v->pcm_data = (const int16_t *)buf->buffer_data;
+            v->pcm_bytes = dwBufferBytes;
+            v->num_channels = buf->channels;
+            v->sample_rate = buf->frequency;
+        }
     }
     return S_OK;
 }
@@ -140,24 +160,55 @@ static HRESULT __stdcall buf_Play(IDirectSoundBuffer8 *self, DWORD r1, DWORD r2,
     DSoundBuffer *buf = buf_from_iface(self);
     buf->status = DSBSTATUS_PLAYING;
     if (dwFlags & DSBPLAY_LOOPING) buf->status |= DSBSTATUS_LOOPING;
+
+    /* Start playback through APU mixer */
+    if (buf->mixer_slot >= 0) {
+        apu_mixer_play(buf->mixer_slot, (dwFlags & DSBPLAY_LOOPING) ? 1 : 0);
+    }
     return S_OK;
 }
 
 static HRESULT __stdcall buf_Stop(IDirectSoundBuffer8 *self)
 {
-    buf_from_iface(self)->status = 0;
+    DSoundBuffer *buf = buf_from_iface(self);
+    buf->status = 0;
+    if (buf->mixer_slot >= 0) {
+        apu_mixer_stop(buf->mixer_slot);
+    }
     return S_OK;
 }
 
 static HRESULT __stdcall buf_SetVolume(IDirectSoundBuffer8 *self, LONG lVolume)
 {
-    buf_from_iface(self)->volume = lVolume;
+    DSoundBuffer *buf = buf_from_iface(self);
+    buf->volume = lVolume;
+
+    /* Convert DirectSound volume (hundredths of dB, 0=max, -9600=min) to linear */
+    if (buf->mixer_slot >= 0) {
+        APUMixerVoice *v = apu_mixer_get_voice(buf->mixer_slot);
+        if (v) {
+            if (lVolume <= -9600) {
+                v->volume = 0.0f;
+            } else if (lVolume >= 0) {
+                v->volume = 1.0f;
+            } else {
+                /* dB to linear: 10^(dB/2000) since lVolume is in hundredths of dB */
+                v->volume = powf(10.0f, lVolume / 2000.0f);
+            }
+        }
+    }
     return S_OK;
 }
 
 static HRESULT __stdcall buf_SetFrequency(IDirectSoundBuffer8 *self, DWORD dwFrequency)
 {
-    buf_from_iface(self)->frequency = dwFrequency;
+    DSoundBuffer *buf = buf_from_iface(self);
+    buf->frequency = dwFrequency;
+
+    if (buf->mixer_slot >= 0) {
+        APUMixerVoice *v = apu_mixer_get_voice(buf->mixer_slot);
+        if (v) v->sample_rate = dwFrequency;
+    }
     return S_OK;
 }
 
@@ -210,11 +261,39 @@ static HRESULT __stdcall ds_CreateSoundBuffer(IDirectSound8 *self, const DSBUFFE
     buf->ref_count = 1;
     buf->volume = 0;         /* Full volume (0 dB) */
     buf->frequency = 44100;  /* Default sample rate */
+    buf->channels = 2;
+    buf->bits_per_sample = 16;
+
+    /* Extract format from WAVEFORMATEX if provided */
+    if (desc && desc->lpwfxFormat) {
+        XBOX_WAVEFORMATEX *wfx = (XBOX_WAVEFORMATEX *)desc->lpwfxFormat;
+        buf->channels = wfx->nChannels;
+        buf->frequency = wfx->nSamplesPerSec;
+        buf->bits_per_sample = wfx->wBitsPerSample;
+    }
+
+    /* Allocate a mixer voice slot */
+    buf->mixer_slot = apu_mixer_alloc_voice();
+    if (buf->mixer_slot >= 0) {
+        APUMixerVoice *v = apu_mixer_get_voice(buf->mixer_slot);
+        if (v) {
+            v->num_channels = buf->channels;
+            v->sample_rate = buf->frequency;
+        }
+    }
 
     /* Pre-allocate buffer if size specified */
     if (desc && desc->dwBufferBytes > 0) {
         buf->buffer_data = calloc(1, desc->dwBufferBytes);
         buf->buffer_size = desc->dwBufferBytes;
+    }
+
+    static int create_log_count = 0;
+    if (create_log_count < 30) {
+        fprintf(stderr, "[DSOUND] CreateSoundBuffer: %u bytes, %d ch, %u Hz, %d-bit → mixer slot %d\n",
+                desc ? desc->dwBufferBytes : 0, buf->channels, buf->frequency,
+                buf->bits_per_sample, buf->mixer_slot);
+        create_log_count++;
     }
 
     *ppBuffer = &buf->iface;

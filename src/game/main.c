@@ -45,6 +45,14 @@
 #include "video_player.h"
 #include "menu_gui.h"
 
+/* Audio wave dictionary loader */
+#include "awd_loader.h"
+#include "../apu/apu.h"
+
+/* Global AWD files */
+AWDFile *g_awd_fe = NULL;
+AWDFile *g_awd_generic = NULL;
+
 /* Recompiled code */
 #include "recomp/gen/recomp_funcs.h"
 
@@ -1572,6 +1580,18 @@ static BOOL init_subsystems(void)
         }
     }
 
+    /* [6/6] Load game audio */
+    fprintf(stderr, "[6/6] Loading game audio...\n");
+    g_awd_fe = awd_load("Burnout 3 Takedown\\sound\\Fe.awd");
+    g_awd_generic = awd_load("Burnout 3 Takedown\\sound\\Generic.awd");
+
+    /* Play startup chime */
+    if (g_awd_fe) {
+        int idx = awd_play(g_awd_fe, "GlobeHigh", false);
+        if (idx >= 0)
+            fprintf(stderr, "[AWD] Playing startup chime: 'GlobeHigh'\n");
+    }
+
     fprintf(stderr, "=== All subsystems initialized ===\n\n");
     return TRUE;
 }
@@ -2210,6 +2230,22 @@ void game_frame_pump(void)
                     }
                 }
                 u_key_prev = u_key_now;
+            }
+
+            /* I key: play AWD game sounds (cycle through Fe.awd entries) */
+            {
+                static int i_key_prev = 0;
+                static int i_sound_idx = 0;
+                int i_key_now = (GetAsyncKeyState('I') & 0x8000) ? 1 : 0;
+                if (i_key_now && !i_key_prev && g_awd_fe) {
+                    awd_stop_all(g_awd_fe);
+                    if (i_sound_idx >= g_awd_fe->num_entries) i_sound_idx = 0;
+                    fprintf(stderr, "[AWD] Playing Fe.awd[%d]: '%s'\n",
+                            i_sound_idx, g_awd_fe->entries[i_sound_idx].name);
+                    awd_play_index(g_awd_fe, i_sound_idx, false);
+                    i_sound_idx++;
+                }
+                i_key_prev = i_key_now;
             }
 
             /* Debug: log input state */

@@ -20,6 +20,7 @@
  */
 
 #include "apu_state.h"
+#include "apu.h"
 #include "fpconv.h"
 
 /* ============================================================
@@ -29,6 +30,14 @@
 uint8_t *g_apu_ram_ptr = NULL;
 
 MCPXAPUState *g_state = NULL;
+
+/* Forward declarations for software mixer */
+static void mixer_init(void);
+static void mixer_render(int16_t frame_buf[][2], int num_samples);
+static APUMixerVoice g_mixer_voices[APU_MIXER_MAX_VOICES];
+static volatile int g_mixer_active_count = 0;
+static CRITICAL_SECTION g_mixer_cs;
+static bool g_mixer_initialized = false;
 struct McpxApuDebug g_dbg;
 struct McpxApuDebug g_dbg_cache;
 int g_dbg_voice_monitor = -1;
@@ -146,7 +155,8 @@ static struct {
 
 /* Ring of waveOut buffers for double-buffering */
 #define WAVEOUT_NUM_BUFS 4
-#define WAVEOUT_BUF_SAMPLES 256  /* matches frame_buf size */
+#define WAVEOUT_BUF_SAMPLES 2048  /* ~42.7ms at 48kHz, matches 8-frame delivery rate */
+#define MIXER_FRAME_SAMPLES 256  /* Internal mixing frame size (matches frame_buf) */
 
 typedef struct {
     HWAVEOUT hwo;
@@ -219,52 +229,57 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         return;
     }
 
-    /* Inject test tone directly into frame_buf if active */
-    if (g_test_tone.active) {
-        for (int i = 0; i < WAVEOUT_BUF_SAMPLES; i++) {
-            int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
-            d->monitor.frame_buf[i][0] = s;
-            d->monitor.frame_buf[i][1] = s;
-            g_test_tone.phase += g_test_tone.phase_inc;
-            if (g_test_tone.phase >= 2.0 * M_PI)
-                g_test_tone.phase -= 2.0 * M_PI;
-        }
+    if (!g_waveout.initialized) return;
+
+    int idx = g_waveout.next_buf;
+    WAVEHDR *hdr = &g_waveout.hdrs[idx];
+
+    /* Wait if this buffer is still playing (with timeout) */
+    int wait_loops = 0;
+    while (!(hdr->dwFlags & WHDR_DONE) && (hdr->dwFlags & WHDR_INQUEUE)) {
+        qemu_mutex_unlock(&d->lock);
+        Sleep(1);
+        qemu_mutex_lock(&d->lock);
+        if (++wait_loops > 50) break;
     }
 
-    if (g_waveout.initialized) {
-        int idx = g_waveout.next_buf;
-        WAVEHDR *hdr = &g_waveout.hdrs[idx];
+    /* Fill the large waveOut buffer by rendering multiple 256-sample frames */
+    int16_t *out = (int16_t *)g_waveout.bufs[idx];
+    int remaining = WAVEOUT_BUF_SAMPLES;
+    int out_offset = 0;
 
-        /* Wait if this buffer is still playing (with timeout) */
-        int wait_loops = 0;
-        while (!(hdr->dwFlags & WHDR_DONE) && (hdr->dwFlags & WHDR_INQUEUE)) {
-            /* Release mutex while waiting so other threads can proceed */
-            qemu_mutex_unlock(&d->lock);
-            Sleep(1);
-            qemu_mutex_lock(&d->lock);
-            if (++wait_loops > 50) {
-                /* Timeout after 50ms - skip this buffer */
-                static int timeout_count = 0;
-                if (timeout_count++ < 5)
-                    fprintf(stderr, "[APU] waveOut buffer %d timeout (flags=0x%08X)\n",
-                            idx, (unsigned)hdr->dwFlags);
-                break;
+    while (remaining > 0) {
+        int chunk = (remaining < MIXER_FRAME_SAMPLES) ? remaining : MIXER_FRAME_SAMPLES;
+
+        memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+
+        /* Test tone */
+        if (g_test_tone.active) {
+            for (int i = 0; i < chunk; i++) {
+                int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
+                d->monitor.frame_buf[i][0] = s;
+                d->monitor.frame_buf[i][1] = s;
+                g_test_tone.phase += g_test_tone.phase_inc;
+                if (g_test_tone.phase >= 2.0 * M_PI)
+                    g_test_tone.phase -= 2.0 * M_PI;
             }
         }
 
-        /* Copy frame_buf to waveOut buffer */
-        memcpy(g_waveout.bufs[idx], d->monitor.frame_buf,
-               WAVEOUT_BUF_SAMPLES * 2 * sizeof(int16_t));
+        /* Mix software voices */
+        mixer_render(d->monitor.frame_buf, chunk);
 
-        /* Submit to waveOut */
-        hdr->dwFlags &= ~WHDR_DONE;
-        waveOutWrite(g_waveout.hwo, hdr, sizeof(WAVEHDR));
-
-        g_waveout.next_buf = (idx + 1) % WAVEOUT_NUM_BUFS;
-        g_waveout.frames_written++;
+        /* Copy to waveOut buffer */
+        memcpy(out + out_offset * 2, d->monitor.frame_buf, chunk * 2 * sizeof(int16_t));
+        out_offset += chunk;
+        remaining -= chunk;
     }
 
-    memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+    /* Submit to waveOut */
+    hdr->dwFlags &= ~WHDR_DONE;
+    waveOutWrite(g_waveout.hwo, hdr, sizeof(WAVEHDR));
+
+    g_waveout.next_buf = (idx + 1) % WAVEOUT_NUM_BUFS;
+    g_waveout.frames_written++;
 }
 
 /* ============================================================
@@ -343,7 +358,7 @@ static void *mcpx_apu_frame_thread(void *arg)
     qemu_mutex_lock(&d->lock);
 
     while (!qatomic_read(&d->exiting)) {
-        if (d->pause_requested && !g_test_tone.active) {
+        if (d->pause_requested && !g_test_tone.active && !g_mixer_active_count) {
             d->is_idle = true;
             qemu_cond_signal(&d->idle_cond);
             qemu_cond_wait(&d->cond, &d->lock);
@@ -351,40 +366,26 @@ static void *mcpx_apu_frame_thread(void *arg)
             continue;
         }
 
-        if (g_test_tone.active) {
-            /* Test tone mode: bypass VP/DSP, just throttle + generate tone */
-            throttle(d);
-            mcpx_apu_monitor_frame(d);
-            d->ep_frame_div++;
-            continue;
-        }
+        /* Always run the audio output loop — the software mixer and test tone
+         * need continuous frame delivery regardless of APU register state.
+         * The VP/DSP pipeline (se_frame) only runs when registers allow it. */
+        throttle(d);
 
         int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
                                 NV_PAPU_SECTL_XCNTMODE);
         uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
-        if (xcntmode == NV_PAPU_SECTL_XCNTMODE_OFF ||
-            (fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) ||
-            (fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED)) {
-            d->set_irq = true;
-        }
+        bool apu_active = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
+                          !(fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
+                          !(fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED);
 
-        if (d->set_irq) {
-            update_irq(d);
-            d->set_irq = false;
+        if (apu_active && !g_test_tone.active) {
+            /* Full pipeline: VP voices → DSP → monitor → waveOut */
+            se_frame(d);
+        } else {
+            /* Lightweight: just monitor frame (test tone + software mixer) */
+            mcpx_apu_monitor_frame(d);
+            d->ep_frame_div++;
         }
-
-        xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
-                            NV_PAPU_SECTL_XCNTMODE);
-        fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
-        if (xcntmode == NV_PAPU_SECTL_XCNTMODE_OFF ||
-            (fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) ||
-            (fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED)) {
-            qemu_cond_timedwait(&d->cond, &d->lock, 5);
-            continue;
-        }
-
-        throttle(d);
-        se_frame(d);
     }
 
     qemu_mutex_unlock(&d->lock);
@@ -462,7 +463,10 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     /* Init DSP (GP/EP - stubbed) */
     mcpx_apu_dsp_init(d);
 
-    /* Init monitor (stubbed - no SDL) */
+    /* Init software mixer for DirectSound bridge */
+    mixer_init();
+
+    /* Init monitor (waveOut output) */
     Error *local_err = NULL;
     mcpx_apu_monitor_init(d, &local_err);
     if (local_err) {
@@ -601,4 +605,158 @@ void mcpx_apu_play_test_tone(MCPXAPUState *d)
 
     fprintf(stderr, "[APU-TEST] Test tone ON - 440Hz sine, amplitude=%d\n",
             g_test_tone.amplitude);
+}
+
+/* ============================================================
+ * Software mixer - mixes DirectSound buffers to waveOut
+ *
+ * This bypasses the VP hardware voice pipeline entirely.
+ * DirectSound buffers register PCM data here, and the APU
+ * frame thread mixes them into the monitor frame_buf.
+ * ============================================================ */
+
+static void mixer_init(void)
+{
+    if (g_mixer_initialized) return;
+    InitializeCriticalSection(&g_mixer_cs);
+    memset(g_mixer_voices, 0, sizeof(g_mixer_voices));
+    g_mixer_initialized = true;
+}
+
+int apu_mixer_alloc_voice(void)
+{
+    if (!g_mixer_initialized) mixer_init();
+    EnterCriticalSection(&g_mixer_cs);
+    for (int i = 0; i < APU_MIXER_MAX_VOICES; i++) {
+        if (!g_mixer_voices[i].active && !g_mixer_voices[i].pcm_data) {
+            g_mixer_voices[i].volume = 1.0f;
+            g_mixer_voices[i].sample_rate = 44100;
+            g_mixer_voices[i].num_channels = 2;
+            LeaveCriticalSection(&g_mixer_cs);
+            return i;
+        }
+    }
+    LeaveCriticalSection(&g_mixer_cs);
+    return -1;
+}
+
+void apu_mixer_free_voice(int slot)
+{
+    if (slot < 0 || slot >= APU_MIXER_MAX_VOICES) return;
+    EnterCriticalSection(&g_mixer_cs);
+    g_mixer_voices[slot].active = 0;
+    g_mixer_voices[slot].pcm_data = NULL;
+    g_mixer_voices[slot].pcm_bytes = 0;
+    g_mixer_voices[slot].play_offset = 0;
+    LeaveCriticalSection(&g_mixer_cs);
+}
+
+APUMixerVoice *apu_mixer_get_voice(int slot)
+{
+    if (slot < 0 || slot >= APU_MIXER_MAX_VOICES) return NULL;
+    return &g_mixer_voices[slot];
+}
+
+void apu_mixer_play(int slot, int looping)
+{
+    if (slot < 0 || slot >= APU_MIXER_MAX_VOICES) return;
+    APUMixerVoice *v = &g_mixer_voices[slot];
+    if (!v->pcm_data || v->pcm_bytes == 0) return;
+    v->looping = looping;
+    v->play_offset = 0;
+    v->active = 1;
+    InterlockedIncrement((volatile LONG *)&g_mixer_active_count);
+
+    /* Wake up APU thread if it was paused */
+    extern MCPXAPUState *g_state;
+    if (g_state) {
+        qemu_mutex_lock(&g_state->lock);
+        g_state->pause_requested = false;
+        qemu_cond_signal(&g_state->cond);
+        qemu_mutex_unlock(&g_state->lock);
+    }
+
+    static int play_log_count = 0;
+    if (play_log_count < 20) {
+        fprintf(stderr, "[APU-MIX] Play voice %d: %u bytes, %u ch, %u Hz, vol=%.2f, loop=%d\n",
+                slot, v->pcm_bytes, v->num_channels, v->sample_rate, v->volume, looping);
+        play_log_count++;
+    }
+}
+
+void apu_mixer_stop(int slot)
+{
+    if (slot < 0 || slot >= APU_MIXER_MAX_VOICES) return;
+    if (g_mixer_voices[slot].active) {
+        g_mixer_voices[slot].active = 0;
+        InterlockedDecrement((volatile LONG *)&g_mixer_active_count);
+    }
+}
+
+/* Mix all active voices into frame_buf. Called from mcpx_apu_monitor_frame.
+ * play_offset is stored as a 16.16 fixed-point source frame position. */
+static void mixer_render(int16_t frame_buf[][2], int num_samples)
+{
+    if (!g_mixer_initialized) return;
+
+    for (int v = 0; v < APU_MIXER_MAX_VOICES; v++) {
+        APUMixerVoice *voice = &g_mixer_voices[v];
+        if (!voice->active || !voice->pcm_data || voice->pcm_bytes == 0)
+            continue;
+
+        uint32_t total_frames = voice->pcm_bytes / sizeof(int16_t);
+        if (voice->num_channels == 2) total_frames /= 2;
+        if (total_frames == 0) continue;
+
+        /* Fixed-point 16.16 increment per output sample */
+        uint32_t inc = (uint32_t)(((uint64_t)voice->sample_rate << 16) / 48000);
+        uint32_t pos = voice->play_offset; /* 16.16 fixed-point */
+        float vol = voice->volume;
+
+        for (int i = 0; i < num_samples; i++) {
+            uint32_t src_frame = pos >> 16;
+
+            if (src_frame >= total_frames) {
+                if (voice->looping) {
+                    pos = 0;
+                    src_frame = 0;
+                } else {
+                    voice->active = 0;
+                    InterlockedDecrement((volatile LONG *)&g_mixer_active_count);
+                    break;
+                }
+            }
+
+            int32_t left, right;
+            if (voice->num_channels >= 2) {
+                left  = (int32_t)(voice->pcm_data[src_frame * 2] * vol);
+                right = (int32_t)(voice->pcm_data[src_frame * 2 + 1] * vol);
+            } else {
+                left = right = (int32_t)(voice->pcm_data[src_frame] * vol);
+            }
+
+            /* Accumulate (mix) into frame_buf with clamping */
+            int32_t mixed_l = frame_buf[i][0] + left;
+            int32_t mixed_r = frame_buf[i][1] + right;
+            if (mixed_l > 32767) mixed_l = 32767;
+            if (mixed_l < -32768) mixed_l = -32768;
+            if (mixed_r > 32767) mixed_r = 32767;
+            if (mixed_r < -32768) mixed_r = -32768;
+            frame_buf[i][0] = (int16_t)mixed_l;
+            frame_buf[i][1] = (int16_t)mixed_r;
+
+            pos += inc;
+        }
+
+        voice->play_offset = pos;
+        uint32_t end_frame = pos >> 16;
+        if (end_frame >= total_frames) {
+            if (voice->looping) {
+                voice->play_offset = 0;
+            } else if (voice->active) {
+                voice->active = 0;
+                InterlockedDecrement((volatile LONG *)&g_mixer_active_count);
+            }
+        }
+    }
 }
