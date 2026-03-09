@@ -21,6 +21,13 @@ void recomp_icall_fail_log(uint32_t va)
 /* D3D8 frame pump (implemented in d3d8_device.c) */
 extern void d3d8_PresentFrame(void);
 
+/* RW→D3D11 rendering bridge (rw_bridge.c) */
+extern int  rw_bridge_camera_render(uint32_t camera_va);
+extern void rw_bridge_camera_begin(uint32_t camera_va);
+extern void rw_bridge_camera_end(uint32_t camera_va);
+extern void rw_bridge_new_frame(void);
+extern int  rw_bridge_frame_rendered(void);
+
 /**
  * RW Display Driver Function Pointer Table
  *
@@ -82,9 +89,20 @@ void rw_init_display_driver_table(void)
         MEM32(table_base + entries[i].id * 4) = entries[i].func;
     }
 
+    /* Also populate the im2d function pointer table.
+     * sub_001DBC80 normally does this during RW device open, but
+     * RW device initialization doesn't fully execute in our recomp.
+     * These are the im2d vertex transform and render functions. */
+    MEM32(0x7592A8) = 0x1DB620;   /* im2d vertex transform (single) */
+    MEM32(0x7592AC) = 0x1DB2C0;   /* im2d transform helper */
+    MEM32(0x7592B0) = 0x1DB9D0;   /* im2d vertex transform (inverse) */
+    MEM32(0x7592B4) = 0x1DB6D0;   /* im2d batch vertex transform */
+    MEM32(0x41AAD4) = 1;          /* im2d reference count */
+
     fprintf(stderr, "  [RW] Display driver table populated at 0x%08X\n", table_base);
     fprintf(stderr, "  [RW]   [0x759338] (render cb) = 0x%08X\n", MEM32(0x759338));
     fprintf(stderr, "  [RW]   [0x759318] (viewport)  = 0x%08X\n", MEM32(0x759318));
+    fprintf(stderr, "  [RW]   [0x7592B4] (im2d fn)   = 0x%08X\n", MEM32(0x7592B4));
 }
 
 /* Track spawn state exported from rw_renderer.c */
@@ -133,6 +151,8 @@ void sub_001D9230(void);
 /* sub_00157680 removed from manual overrides - uses gen code with relocated PrgData */
 void sub_001D9280(void);
 void sub_001DDAF0(void);
+void sub_001DD910(void);  /* CameraBeginUpdate - display driver 0x01 */
+void sub_001E7B10(void);  /* CameraEndUpdate - display driver 0x0B */
 void sub_001D9290(void);
 void sub_001D92A0(void);
 void sub_001D92EF(void);
@@ -189,6 +209,9 @@ void sub_00339506(void);
 void sub_00339511(void);
 void sub_0035B3B0(void);
 void sub_00361BB4(void);
+
+/* Im2D vertex transform helper (not generated - below recompiler threshold) */
+void sub_001DB2C0(void);
 
 /* D3D8LTCG rendering pipeline stubs */
 void sub_0034D530(void);
@@ -290,6 +313,8 @@ static const struct {
     { 0x001D7D70u, (recomp_func_t)sub_001D7D70 },
     { 0x001D9700u, (recomp_func_t)sub_001D9700 },
     { 0x001DDAF0u, (recomp_func_t)sub_001DDAF0 },
+    { 0x001DD910u, (recomp_func_t)sub_001DD910 },  /* CameraBeginUpdate */
+    { 0x001E7B10u, (recomp_func_t)sub_001E7B10 },  /* CameraEndUpdate */
     { 0x00351090u, (recomp_func_t)sub_00351090 },
     { 0x001D9A50u, (recomp_func_t)sub_001D9A50 },
     { 0x001D9AF0u, (recomp_func_t)sub_001D9AF0 },
@@ -335,6 +360,8 @@ static const struct {
     { 0x00361BB4u, (recomp_func_t)sub_00361BB4 },
     /* RW linked-list traversal with loop limit */
     { 0x001FE1E0u, (recomp_func_t)sub_001FE1E0 },
+    /* Im2D vertex transform helper (stub) */
+    { 0x001DB2C0u, (recomp_func_t)sub_001DB2C0 },
     /* D3D8LTCG rendering pipeline */
     { 0x0034D530u, (recomp_func_t)sub_0034D530 },
     /* Rendering context tick (stubbed) */
@@ -1497,8 +1524,9 @@ void sub_001D9420(void) {
 
     if (g_present_count <= 5 || (g_present_count % 1000) == 0) {
         uint32_t rw_cb = MEM32(0x759338);
-        fprintf(stderr, "  [PRESENT] #%u: [0x759338]=0x%08X esi_param=0x%08X\n",
-                g_present_count, rw_cb, MEM32(esp + 4));
+        uint32_t im2d_fn = MEM32(0x7592B4);
+        fprintf(stderr, "  [PRESENT] #%u: [0x759338]=0x%08X [0x7592B4]=0x%08X esi_param=0x%08X\n",
+                g_present_count, rw_cb, im2d_fn, MEM32(esp + 4));
     }
 
     /* Call through to real gen code: reads 3 stack params, calls sub_001DE7E0 */
@@ -1552,6 +1580,9 @@ void sub_001DDAF0(void)
                 call_count, param3, MEM32(0x35FB48));
     }
 
+    /* Reset bridge state for this new render pass */
+    rw_bridge_new_frame();
+
     /* Skip gamma logic (sub_001D7130 touches NV2A gamma ramp).
      * Just set the state variable like the original does. */
     if (param3 & 1) {
@@ -1562,7 +1593,8 @@ void sub_001DDAF0(void)
             MEM32(0x41AB40) = 0x80000000u;
     }
 
-    /* Call sub_00351090(0) - RW camera scene render */
+    /* Call sub_00351090(0) - RW camera scene render.
+     * The bridge inside sub_00351090 will render through our D3D8→D3D11 layer. */
     PUSH32(esp, 0);
     PUSH32(esp, 0); sub_00351090();
 
@@ -1571,6 +1603,61 @@ void sub_001DDAF0(void)
 }
 void sub_001D94A0(void) { esp += 4; return; }
 void sub_001D94D0(void) { esp += 4; return; }
+
+/*
+ * sub_001DD910 - RW CameraBeginUpdate (display driver entry 0x01)
+ *
+ * Original: Sets up rendering context for a new frame.
+ * Called from RwCameraBeginUpdate with camera pointer as param.
+ *
+ * Override: Call bridge to set up BeginScene + viewport + transforms.
+ * Also stores camera VA for later use by bridge.
+ *
+ * Stack: [esp+4]=ret_junk, [esp+8]=camera_ptr, [esp+C]=flags
+ */
+void sub_001DD910(void)
+{
+    static uint32_t call_count = 0;
+    uint32_t camera_ptr = MEM32(esp + 8);
+
+    call_count++;
+    if (call_count <= 5 || (call_count % 500) == 0) {
+        fprintf(stderr, "  [RW-BEGIN] CameraBeginUpdate #%u: camera=0x%08X\n",
+                call_count, camera_ptr);
+    }
+
+    /* Store camera in RW global for sub_00351090 to read */
+    MEM32(0x759280) = camera_ptr;
+
+    /* Call bridge to set up BeginScene/Clear/viewport */
+    rw_bridge_camera_begin(camera_ptr);
+
+    eax = 1;
+    esp += 4; return;
+}
+
+/*
+ * sub_001E7B10 - RW CameraEndUpdate (display driver entry 0x0B)
+ *
+ * Original: Finalizes rendering for the current frame.
+ * Called from RwCameraEndUpdate.
+ *
+ * Override: Call bridge to EndScene.
+ */
+void sub_001E7B10(void)
+{
+    static uint32_t call_count = 0;
+    call_count++;
+    if (call_count <= 5 || (call_count % 500) == 0) {
+        fprintf(stderr, "  [RW-END] CameraEndUpdate #%u\n", call_count);
+    }
+
+    /* Call bridge to flush 2D and EndScene */
+    rw_bridge_camera_end(0);
+
+    eax = 1;
+    esp += 4; return;
+}
 
 /*
  * sub_00351090 - RW camera scene render (RwCameraShowRaster equivalent)
@@ -1627,10 +1714,7 @@ void sub_00351090(void)
         if (camera_xbox_va > 0x10000 && camera_xbox_va < 0x4000000) {
             uint32_t flags = MEM32(camera_xbox_va + 8);
             uint32_t frame = MEM32(camera_xbox_va + 0x2478);
-            uint32_t s1 = MEM32(camera_xbox_va + 0x8D4);
-            uint32_t s2 = MEM32(camera_xbox_va + 0x8D8);
-            fprintf(stderr, " flags=0x%08X frame=%u s1=%u s2=%u",
-                    flags, frame, s1, s2);
+            fprintf(stderr, " flags=0x%08X frame=%u", flags, frame);
         }
         fprintf(stderr, "\n");
     }
@@ -1644,6 +1728,12 @@ void sub_00351090(void)
             MEM32(camera_xbox_va + 0x2478) = MEM32(camera_xbox_va + 0x2478) + 1;
         }
     }
+
+    /* === RW→D3D11 BRIDGE: Actually render the scene ===
+     * Instead of just incrementing the frame counter, call the bridge
+     * to render through our D3D8→D3D11 layer. The bridge reads camera
+     * state from Xbox memory and renders track/vehicles/scene. */
+    rw_bridge_camera_render(camera_xbox_va);
 
     /* Original uses RET 4 (callee cleans 1 param) */
     eax = (camera_xbox_va > 0x10000 && camera_xbox_va < 0x4000000)
@@ -1847,6 +1937,24 @@ void sub_001FE1E0(void)
  * Our D3D11 layer (d3d8_device.c) handles actual rendering separately.
  * This stub matches the original's ret 12 (pops 3 dword args + ret addr).
  */
+/*
+ * sub_001DB2C0 - Im2D vertex transform helper (STUB)
+ *
+ * Original: 0x001DB2C0 (not generated by recompiler)
+ * Called via im2d function pointer table at 0x7592AC.
+ * Similar to sub_001DB620/sub_001DB9D0 - vertex transformation.
+ * Stub: return without action (im2d transforms not needed when
+ * rendering through our D3D8→D3D11 bridge).
+ */
+void sub_001DB2C0(void)
+{
+    static uint32_t call_count = 0;
+    call_count++;
+    if (call_count <= 5 || (call_count % 10000) == 0)
+        fprintf(stderr, "  [IM2D] sub_001DB2C0 (im2d transform) called #%u\n", call_count);
+    esp += 4; return;
+}
+
 volatile uint32_t g_d3d_render_count = 0;
 void sub_0034D530(void)
 {

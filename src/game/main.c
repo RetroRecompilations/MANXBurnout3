@@ -49,6 +49,9 @@
 #include "awd_loader.h"
 #include "../apu/apu.h"
 
+/* RW→D3D11 rendering bridge */
+#include "rw_bridge.h"
+
 /* Global AWD files */
 AWDFile *g_awd_fe = NULL;
 AWDFile *g_awd_generic = NULL;
@@ -2329,22 +2332,32 @@ void game_frame_pump(void)
         }
 
         /* === Gameplay rendering === */
-        g_d3d_device->lpVtbl->BeginScene(g_d3d_device);
-        g_d3d_device->lpVtbl->Clear(g_d3d_device, 0, NULL,
-            D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER,
-            0xFF102040, /* Dark blue-grey */
-            1.0f, 0);
 
         /* Initialize texture cache on first frame */
         txd_cache_init();
 
-        /* 3D model view mode (toggle with M key) */
-        if (g_show_3d_model && g_car_model_loaded) {
-            render_3d_model_view(g_d3d_device, 1.0f / 60.0f);
-        }
-        else {
-            /* 3D rendering mode (always on) */
-            rw_gameplay_render();
+        /* Check if the RW bridge already rendered this frame.
+         * If so, the RW pipeline (sub_001DDAF0 → sub_00351090 → bridge)
+         * already called BeginScene/Clear/rw_gameplay_render/EndScene.
+         * We only need to do the model viewer or NV2A test, plus Present. */
+        if (!rw_bridge_frame_rendered()) {
+            g_d3d_device->lpVtbl->BeginScene(g_d3d_device);
+            g_d3d_device->lpVtbl->Clear(g_d3d_device, 0, NULL,
+                D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER,
+                0xFF102040, /* Dark blue-grey */
+                1.0f, 0);
+
+            /* 3D model view mode (toggle with M key) */
+            if (g_show_3d_model && g_car_model_loaded) {
+                render_3d_model_view(g_d3d_device, 1.0f / 60.0f);
+            }
+            else {
+                /* 3D rendering mode (fallback when bridge isn't active) */
+                rw_gameplay_render();
+            }
+        } else {
+            /* Bridge rendered — BeginScene/EndScene already done.
+             * NV2A test and ImGui will run after this block. */
         }
 #if 0  /* Pseudo-3D mode removed - 3D is always on */
         if (0)
@@ -4614,13 +4627,19 @@ void game_frame_pump(void)
             nv2a_pb_test_frame();
         }
 
-        g_d3d_device->lpVtbl->EndScene(g_d3d_device);
+        if (!rw_bridge_frame_rendered()) {
+            g_d3d_device->lpVtbl->EndScene(g_d3d_device);
+        }
         menu_gui_begin_frame();
         menu_gui_render();
-        g_d3d_device->lpVtbl->Present(g_d3d_device, NULL, NULL, NULL, NULL);
-        {
-            extern volatile uint32_t g_present_count;
-            g_present_count++;
+        if (!rw_bridge_frame_rendered()) {
+            /* Only present here if the bridge didn't render.
+             * When bridge is active, sub_001D9420 handles Present. */
+            g_d3d_device->lpVtbl->Present(g_d3d_device, NULL, NULL, NULL, NULL);
+            {
+                extern volatile uint32_t g_present_count;
+                g_present_count++;
+            }
         }
     }
 

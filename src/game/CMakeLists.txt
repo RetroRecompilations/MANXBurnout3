@@ -44,6 +44,7 @@ set(GAME_SOURCES
     rw_renderer.c
     video_player.c
     awd_loader.c
+    rw_bridge.c
     menu_gui.cpp
     recomp/recomp_test.c
     recomp/recomp_manual.c

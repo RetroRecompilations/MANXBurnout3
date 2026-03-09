@@ -259,8 +259,20 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
     g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
     g_icall_trace_idx++; \
     g_icall_count++; \
+    /* Try native pointer → Xbox VA conversion for addresses in mapped region. \
+     * RW engine stores native heap pointers in Xbox memory; when code reads \
+     * them back and uses as function addresses, they're native addresses \
+     * pointing into our memory mirrors. Convert back to Xbox VA. */ \
     if (_va >= 0x00400000 && _va < 0xFE000000) { \
-        g_esp += 4; eax = 0; break; /* garbage VA: outside code + kernel range */ \
+        uint32_t _off32 = (uint32_t)g_xbox_mem_offset; \
+        int _resolved = 0; \
+        if (_off32 != 0 && _va >= _off32) { \
+            uint32_t _xva = (_va - _off32) % 0x04000000u; \
+            if (_xva >= 0x00011000 && _xva < 0x002CC800) { \
+                _va = _xva; _resolved = 1; \
+            } \
+        } \
+        if (!_resolved) { g_esp += 4; eax = 0; break; } \
     } \
     recomp_func_t _fn = recomp_lookup_manual(_va); \
     if (!_fn) _fn = recomp_lookup(_va); \
@@ -280,7 +292,15 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
     g_icall_trace_idx++; \
     g_icall_count++; \
     if (_va >= 0x00400000 && _va < 0xFE000000) { \
-        g_esp = (saved_esp); eax = 0; break; /* garbage VA: outside code + kernel range */ \
+        uint32_t _off32 = (uint32_t)g_xbox_mem_offset; \
+        int _resolved = 0; \
+        if (_off32 != 0 && _va >= _off32) { \
+            uint32_t _xva = (_va - _off32) % 0x04000000u; \
+            if (_xva >= 0x00011000 && _xva < 0x002CC800) { \
+                _va = _xva; _resolved = 1; \
+            } \
+        } \
+        if (!_resolved) { g_esp = (saved_esp); eax = 0; break; } \
     } \
     recomp_func_t _fn = recomp_lookup_manual(_va); \
     if (!_fn) _fn = recomp_lookup(_va); \
