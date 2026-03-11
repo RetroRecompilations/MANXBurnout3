@@ -34,9 +34,24 @@ The goal is to translate the original x86 Xbox code into a native Windows execut
 - Addresses are always shown as hex with 0x prefix (e.g., 0x001D2807)
 - Xbox kernel function names use their original Xbox names with `xbox_` prefix when reimplemented
 
-## Current Work State (Session 31)
+## Current Work State (Session 37)
 
-### Status: xemu-verified gameplay state + race data writeback
+### Status: State machine state 5 (frontend/menus) reached
+Game boots, loads, runs gameplay loop. State 4→5 transition now forced via sub_001AA100 override.
+sub_000171A0 (frontend render dispatch) is called every frame in state 5.
+**Current blocker**: Frontend object vtable is native pointer (0x1C45BA68) — needs native→Xbox VA conversion.
+
+### Session 37 Changes
+- **sub_001AA100 overridden** in recomp_manual.c: forces return 1 after 30 frames
+  - Fixes garbage phase (0x3F800000 at 0x60EA00+0x144384) → set to 0x17
+  - Enables state 4→5 transition in outer state machine (sub_000165F0)
+- **Frontend render path activated**: sub_000171A0 now fires every frame
+  - Frontend obj at 0x4D4008, vtable at 0x1C45BA68 (native ptr, not Xbox VA)
+  - 0x1C45BA68 % 0x4000000 = 0x0045BA68 (valid Xbox VA)
+  - Next: fix vtable resolution to use Xbox VA space
+- **recomp_0004.c**: `#if 0` around gen sub_001AA100
+
+### Previous Status
 Game boots, loads, runs gameplay loop. **Two rendering modes** toggled with V key:
 1. **Pseudo-3D** (default): OutRun-style 2.5D rendering (unchanged from Session 21)
 2. **True 3D** (V key): Full 3D world-space rendering with chase camera, time-of-day cycling, roadside scenery, tunnels, night stars, rain weather, and 3D vehicle models.
@@ -186,7 +201,7 @@ Game boots, loads, runs gameplay loop. **Two rendering modes** toggled with V ke
 1. **recomp_0000.c**: extern g_tick_110e0_count, sub_000165F0 entry/ESP traces, sub_00015570 vtable guard, sub_0003D9E0 #if 0, **sub_000636D0 #if 0**, jump table→C switch (replace_all), state traces, exit path traces, case 3 traces
 2. **recomp_0002.c**: #if 0 around sub_00135040, sub_00135240
 3. **recomp_0003.c**: extern g_tick_110e0_count, flag clear, ESP+callee-saved save/restore, game loop traces
-4. **recomp_0004.c**: #if 0 around sub_001CFDD0, sub_001BEFF0, sub_001C1670, sub_001C1740, sub_001C66F0; vtable guards in sub_001B4170, sub_001B41F0, sub_001AEE20
+4. **recomp_0004.c**: #if 0 around sub_001CFDD0, sub_001BEFF0, sub_001C1670, sub_001C1740, sub_001C66F0, sub_001AA100; vtable guards in sub_001B4170, sub_001B41F0, sub_001AEE20
 5. **recomp_0005.c**: #if 0 around 35 functions
 6. **recomp_0006.c**: #if 0 around sub_001FE1E0, sub_00221F20
 7. **recomp_0007.c**: #if 0 around sub_00244C51, sub_00249B7C, sub_00249B9C
@@ -195,5 +210,5 @@ Game boots, loads, runs gameplay loop. **Two rendering modes** toggled with V ke
 10. **recomp_dispatch.c**: add sub_001D1818/sub_001D2793 entries, size=22097
 11. **recomp_funcs.h**: add sub_001D1818/sub_001D2793 declarations
 
-### Manual Function Overrides (recomp_manual.c) - 31 functions
-Including sub_000636D0 (physics force with scale fallbacks + fake body), sub_0003D9E0 (render orchestrator stub), sub_000110E0 (frame pump with MEM8(0x4D53BE)=1 signal)
+### Manual Function Overrides (recomp_manual.c) - 32 functions
+Including sub_000636D0 (physics force with scale fallbacks + fake body), sub_0003D9E0 (render orchestrator stub), sub_000110E0 (frame pump with MEM8(0x4D53BE)=1 signal), sub_001AA100 (game mode state machine - forces state 4→5 transition after 30 frames)

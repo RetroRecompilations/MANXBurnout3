@@ -158,6 +158,7 @@ void sub_001D92A0(void);
 void sub_001D92EF(void);
 void sub_001D9360(void);
 void sub_001D93AF(void);
+void sub_000171A0(void);  /* Frontend render dispatch (traced) */
 void sub_001D9420(void);
 void sub_001D9450(void);
 void sub_001D94A0(void);
@@ -392,6 +393,10 @@ static const struct {
     /* Resource queue handler (override - actually loads files) */
     { 0x00011240u, (recomp_func_t)sub_00011240 },
     /* sub_00157680 removed - using gen code with relocated PrgData */
+    /* Frontend render dispatch (traced) */
+    { 0x000171A0u, (recomp_func_t)sub_000171A0 },
+    /* Game mode state machine (force state 4→5 transition) */
+    { 0x001AA100u, (recomp_func_t)sub_001AA100 },
 };
 #define NUM_MANUAL_FUNCS (sizeof(g_manual_funcs) / sizeof(g_manual_funcs[0]))
 
@@ -1699,12 +1704,16 @@ void sub_00351090(void)
 
     swap_flag = MEM32(esp + 4);
 
-    /* Check if camera pointer is a native address and convert */
+    /* Check if camera pointer is a native address and convert.
+     * Native addresses in memory mirrors need modulo 0x4000000 (64MB)
+     * to unwrap back to Xbox VA space. */
     if (camera_xbox_va > 0x4000000 && g_xbox_mem_offset > 0) {
-        /* The RW code stored a native pointer - convert back to Xbox VA */
-        uint32_t maybe_xbox_va = (uint32_t)(camera_xbox_va - (uint32_t)g_xbox_mem_offset);
-        if (maybe_xbox_va < 0x4000000) {
-            camera_xbox_va = maybe_xbox_va;
+        uint32_t _off32 = (uint32_t)g_xbox_mem_offset;
+        if (camera_xbox_va >= _off32) {
+            uint32_t maybe_xbox_va = (camera_xbox_va - _off32) % 0x04000000u;
+            if (maybe_xbox_va >= 0x10000 && maybe_xbox_va < 0x4000000) {
+                camera_xbox_va = maybe_xbox_va;
+            }
         }
     }
 
@@ -3643,3 +3652,150 @@ void sub_002CC851(void) { /* RW software rasterizer - stubbed */ }
 void sub_002CC935(void) { /* RW software rasterizer - stubbed */ }
 void sub_002CC951(void) { /* RW software rasterizer - stubbed */ }
 void sub_002CCB1C(void) { /* RW software rasterizer - stubbed */ }
+
+/* =================================================================
+ * sub_000171A0 - Frontend object render dispatch (TRACED)
+ *
+ * Original: reads frontend object from game_base+0x2E1D0,
+ * gets vtable, calls vtable[3] (render method).
+ * Override: same logic but with diagnostic tracing to see
+ * what render method is being called and whether it succeeds.
+ * ================================================================= */
+void sub_000171A0(void)
+{
+    static uint32_t call_count = 0;
+    uint32_t ebp_local;  /* ebp is local, not a global register */
+    uint32_t game_base, frontend_obj, vtable, render_method;
+    float xmm0, xmm1, xmm2, xmm3;
+
+    call_count++;
+    if (call_count <= 5)
+        fprintf(stderr, "  [FRONTEND] sub_000171A0 ENTERED #%u esp=0x%08X\n", call_count, esp);
+
+    /* Standard EBP-based prologue (ebp is local) */
+    PUSH32(esp, g_seh_ebp);
+    ebp_local = esp;
+    esp = esp - 0x14;
+
+    /* Floating point delta tracking (original code) */
+    xmm0 = MEMF(0x4D6198);
+    xmm2 = MEMF(0x4D61A0);
+    xmm3 = MEMF(0x4D61A4);
+    xmm1 = MEMF(0x4D619C);
+
+    if (xmm0 != xmm2 || xmm1 != xmm3) {
+        float dx = xmm0 - xmm2;
+        float dy = xmm1 - xmm3;
+        MEMF(0x4D618C) = MEMF(0x4D618C) + dx;
+        MEMF(0x4D6190) = MEMF(0x4D6190) + dy;
+        MEM32(0x4D61A0) = MEM32(0x4D6198);
+        MEM32(0x4D61A4) = MEM32(0x4D619C);
+    }
+
+    /* Get frontend object and call its render method.
+     * ebp_local + 8 = first param (game_base, pushed by caller) */
+    game_base = MEM32(ebp_local + 8);
+    frontend_obj = MEM32(game_base + 0x2E1D0);
+
+    if (frontend_obj > 0x10000 && frontend_obj < 0x4000000) {
+        vtable = MEM32(frontend_obj);
+        if (vtable > 0x10000 && vtable < 0x4000000) {
+            render_method = MEM32(vtable + 0xC);
+
+            if (call_count <= 10 || (call_count % 5000) == 0) {
+                fprintf(stderr, "  [FRONTEND] #%u: base=0x%08X fe_obj=0x%08X vtable=0x%08X render=0x%08X im2d_state=%u\n",
+                        call_count, game_base, frontend_obj, vtable, render_method, MEM32(0x7593F0));
+            }
+
+            /* Make the vtable call */
+            { uint32_t _icall_esp = g_esp;
+            PUSH32(esp, 0); RECOMP_ICALL_SAFE(render_method, _icall_esp);
+            }
+        } else {
+            if (call_count <= 10)
+                fprintf(stderr, "  [FRONTEND] #%u: fe_obj=0x%08X vtable=0x%08X (INVALID)\n",
+                        call_count, frontend_obj, vtable);
+        }
+    } else {
+        if (call_count <= 10)
+            fprintf(stderr, "  [FRONTEND] #%u: base=0x%08X fe_obj=0x%08X (INVALID)\n",
+                    call_count, game_base, frontend_obj);
+    }
+
+    /* Epilogue: ret 4 (stdcall) */
+    esp = ebp_local;
+    POP32(esp, g_seh_ebp);
+    esp += 8; return;
+}
+
+/* =================================================================
+ * sub_001AA100 - Game mode state machine (OVERRIDE)
+ *
+ * Original: 0x001AA100 - 0x001AA6A8 (1448 bytes, 346 insns)
+ * Category: game_network
+ * CC: stdcall, 1 param (game object base, usually 0x60EA00)
+ *
+ * This is a multi-phase initialization state machine (phases 1-0x17)
+ * stored at ebp+0x144384. The problem: the phase field contains
+ * garbage (0x3F800000 = 1.0f as IEEE 754) because the initialization
+ * that would set it properly never ran. The function jumps to the
+ * per-frame body (phase > 0x17) but crashes on corrupted internal
+ * state (12B79C=huge count, native pointer leaks), returning 0.
+ *
+ * Fix: After a warm-up period, force return 1 so the outer state
+ * machine (sub_000165F0) transitions from state 4 to state 5 (menus).
+ * Also initialize the phase to 0x17 (completed) so the per-frame
+ * body path is correct on subsequent calls.
+ * ================================================================= */
+void sub_001AA100(void)
+{
+    static uint32_t call_count = 0;
+    uint32_t ebp_val;
+
+    /* stdcall: 1 param on stack (game object base) */
+    /* Stack: [esp] = return addr, [esp+4] = param */
+    PUSH32(esp, ebx);
+    PUSH32(esp, g_seh_ebp);
+    ebp_val = MEM32(esp + 0xC); /* param = game object base (0x60EA00) */
+    PUSH32(esp, esi);
+    PUSH32(esp, edi);
+
+    call_count++;
+
+    if (call_count <= 10 || (call_count % 1000) == 0) {
+        fprintf(stderr, "  [1AA100-OVR] #%u ebp=0x%08X phase=0x%08X\n",
+                call_count, ebp_val, MEM32(ebp_val + 0x144384));
+    }
+
+    /* Initialize phase to 0x17 (completed) if it's garbage */
+    if (MEM32(ebp_val + 0x144384) > 0x100) {
+        fprintf(stderr, "  [1AA100-OVR] Fixing garbage phase 0x%08X → 0x17\n",
+                MEM32(ebp_val + 0x144384));
+        MEM32(ebp_val + 0x144384) = 0x17;
+    }
+
+    /* After 30 frames of warmup, return 1 to trigger state 4→5 */
+    if (call_count >= 30) {
+        if (call_count == 30) {
+            fprintf(stderr, "  [1AA100-OVR] FORCING return 1 after %u frames → state 5\n",
+                    call_count);
+            /* Set the "done" flag that the caller checks */
+            MEM32(ebp_val + 0x144384) = 0x17;
+        }
+        /* Return 1: transition allowed */
+        POP32(esp, edi);
+        POP32(esp, esi);
+        POP32(esp, g_seh_ebp);
+        SET_LO8(eax, 1);
+        POP32(esp, ebx);
+        esp += 8; return; /* ret 4 (stdcall) */
+    }
+
+    /* First 30 frames: return 0 (let other init happen) */
+    POP32(esp, edi);
+    POP32(esp, esi);
+    POP32(esp, g_seh_ebp);
+    SET_LO8(eax, 0);
+    POP32(esp, ebx);
+    esp += 8; return; /* ret 4 (stdcall) */
+}
