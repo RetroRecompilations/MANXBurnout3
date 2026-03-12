@@ -27,6 +27,7 @@ extern void rw_bridge_camera_begin(uint32_t camera_va);
 extern void rw_bridge_camera_end(uint32_t camera_va);
 extern void rw_bridge_new_frame(void);
 extern int  rw_bridge_frame_rendered(void);
+extern int  rw_bridge_im2d_render(int prim_type, const void *verts, int vert_count);
 
 /**
  * RW Display Driver Function Pointer Table
@@ -98,6 +99,12 @@ void rw_init_display_driver_table(void)
     MEM32(0x7592B0) = 0x1DB9D0;   /* im2d vertex transform (inverse) */
     MEM32(0x7592B4) = 0x1DB6D0;   /* im2d batch vertex transform */
     MEM32(0x41AAD4) = 1;          /* im2d reference count */
+
+    /* Im2d render callbacks (stored in im2d state block):
+     * These are set by RW device open (sub_001E3931 path) but we
+     * need to ensure they're populated for menu/HUD rendering. */
+    MEM32(0x7592CC) = 0x1E2930;   /* im2d render triangle callback */
+    MEM32(0x7592D0) = 0x1E2330;   /* im2d render line callback */
 
     fprintf(stderr, "  [RW] Display driver table populated at 0x%08X\n", table_base);
     fprintf(stderr, "  [RW]   [0x759338] (render cb) = 0x%08X\n", MEM32(0x759338));
@@ -1550,6 +1557,49 @@ void sub_001D9420(void) {
     eax = 0;
     POP32(esp, esi);
 
+    /* ── Im2d debug HUD overlay ── */
+    {
+        /* Draw debug status bars via im2d:
+         * - Top bar: game state indicator (color = state)
+         * - Bottom bar: im2d pipeline active indicator */
+        typedef struct { float x, y, z, rhw; uint32_t col; float u, v; } HudVert;
+        HudVert hv[12]; /* 2 quads = 12 verts */
+        int i;
+
+        uint32_t game_st = MEM32(0x4D53B8);
+        /* State color: 4=orange, 5=green, 7=blue, other=grey */
+        uint32_t sc = 0xC0808080;
+        if (game_st == 4) sc = 0xC0FF8000;
+        if (game_st == 5) sc = 0xC000FF80;
+        if (game_st == 7) sc = 0xC04080FF;
+
+        /* Initialize all verts to defaults */
+        for (i = 0; i < 12; i++) {
+            hv[i].z = 0; hv[i].rhw = 1; hv[i].u = 0; hv[i].v = 0;
+        }
+
+        /* Top bar: game state indicator (full width, 4px tall) */
+        hv[0].x=0;   hv[0].y=0; hv[0].col=sc;
+        hv[1].x=640; hv[1].y=0; hv[1].col=sc;
+        hv[2].x=0;   hv[2].y=4; hv[2].col=sc;
+        hv[3].x=640; hv[3].y=0; hv[3].col=sc;
+        hv[4].x=640; hv[4].y=4; hv[4].col=sc;
+        hv[5].x=0;   hv[5].y=4; hv[5].col=sc;
+
+        /* Bottom bar: im2d active indicator (green pulsing) */
+        {
+            uint32_t pc = 0xC000FF00 | ((g_present_count % 60 < 30) ? 0xFF000000 : 0x80000000);
+            hv[6].x=0;    hv[6].y=476;  hv[6].col=pc;
+            hv[7].x=640;  hv[7].y=476;  hv[7].col=pc;
+            hv[8].x=0;    hv[8].y=480;  hv[8].col=pc;
+            hv[9].x=640;  hv[9].y=476;  hv[9].col=pc;
+            hv[10].x=640; hv[10].y=480; hv[10].col=pc;
+            hv[11].x=0;   hv[11].y=480; hv[11].col=pc;
+        }
+
+        rw_bridge_im2d_render(4, hv, 12);
+    }
+
     /* Always do our D3D11 Present */
     d3d8_PresentFrame();
 
@@ -1972,6 +2022,116 @@ void sub_0034D530(void)
         fprintf(stderr, "  [D3D8-RENDER] sub_0034D530 called #%u\n", g_d3d_render_count);
     eax = 0;
     esp += 16; return; /* ret 12: pop 12 bytes of args + 4 byte ret addr */
+}
+
+/* ── Im2D render overrides ──────────────────────────────────── */
+
+/* RwIm2DVertex matches our rw_bridge.h struct: x,y,z,rhw,color,u,v (28 bytes) */
+typedef struct Im2DVert {
+    float x, y, z, rhw;
+    uint32_t color;
+    float u, v;
+} Im2DVert;
+
+extern int rw_bridge_im2d_render(int prim_type, const void *verts, int vert_count);
+extern int rw_bridge_im2d_render_indexed(int prim_type, const void *verts,
+                                          int vert_count, const uint16_t *indices,
+                                          int index_count);
+
+/**
+ * sub_001DE900 - RwIm2DRenderPrimitive (OVERRIDE)
+ *
+ * Original: 0x001DE900 - 0x001DE92F (47 bytes, 12 insns)
+ * cdecl: (void *verts, uint8_t primType, int32_t numVerts)
+ *
+ * The RW im2d render entry point. Game code calls this with pre-transformed
+ * screen-space vertices (XYZRHW). Originally packs args and calls driver
+ * table entry 0x0F (sub_001DBDE0) which goes through the Xbox D3D8LTCG
+ * pipeline. We intercept here and route to rw_bridge_im2d_render().
+ */
+void sub_001DE900(void)
+{
+    /* Read cdecl params from recomp stack:
+     * esp+4  = vertex buffer pointer (Xbox VA)
+     * esp+8  = primitive type (byte, only low byte used)
+     * esp+C  = vertex count (int32) */
+    uint32_t vert_va   = MEM32(esp + 4);
+    uint32_t prim_type = ZX8(MEM8(esp + 8));
+    int32_t  num_verts = (int32_t)MEM32(esp + 0xC);
+
+    static uint32_t call_count = 0;
+    call_count++;
+
+    if (num_verts <= 0 || num_verts > 4096) {
+        if (call_count <= 10)
+            fprintf(stderr, "  [IM2D-RENDER] #%u: bad vert count %d, skipping\n",
+                    call_count, num_verts);
+        eax = 0;
+        esp += 4; return; /* ret */
+    }
+
+    /* Resolve vertex pointer to native memory */
+    Im2DVert *native_verts = (Im2DVert *)((uintptr_t)vert_va + g_xbox_mem_offset);
+
+    if (call_count <= 10 || (call_count % 5000) == 0) {
+        fprintf(stderr, "  [IM2D-RENDER] #%u: type=%u verts=%d va=0x%08X",
+                call_count, prim_type, num_verts, vert_va);
+        if (num_verts > 0) {
+            fprintf(stderr, " v0=(%.1f,%.1f,%.1f rhw=%.3f col=0x%08X)",
+                    native_verts[0].x, native_verts[0].y, native_verts[0].z,
+                    native_verts[0].rhw, native_verts[0].color);
+        }
+        fprintf(stderr, "\n");
+    }
+
+    /* Route through our D3D11 bridge */
+    int ok = rw_bridge_im2d_render(prim_type, native_verts, num_verts);
+
+    eax = ok ? 1 : 0;
+    esp += 4; return; /* ret */
+}
+
+/**
+ * sub_001DBDE0 - D3D8LTCG im2d render driver entry (OVERRIDE)
+ *
+ * Original: 0x001DBDE0 - 0x001DC138 (856 bytes, 290 insns)
+ * Driver table entry 0x0F. Called with packed args:
+ *   esp+4 = state_ptr, esp+8 = vert_ptr, esp+C = (primType << 8) + vertCount
+ *
+ * Since we override sub_001DE900 above, this should rarely be called.
+ * Override it as safety net in case anything calls the driver entry directly.
+ */
+void sub_001DBDE0(void)
+{
+    /* Read packed args from driver call convention:
+     * After the function's internal esp -= 0x14:
+     *   esp+0x20 = packed (primType << 8) + vertCount
+     *   esp+0x24 = vertex pointer
+     * But since we're overriding from the entry, the stack is simpler:
+     *   esp+4 = state_ptr, esp+8 = vert_ptr, esp+C = packed */
+    uint32_t vert_va = MEM32(esp + 8);
+    uint32_t packed  = MEM32(esp + 0xC);
+    uint32_t prim_type = (packed >> 8) & 0xFF;
+    int32_t  num_verts = packed & 0xFF;
+
+    /* If vertCount > 255 the packed format may differ; try full value */
+    if (num_verts == 0)
+        num_verts = packed & 0xFFFF;
+
+    static uint32_t call_count = 0;
+    call_count++;
+    if (call_count <= 10 || (call_count % 5000) == 0) {
+        fprintf(stderr, "  [IM2D-DRV] #%u: entry 0x0F direct call, type=%u verts=%d\n",
+                call_count, prim_type, num_verts);
+    }
+
+    if (num_verts > 0 && num_verts <= 4096 && vert_va != 0) {
+        Im2DVert *native_verts = (Im2DVert *)((uintptr_t)vert_va + g_xbox_mem_offset);
+        rw_bridge_im2d_render(prim_type, native_verts, num_verts);
+    }
+
+    eax = 0;
+    esp += 4; return; /* ret */
 }
 
 /**

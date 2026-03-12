@@ -289,52 +289,55 @@ int rw_bridge_im2d_render(int prim_type, const RwIm2DVertex *verts,
     IDirect3DDevice8 *dev = xbox_GetD3DDevice();
     if (!dev || !verts || vert_count <= 0) return 0;
 
-    /* If we're in a scene, render directly */
-    if (g_bridge_in_scene) {
-        dev->lpVtbl->SetRenderState(dev, D3DRS_ZENABLE, FALSE);
-        dev->lpVtbl->SetRenderState(dev, D3DRS_LIGHTING, FALSE);
-        dev->lpVtbl->SetRenderState(dev, D3DRS_CULLMODE, D3DCULL_NONE);
-        dev->lpVtbl->SetRenderState(dev, D3DRS_ALPHABLENDENABLE, TRUE);
-        dev->lpVtbl->SetRenderState(dev, D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
-        dev->lpVtbl->SetRenderState(dev, D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
-
-        DWORD fvf = D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1;
-        dev->lpVtbl->SetVertexShader(dev, fvf);
-
-        UINT prim_count = 0;
-        switch (prim_type) {
-            case D3DPT_TRIANGLELIST:  prim_count = vert_count / 3; break;
-            case D3DPT_TRIANGLESTRIP: prim_count = vert_count - 2; break;
-            case D3DPT_TRIANGLEFAN:   prim_count = vert_count - 2; break;
-            case D3DPT_LINELIST:      prim_count = vert_count / 2; break;
-            case D3DPT_LINESTRIP:     prim_count = vert_count - 1; break;
-            default:                  prim_count = vert_count; break;
-        }
-
-        if (prim_count > 0) {
-            dev->lpVtbl->DrawPrimitiveUP(dev, (D3DPRIMITIVETYPE)prim_type,
-                prim_count, verts, sizeof(RwIm2DVertex));
-        }
-
-        static uint32_t im2d_count = 0;
-        im2d_count++;
-        if (im2d_count <= 5 || (im2d_count % 1000) == 0) {
-            fprintf(stderr, "[RW-BRIDGE] im2d render #%u: type=%d verts=%d prims=%u\n",
-                    im2d_count, prim_type, vert_count, prim_count);
-        }
-
-        return 1;
+    /* If not in a scene, start one for this im2d batch.
+     * Im2d calls often happen AFTER the 3D scene ends (camera_end)
+     * but before present (show_raster). We need our own scene bracket. */
+    int started_scene = 0;
+    if (!g_bridge_in_scene) {
+        dev->lpVtbl->BeginScene(dev);
+        g_bridge_in_scene = 1;
+        started_scene = 1;
     }
 
-    /* Not in a scene — queue for later flush during camera_end */
-    if (prim_type == D3DPT_TRIANGLELIST) {
-        int space = IM2D_MAX_VERTS - g_im2d_queue_count;
-        int to_copy = (vert_count < space) ? vert_count : space;
-        if (to_copy > 0) {
-            memcpy(&g_im2d_queue[g_im2d_queue_count], verts,
-                   to_copy * sizeof(RwIm2DVertex));
-            g_im2d_queue_count += to_copy;
-        }
+    /* Set up 2D rendering state */
+    dev->lpVtbl->SetRenderState(dev, D3DRS_ZENABLE, FALSE);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_LIGHTING, FALSE);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_CULLMODE, D3DCULL_NONE);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_ALPHABLENDENABLE, TRUE);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+
+    DWORD fvf = D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1;
+    dev->lpVtbl->SetVertexShader(dev, fvf);
+    dev->lpVtbl->SetTexture(dev, 0, NULL);
+
+    UINT prim_count = 0;
+    switch (prim_type) {
+        case D3DPT_TRIANGLELIST:  prim_count = vert_count / 3; break;
+        case D3DPT_TRIANGLESTRIP: prim_count = vert_count - 2; break;
+        case D3DPT_TRIANGLEFAN:   prim_count = vert_count - 2; break;
+        case D3DPT_LINELIST:      prim_count = vert_count / 2; break;
+        case D3DPT_LINESTRIP:     prim_count = vert_count - 1; break;
+        default:                  prim_count = vert_count; break;
+    }
+
+    if (prim_count > 0) {
+        dev->lpVtbl->DrawPrimitiveUP(dev, (D3DPRIMITIVETYPE)prim_type,
+            prim_count, verts, sizeof(RwIm2DVertex));
+    }
+
+    static uint32_t im2d_count = 0;
+    im2d_count++;
+    if (im2d_count <= 5 || (im2d_count % 1000) == 0) {
+        fprintf(stderr, "[RW-BRIDGE] im2d render #%u: type=%d verts=%d prims=%u scene=%s\n",
+                im2d_count, prim_type, vert_count, prim_count,
+                started_scene ? "auto" : "existing");
+    }
+
+    /* If we started the scene ourselves, end it now */
+    if (started_scene) {
+        dev->lpVtbl->EndScene(dev);
+        g_bridge_in_scene = 0;
     }
 
     return 1;
@@ -347,36 +350,45 @@ int rw_bridge_im2d_render_indexed(int prim_type, const RwIm2DVertex *verts,
     IDirect3DDevice8 *dev = xbox_GetD3DDevice();
     if (!dev || !verts || !indices || index_count <= 0) return 0;
 
-    if (g_bridge_in_scene) {
-        dev->lpVtbl->SetRenderState(dev, D3DRS_ZENABLE, FALSE);
-        dev->lpVtbl->SetRenderState(dev, D3DRS_LIGHTING, FALSE);
-        dev->lpVtbl->SetRenderState(dev, D3DRS_CULLMODE, D3DCULL_NONE);
-        dev->lpVtbl->SetRenderState(dev, D3DRS_ALPHABLENDENABLE, TRUE);
-        dev->lpVtbl->SetRenderState(dev, D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
-        dev->lpVtbl->SetRenderState(dev, D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
-
-        DWORD fvf = D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1;
-        dev->lpVtbl->SetVertexShader(dev, fvf);
-
-        UINT prim_count = 0;
-        switch (prim_type) {
-            case D3DPT_TRIANGLELIST:  prim_count = index_count / 3; break;
-            case D3DPT_TRIANGLESTRIP: prim_count = index_count - 2; break;
-            default:                  prim_count = index_count / 3; break;
-        }
-
-        if (prim_count > 0) {
-            dev->lpVtbl->DrawIndexedPrimitiveUP(dev,
-                (D3DPRIMITIVETYPE)prim_type,
-                0, vert_count, prim_count,
-                indices, D3DFMT_INDEX16,
-                verts, sizeof(RwIm2DVertex));
-        }
-
-        return 1;
+    int started_scene = 0;
+    if (!g_bridge_in_scene) {
+        dev->lpVtbl->BeginScene(dev);
+        g_bridge_in_scene = 1;
+        started_scene = 1;
     }
 
-    return 0;
+    dev->lpVtbl->SetRenderState(dev, D3DRS_ZENABLE, FALSE);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_LIGHTING, FALSE);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_CULLMODE, D3DCULL_NONE);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_ALPHABLENDENABLE, TRUE);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+
+    DWORD fvf = D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1;
+    dev->lpVtbl->SetVertexShader(dev, fvf);
+    dev->lpVtbl->SetTexture(dev, 0, NULL);
+
+    UINT prim_count = 0;
+    switch (prim_type) {
+        case D3DPT_TRIANGLELIST:  prim_count = index_count / 3; break;
+        case D3DPT_TRIANGLESTRIP: prim_count = index_count - 2; break;
+        default:                  prim_count = index_count / 3; break;
+    }
+
+    if (prim_count > 0) {
+        dev->lpVtbl->DrawIndexedPrimitiveUP(dev,
+            (D3DPRIMITIVETYPE)prim_type,
+            0, vert_count, prim_count,
+            indices, D3DFMT_INDEX16,
+            verts, sizeof(RwIm2DVertex));
+    }
+
+    if (started_scene) {
+        dev->lpVtbl->EndScene(dev);
+        g_bridge_in_scene = 0;
+    }
+
+    return 1;
 }
 
 /* ── 3D immediate mode rendering ────────────────────────────── */

@@ -31,11 +31,13 @@ The technical challenges are fascinating: translating x86 to x86-64 with a globa
 - Full game boot sequence through the original RenderWare engine init
 - **Game state machine**: loading → init → state 4 (crash) → state 5 (menus/frontend) — running continuously
 - **RW→D3D11 rendering bridge** — the original RenderWare display driver pipeline (sub_001DDAF0 → sub_00351090) routes through our D3D8→D3D11 layer
-- **Im2d 2D rendering API** ready for menu/HUD overlays
+- **Im2d 2D rendering pipeline** — RwIm2DRenderPrimitive (sub_001DE900) overridden to route pre-transformed 2D vertices through D3D8→D3D11. Debug HUD overlay renders game state indicator bars every frame. Auto scene management handles BeginScene/EndScene for im2d calls outside the 3D render pass.
+- **Im2d driver table** — display driver entry 0x0F (sub_001DBDE0) overridden as safety net; im2d callback table (0x7592CC) populated with render triangle/line callbacks
+- **Game audio events** — AWD sounds triggered on state transitions (Zoom on state 7→4, MenuIn on state 4→5, GlobeHigh startup chime). Sound effects connected to game state machine.
 - **37 playable tracks** loaded from game files with fly camera and drive mode
 - **160 DXT textures per track** loaded from `static.dat` and mapped to geometry
 - **67 vehicle models** across 7 classes (Compact, Coupe, Heavy, etc.)
-- **AWD audio playback** — Fe.awd and Generic.awd loaded, software mixer with 64 voices (16.16 fixed-point resampling, waveOut 48kHz stereo)
+- **AWD audio playback** — Fe.awd (50 sounds) and Generic.awd loaded, software mixer with 64 voices (16.16 fixed-point resampling, waveOut 48kHz stereo)
 - **MCPX APU audio emulation** — xemu's Voice Processor extracted and running standalone
   - VP voice processing pipeline (256 voices, ADPCM decode, SGE page tables, envelope/filter)
   - GP/EP DSP stubbed with direct mixbin passthrough
@@ -52,7 +54,7 @@ The technical challenges are fascinating: translating x86 to x86-64 with a globa
 
 ### What's Left
 - [ ] Frontend object vtable initialization (currently camera object, needs game object)
-- [ ] Un-stub sub_0034D530 (79K D3D rendering pipeline) or route im2d calls around it
+- [ ] Route game's im2d callers through override pipeline (6 RW driver functions ready, awaiting menu code trigger)
 - [ ] Connect game's DirectSound init (sub_00135040) to APU voice processor
 - [ ] Vehicle textures (`.btv` paint variant format)
 - [ ] Full collision / physics world initialization

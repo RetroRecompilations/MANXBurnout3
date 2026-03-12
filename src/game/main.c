@@ -2344,6 +2344,46 @@ void game_frame_pump(void)
         #undef XINP_MEM8
     }
 
+    /* ── Game audio event hooks ── */
+    {
+        static uint32_t prev_game_state = 0;
+        static uint32_t prev_cam_ptr = 0;
+        uint32_t cur_state = MEM32(0x4D53B8);
+        uint32_t cur_cam   = MEM32(0x4D5370);
+
+        /* State transition sounds */
+        if (cur_state != prev_game_state && prev_game_state != 0) {
+            if (cur_state == 5 && g_awd_fe) {
+                /* Entering menus/frontend → play menu transition sound */
+                awd_play(g_awd_fe, "MenuIn", false);
+                fprintf(stderr, "[AUDIO-EVENT] State %u→%u: playing MenuIn\n",
+                        prev_game_state, cur_state);
+            } else if (prev_game_state == 5 && cur_state == 7 && g_awd_fe) {
+                /* Leaving menus to loading → play menu out sound */
+                awd_play(g_awd_fe, "MenuOut", false);
+                fprintf(stderr, "[AUDIO-EVENT] State %u→%u: playing MenuOut\n",
+                        prev_game_state, cur_state);
+            } else if (cur_state == 4 && g_awd_fe) {
+                /* Entering crash mode → play zoom sound */
+                awd_play(g_awd_fe, "Zoom", false);
+                fprintf(stderr, "[AUDIO-EVENT] State %u→%u: playing Zoom\n",
+                        prev_game_state, cur_state);
+            }
+        }
+
+        /* Camera transition (menus ↔ gameplay) */
+        if (cur_cam != prev_cam_ptr && prev_cam_ptr != 0) {
+            if (cur_cam == 0x4D45D0 && g_awd_fe) {
+                /* Entering gameplay camera */
+                awd_play(g_awd_fe, "RoadShow", false);
+                fprintf(stderr, "[AUDIO-EVENT] Camera→gameplay: playing RoadShow\n");
+            }
+        }
+
+        prev_game_state = cur_state;
+        prev_cam_ptr = cur_cam;
+    }
+
     /* ── Boot sequence / gameplay rendering ── */
     if (g_d3d_device) {
         int boot_phase = boot_get_phase();
