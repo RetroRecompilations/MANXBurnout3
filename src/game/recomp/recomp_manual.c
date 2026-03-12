@@ -3697,17 +3697,21 @@ void sub_000171A0(void)
     game_base = MEM32(ebp_local + 8);
     frontend_obj = MEM32(game_base + 0x2E1D0);
 
-    if (frontend_obj > 0x10000 && frontend_obj < 0x4000000) {
+    if (is_valid_game_ptr(frontend_obj)) {
         vtable = MEM32(frontend_obj);
-        if (vtable > 0x10000 && vtable < 0x4000000) {
+        if (is_valid_game_ptr(vtable)) {
             render_method = MEM32(vtable + 0xC);
 
             if (call_count <= 10 || (call_count % 5000) == 0) {
-                fprintf(stderr, "  [FRONTEND] #%u: base=0x%08X fe_obj=0x%08X vtable=0x%08X render=0x%08X im2d_state=%u\n",
-                        call_count, game_base, frontend_obj, vtable, render_method, MEM32(0x7593F0));
+                uint32_t vtable_xva = native_to_xbox_va(vtable);
+                fprintf(stderr, "  [FRONTEND] #%u: base=0x%08X fe_obj=0x%08X vtable=0x%08X(xva=0x%06X)\n",
+                        call_count, game_base, frontend_obj, vtable, vtable_xva);
+                fprintf(stderr, "    vtable[0..5]=0x%08X 0x%08X 0x%08X 0x%08X 0x%08X 0x%08X\n",
+                        MEM32(vtable), MEM32(vtable+4), MEM32(vtable+8),
+                        render_method, MEM32(vtable+0x10), MEM32(vtable+0x14));
             }
 
-            /* Make the vtable call */
+            /* Make the vtable call - ICALL_SAFE handles native→Xbox VA conversion */
             { uint32_t _icall_esp = g_esp;
             PUSH32(esp, 0); RECOMP_ICALL_SAFE(render_method, _icall_esp);
             }

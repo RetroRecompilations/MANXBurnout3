@@ -123,6 +123,44 @@ static __forceinline uintptr_t xbox_ptr_resolve(uint32_t addr)
 }
 #define XBOX_PTR(addr) xbox_ptr_resolve((uint32_t)(addr))
 
+/**
+ * Check if a uint32_t value is a valid game pointer.
+ * Accepts both Xbox VAs (0x10000..0x4000000) and native pointers
+ * that fall within the mapped Xbox memory region.
+ * Use this for vtable validation instead of rigid Xbox VA range checks.
+ */
+static __forceinline int is_valid_game_ptr(uint32_t val)
+{
+    /* Xbox VA range (covers .text, .data, .rdata, heap, stack) */
+    if (val >= 0x10000 && val < 0x4000000)
+        return 1;
+    /* Native pointer in our mapped region */
+    uint32_t offset32 = (uint32_t)g_xbox_mem_offset;
+    if (offset32 != 0) {
+        uint32_t rel = val - offset32;
+        if (rel < 0x74000000u)
+            return 1;
+    }
+    return 0;
+}
+
+/**
+ * Convert a native pointer value to its Xbox VA equivalent.
+ * Returns the Xbox VA (modulo 64MB mirror) if the value is a native
+ * pointer in the mapped region. Returns the value unchanged if it's
+ * already an Xbox VA.
+ */
+static __forceinline uint32_t native_to_xbox_va(uint32_t val)
+{
+    uint32_t offset32 = (uint32_t)g_xbox_mem_offset;
+    if (offset32 != 0 && val >= offset32) {
+        uint32_t rel = val - offset32;
+        if (rel < 0x74000000u)
+            return rel % 0x04000000u;
+    }
+    return val;
+}
+
 /** Read N bytes from a flat memory address. */
 #define MEM8(addr)   (*(volatile uint8_t  *)XBOX_PTR(addr))
 #define MEM16(addr)  (*(volatile uint16_t *)XBOX_PTR(addr))

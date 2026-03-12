@@ -24,29 +24,36 @@ The technical challenges are fascinating: translating x86 to x86-64 with a globa
 
 ## Current Status
 
-**Phase 5: Integration** — The game boots, loads all resources, enters its main gameplay loop, and renders textured 3D track geometry from the actual game files. Audio output pipeline is now functional.
+**Phase 5: Integration** — The game boots, loads all resources, transitions through state 4 (crash mode) → state 5 (menus/frontend), and runs the gameplay loop continuously. RenderWare rendering pipeline is connected to D3D11 via a rendering bridge.
 
 ### What's Working
 - **Boot video sequence** — Criterion logo, EA logo, and title intro videos play from pre-converted XMV→MP4 files via Media Foundation
 - Full game boot sequence through the original RenderWare engine init
-- Game state machine: loading → init → gameplay (state 4) — running continuously
+- **Game state machine**: loading → init → state 4 (crash) → state 5 (menus/frontend) — running continuously
+- **RW→D3D11 rendering bridge** — the original RenderWare display driver pipeline (sub_001DDAF0 → sub_00351090) routes through our D3D8→D3D11 layer
+- **Im2d 2D rendering API** ready for menu/HUD overlays
 - **37 playable tracks** loaded from game files with fly camera and drive mode
 - **160 DXT textures per track** loaded from `static.dat` and mapped to geometry
 - **67 vehicle models** across 7 classes (Compact, Coupe, Heavy, etc.)
+- **AWD audio playback** — Fe.awd and Generic.awd loaded, software mixer with 64 voices (16.16 fixed-point resampling, waveOut 48kHz stereo)
 - **MCPX APU audio emulation** — xemu's Voice Processor extracted and running standalone
-  - waveOut audio output (48kHz stereo 16-bit, 4-buffer ring)
   - VP voice processing pipeline (256 voices, ADPCM decode, SGE page tables, envelope/filter)
   - GP/EP DSP stubbed with direct mixbin passthrough
   - Test tone generator (U key) confirms end-to-end audio pipeline
 - **NV2A GPU register emulation** — PMC, PBUS, PTIMER, PFB, PCRTC, PRAMDAC, PFIFO, PGRAPH handlers from xemu
+  - Push buffer command processing validated (viewport, clear, draws, flip)
+  - MMIO VEH instruction decoder intercepts 0xFD000000+ accesses
+- **VEH fault handling** — divide-by-zero, access violations, and 32-bit overflow all handled gracefully
+- **Native pointer resolution** — RW allocator stores native heap pointers in Xbox memory; our `xbox_ptr_resolve()` and `ICALL_SAFE` handle transparent native↔Xbox VA conversion
 - File loading pipeline reads game resources into Xbox memory space
 - Physics model with heading-based steering and road interaction
 - Keyboard + gamepad input (XInput)
 - D3D11 rendering through a D3D8 compatibility layer
 
 ### What's Left
-- [ ] Connect original RenderWare rendering pipeline to our D3D11 backend
-- [ ] Connect game's DirectSound calls to APU voice processor for real audio
+- [ ] Frontend object vtable initialization (currently camera object, needs game object)
+- [ ] Un-stub sub_0034D530 (79K D3D rendering pipeline) or route im2d calls around it
+- [ ] Connect game's DirectSound init (sub_00135040) to APU voice processor
 - [ ] Vehicle textures (`.btv` paint variant format)
 - [ ] Full collision / physics world initialization
 - [ ] Performance optimization (currently ~18 FPS with 1400+ draw calls per track)
@@ -113,7 +120,7 @@ The Xbox uses a modified Direct3D 8 API. We implement a full D3D8 COM interface 
 
 The biggest challenge: the game makes thousands of indirect calls (virtual methods, function pointers) that we can't resolve at compile time. Our RECOMP_ICALL macro handles this with a 3-tier lookup:
 
-1. **Manual overrides** — 33+ hand-written function replacements
+1. **Manual overrides** — 32 hand-written function replacements
 2. **Auto-generated dispatch table** — 22,097 entries mapping Xbox addresses to C functions
 3. **Kernel bridge** — Xbox kernel thunks at 0xFE000000+ routed to Win32 implementations
 
@@ -181,6 +188,7 @@ burnout3/
 │   ├── kernel/               # Xbox kernel → Win32 (147 imports)
 │   ├── d3d/                  # D3D8 → D3D11 translation layer
 │   ├── apu/                  # MCPX APU audio emulation (from xemu)
+│   ├── nv2a/                 # NV2A GPU register emulation (from xemu)
 │   ├── audio/                # DirectSound → XAudio2 stubs
 │   ├── input/                # Xbox input → XInput
 │   └── game/                 # Game executable
@@ -190,8 +198,10 @@ burnout3/
 │       ├── track_loader.c/h  # Track geometry from streamed.dat
 │       ├── static_textures.c/h # Track textures from static.dat
 │       ├── video_player.c/h  # Boot video playback (MF Source Reader)
+│       ├── rw_bridge.c/h     # RW→D3D11 rendering bridge
 │       ├── rw_renderer.c/h   # 3D renderer (camera, scene, HUD)
 │       ├── rw_math.h         # Matrix math utilities
+│       ├── awd_loader.c/h    # AWD audio format loader + software mixer
 │       └── recomp/           # Recompiled code infrastructure
 │           ├── recomp_types.h    # Register model, ICALL macros
 │           ├── recomp_manual.c   # 33+ manual function overrides

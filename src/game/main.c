@@ -424,6 +424,71 @@ static LONG WINAPI crash_veh(PEXCEPTION_POINTERS info)
         ExitProcess(42);
     }
 
+    /*
+     * Handle integer divide by zero in recompiled code.
+     *
+     * Some recompiled functions contain div/idiv instructions that can
+     * fault when the divisor is zero (e.g., uninitialized state during
+     * state machine transitions). Rather than crashing, we set the
+     * quotient/remainder to 0 and skip the instruction.
+     *
+     * x86-64 div/idiv format: [REX] F7 ModRM (opcode ext /6 or /7)
+     * Result: EAX=quotient, EDX=remainder (both cleared on fault)
+     */
+    if (info->ExceptionRecord->ExceptionCode == EXCEPTION_INT_DIVIDE_BY_ZERO) {
+        static int div0_count = 0;
+        uint8_t *rip = (uint8_t *)info->ContextRecord->Rip;
+        int prefix_len = 0;
+        int rex_b = 0;
+
+        /* Parse legacy prefixes */
+        while (prefix_len < 4) {
+            uint8_t b = rip[prefix_len];
+            if (b == 0x66 || b == 0x67 || b == 0xF2 || b == 0xF3 ||
+                b == 0x2E || b == 0x3E || b == 0x26 || b == 0x36 ||
+                b == 0x64 || b == 0x65) {
+                prefix_len++;
+            } else {
+                break;
+            }
+        }
+        /* Parse REX prefix */
+        if ((rip[prefix_len] & 0xF0) == 0x40) {
+            rex_b = rip[prefix_len] & 1;
+            prefix_len++;
+        }
+
+        uint8_t *op = rip + prefix_len;
+        /* F7 /6 = div r/m32, F7 /7 = idiv r/m32 */
+        if (op[0] == 0xF7) {
+            int reg_ext = (op[1] >> 3) & 7;
+            if (reg_ext == 6 || reg_ext == 7) {
+                /* Calculate instruction length (F7 + ModRM + disp) */
+                int mod = (op[1] >> 6) & 3;
+                int rm = (op[1] & 7) | (rex_b << 3);
+                int modrm_total = 1; /* modrm byte */
+                if (mod == 0 && (rm & 7) == 4) modrm_total++; /* SIB */
+                if (mod == 0 && (rm & 7) == 5) modrm_total += 4; /* RIP-rel */
+                if (mod == 1) { modrm_total++; if ((rm & 7) == 4) modrm_total++; }
+                if (mod == 2) { modrm_total += 4; if ((rm & 7) == 4) modrm_total++; }
+
+                /* Clear result registers and skip */
+                info->ContextRecord->Rax = 0;
+                info->ContextRecord->Rdx = 0;
+                info->ContextRecord->Rip += prefix_len + 1 + modrm_total;
+
+                div0_count++;
+                if (div0_count <= 5 || (div0_count % 10000) == 0) {
+                    fprintf(stderr, "  [DIV0 #%d] Skipped %s at RIP=0x%p (Xbox ESP=0x%08X)\n",
+                            div0_count, reg_ext == 6 ? "div" : "idiv",
+                            info->ExceptionRecord->ExceptionAddress, g_esp);
+                }
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        }
+        /* Unknown divide instruction - fall through to crash reporting */
+    }
+
     if (info->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
         uintptr_t fault_addr = info->ExceptionRecord->ExceptionInformation[1];
         int is_write = (int)info->ExceptionRecord->ExceptionInformation[0];
