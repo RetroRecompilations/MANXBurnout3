@@ -51,6 +51,8 @@
 
 /* RW→D3D11 rendering bridge */
 #include "rw_bridge.h"
+/* Frontend menu renderer */
+#include "fe_menu.h"
 
 /* Global AWD files */
 AWDFile *g_awd_fe = NULL;
@@ -838,9 +840,9 @@ static IDirect3D8 *g_d3d8 = NULL;
 static IDirect3DDevice8 *g_d3d_device = NULL;
 static IDirectSound8 *g_dsound = NULL;
 
-/* Loaded game textures */
-static TXD_Dict g_global_txd;
-static int g_textures_loaded = 0;
+/* Loaded game textures (non-static: accessed by fe_menu.c) */
+TXD_Dict g_global_txd;
+int g_textures_loaded = 0;
 
 /* Procedural paint texture for car models */
 static IDirect3DTexture8 *g_paint_tex = NULL;
@@ -1560,6 +1562,30 @@ static BOOL init_subsystems(void)
         if (n > 0) {
             g_textures_loaded = 1;
             fprintf(stderr, "  Loaded %d textures from Global.txd\n", n);
+            /* Dump FE_ (frontend) texture names for menu rendering */
+            for (int ti = 0; ti < g_global_txd.count; ti++) {
+                if (strncmp(g_global_txd.entries[ti].name, "FE_", 3) == 0 ||
+                    strncmp(g_global_txd.entries[ti].name, "fe_", 3) == 0 ||
+                    strncmp(g_global_txd.entries[ti].name, "Font", 4) == 0 ||
+                    strncmp(g_global_txd.entries[ti].name, "font", 4) == 0 ||
+                    strncmp(g_global_txd.entries[ti].name, "Title", 5) == 0 ||
+                    strncmp(g_global_txd.entries[ti].name, "Logo", 4) == 0 ||
+                    strncmp(g_global_txd.entries[ti].name, "logo", 4) == 0 ||
+                    strncmp(g_global_txd.entries[ti].name, "Burnout", 7) == 0) {
+                    fprintf(stderr, "  [FE-TEX] [%d] '%s' %ux%u fmt=0x%02X tex=%p\n",
+                            ti, g_global_txd.entries[ti].name,
+                            g_global_txd.entries[ti].width, g_global_txd.entries[ti].height,
+                            g_global_txd.entries[ti].format, g_global_txd.entries[ti].texture);
+                }
+            }
+            /* Full texture list dump (first 20 + last 10) */
+            fprintf(stderr, "  [TXD-DUMP] All %d textures:\n", g_global_txd.count);
+            for (int ti = 0; ti < g_global_txd.count; ti++) {
+                fprintf(stderr, "    [%3d] %-24s %4ux%-4u fmt=0x%02X\n",
+                        ti, g_global_txd.entries[ti].name,
+                        g_global_txd.entries[ti].width, g_global_txd.entries[ti].height,
+                        g_global_txd.entries[ti].format);
+            }
         } else {
             fprintf(stderr, "  WARNING: No textures loaded from Global.txd\n");
         }
@@ -1653,12 +1679,7 @@ static BOOL init_subsystems(void)
     g_awd_fe = awd_load("Burnout 3 Takedown\\sound\\Fe.awd");
     g_awd_generic = awd_load("Burnout 3 Takedown\\sound\\Generic.awd");
 
-    /* Play startup chime */
-    if (g_awd_fe) {
-        int idx = awd_play(g_awd_fe, "GlobeHigh", false);
-        if (idx >= 0)
-            fprintf(stderr, "[AWD] Playing startup chime: 'GlobeHigh'\n");
-    }
+    /* Startup chime disabled — sounds now driven by fe_menu.c */
 
     fprintf(stderr, "=== All subsystems initialized ===\n\n");
     return TRUE;
@@ -2142,6 +2163,14 @@ void game_frame_pump(void)
         }
     }
 
+    /* ── Frontend menu update (when in menu state) ── */
+    {
+        float frame_dt = (float)(elapsed_ms / 1000.0);
+        if (fe_menu_is_active()) {
+            fe_menu_update(frame_dt);
+        }
+    }
+
     /* ── Input polling & injection into game memory ── */
     {
         extern ptrdiff_t g_xbox_mem_offset;
@@ -2344,44 +2373,15 @@ void game_frame_pump(void)
         #undef XINP_MEM8
     }
 
-    /* ── Game audio event hooks ── */
+    /* ── Game state transition logging ── */
     {
         static uint32_t prev_game_state = 0;
-        static uint32_t prev_cam_ptr = 0;
         uint32_t cur_state = MEM32(0x4D53B8);
-        uint32_t cur_cam   = MEM32(0x4D5370);
-
-        /* State transition sounds */
         if (cur_state != prev_game_state && prev_game_state != 0) {
-            if (cur_state == 5 && g_awd_fe) {
-                /* Entering menus/frontend → play menu transition sound */
-                awd_play(g_awd_fe, "MenuIn", false);
-                fprintf(stderr, "[AUDIO-EVENT] State %u→%u: playing MenuIn\n",
-                        prev_game_state, cur_state);
-            } else if (prev_game_state == 5 && cur_state == 7 && g_awd_fe) {
-                /* Leaving menus to loading → play menu out sound */
-                awd_play(g_awd_fe, "MenuOut", false);
-                fprintf(stderr, "[AUDIO-EVENT] State %u→%u: playing MenuOut\n",
-                        prev_game_state, cur_state);
-            } else if (cur_state == 4 && g_awd_fe) {
-                /* Entering crash mode → play zoom sound */
-                awd_play(g_awd_fe, "Zoom", false);
-                fprintf(stderr, "[AUDIO-EVENT] State %u→%u: playing Zoom\n",
-                        prev_game_state, cur_state);
-            }
+            fprintf(stderr, "[STATE] %u→%u cam=0x%08X\n",
+                    prev_game_state, cur_state, MEM32(0x4D5370));
         }
-
-        /* Camera transition (menus ↔ gameplay) */
-        if (cur_cam != prev_cam_ptr && prev_cam_ptr != 0) {
-            if (cur_cam == 0x4D45D0 && g_awd_fe) {
-                /* Entering gameplay camera */
-                awd_play(g_awd_fe, "RoadShow", false);
-                fprintf(stderr, "[AUDIO-EVENT] Camera→gameplay: playing RoadShow\n");
-            }
-        }
-
         prev_game_state = cur_state;
-        prev_cam_ptr = cur_cam;
     }
 
     /* ── Boot sequence / gameplay rendering ── */

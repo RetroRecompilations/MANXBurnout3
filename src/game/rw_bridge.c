@@ -20,6 +20,7 @@
 #include "rw_bridge.h"
 #include "rw_renderer.h"
 #include "rw_math.h"
+#include "fe_menu.h"
 #include "../d3d/d3d8_xbox.h"
 #include <stdio.h>
 #include <string.h>
@@ -252,6 +253,21 @@ int rw_bridge_camera_render(uint32_t camera_va)
     if (!dev) return 0;
 
     g_bridge_frame_count++;
+
+    /* Check if we're in menu state — route to frontend menu renderer.
+     * Menu detection: camera pointer at 0x4D5370 == 0x4D4008 (menus). */
+    if (fe_menu_is_active()) {
+        /* Frontend menu: rendered entirely by fe_menu.c */
+        fe_menu_render_frame();
+        g_bridge_rendered = 1;
+
+        static int menu_logged = 0;
+        if (!menu_logged) {
+            fprintf(stderr, "[RW-BRIDGE] Menu mode active — rendering frontend menu\n");
+            menu_logged = 1;
+        }
+        return 1;
+    }
 
     /* Read camera state */
     read_rw_camera_state();
