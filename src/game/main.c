@@ -1411,6 +1411,13 @@ static BOOL init_subsystems(void)
     /* Verify .text section data integrity */
     fprintf(stderr, "  .text verify: JT[0x16CC8]=0x%08X (expect 0x000166D1)\n", MEM32(0x16CC8));
 
+    /* Dump frontend vtable at 0x3A9E7C (before game code can corrupt it) */
+    fprintf(stderr, "  [VTABLE-EARLY] 0x3A9E7C (frontend object vtable):\n");
+    fprintf(stderr, "    [0]=0x%08X [1]=0x%08X [2]=0x%08X [3]=0x%08X\n",
+            MEM32(0x3A9E7C), MEM32(0x3A9E80), MEM32(0x3A9E84), MEM32(0x3A9E88));
+    fprintf(stderr, "    [4]=0x%08X [5]=0x%08X [6]=0x%08X [7]=0x%08X\n",
+            MEM32(0x3A9E8C), MEM32(0x3A9E90), MEM32(0x3A9E94), MEM32(0x3A9E98));
+
     /* 2. Xbox kernel replacement layer */
     fprintf(stderr, "[2/4] Kernel layer...\n");
     fflush(stderr);
@@ -1518,10 +1525,49 @@ static BOOL init_subsystems(void)
      * though the actual GPU hardware doesn't exist.
      */
     {
-        uint32_t fake_device = xbox_HeapAlloc(0x2000, 16);  /* 8 KB */
+        /* Allocate 16KB for the D3D8 device context — offsets go up to ~0x2500 */
+        uint32_t fake_device = xbox_HeapAlloc(0x4000, 16);  /* 16 KB */
         if (fake_device) {
+            uint32_t pb_start = MEM32(0x35D6A0);  /* push buffer write ptr */
+            uint32_t pb_end   = MEM32(0x35D6A4);  /* push buffer end ptr */
+
             MEM32(0x35FB48) = fake_device;
-            fprintf(stderr, "  D3D8 device context: fake at Xbox VA 0x%08X\n", fake_device);
+
+            /* Push buffer pointers — D3D functions check device[0] < device[4]
+             * to decide if they need to flush. Set current = start, end = end. */
+            MEM32(fake_device + 0x00) = pb_start;
+            MEM32(fake_device + 0x04) = pb_end;
+            MEM32(fake_device + 0x08) = pb_start;
+            MEM32(fake_device + 0x0C) = pb_end - pb_start;
+
+            /* Fake render target / surface descriptors.
+             * Fields +0x794, +0x784, +0x7A8 are read as ptrs to surfaces. */
+            {
+                uint32_t fake_surf = xbox_HeapAlloc(0x1000, 16);
+                if (fake_surf) {
+                    MEM32(fake_device + 0x784) = fake_surf;
+                    MEM32(fake_device + 0x794) = fake_surf + 0x100;
+                    MEM32(fake_device + 0x7A8) = fake_surf + 0x200;
+                }
+            }
+
+            /* Render state fields */
+            MEM32(fake_device + 0x1A04) = 0;
+            MEM32(fake_device + 0x1A14) = 0;
+            MEM32(fake_device + 0x1A18) = 0;
+            MEM32(fake_device + 0x1AD4) = 0;
+            MEMF(fake_device + 0xEF8) = 0.0f;
+            MEMF(fake_device + 0xEFC) = 0.0f;
+
+            /* +0x9B8: render list pointer */
+            {
+                uint32_t fake_rl = xbox_HeapAlloc(0x2000, 16);
+                if (fake_rl)
+                    MEM32(fake_device + 0x9B8) = fake_rl;
+            }
+
+            fprintf(stderr, "  D3D8 device context: at Xbox VA 0x%08X (PB 0x%08X-0x%08X)\n",
+                    fake_device, pb_start, pb_end);
         }
     }
 

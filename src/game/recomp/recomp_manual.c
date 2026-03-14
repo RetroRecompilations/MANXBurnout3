@@ -21,6 +21,13 @@ void recomp_icall_fail_log(uint32_t va)
 /* D3D8 frame pump (implemented in d3d8_device.c) */
 extern void d3d8_PresentFrame(void);
 
+/* D3D8 device access */
+#include "d3d8_xbox.h"
+#include "d3d8_internal.h"
+
+/* TXD texture loader */
+#include "txd_loader.h"
+
 /* RW→D3D11 rendering bridge (rw_bridge.c) */
 extern int  rw_bridge_camera_render(uint32_t camera_va);
 extern void rw_bridge_camera_begin(uint32_t camera_va);
@@ -179,6 +186,9 @@ void sub_001D9AF0(void);
 void sub_001D9BC0(void);
 void sub_001D9D40(void);
 void sub_001C1740(void);
+void sub_0034C2E0(void);  /* D3D state machine (83K, native ptr crash) */
+void sub_001AE6F0(void);  /* Frontend render dispatch (override) */
+void sub_001AE732(void);  /* Mid-function entry of sub_001AE6F0 (stub) */
 
 /* Newly-exposed mid-function entry point stubs (switch table fix) */
 void sub_00014FB0(void);
@@ -329,6 +339,9 @@ static const struct {
     { 0x001D9BC0u, (recomp_func_t)sub_001D9BC0 },
     { 0x001D9D40u, (recomp_func_t)sub_001D9D40 },
     { 0x001C1740u, (recomp_func_t)sub_001C1740 },
+    { 0x0034C2E0u, (recomp_func_t)sub_0034C2E0 },
+    { 0x001AE6F0u, (recomp_func_t)sub_001AE6F0 },
+    { 0x001AE732u, (recomp_func_t)sub_001AE732 },
     /* Mid-function entry points exposed by switch table fix */
     { 0x00014FB0u, (recomp_func_t)sub_00014FB0 },
     { 0x0006AE80u, (recomp_func_t)sub_0006AE80 },
@@ -1494,7 +1507,59 @@ void sub_001D9180(void) { esp += 4; return; }
 void sub_001D91B0(void) { esp += 4; return; }
 void sub_001D91F0(void) { esp += 4; return; }
 void sub_001D9230(void) { esp += 4; return; }
-void sub_001D9280(void) { esp += 4; return; }
+void sub_001D9280(void) {
+    /* Frontend prep: indirect tail call through vtable at [param + 0x1C].
+     * Original: 11 bytes at 0x001D9280, just "mov eax,[esp+4]; jmp [eax+0x1C]"
+     * Called with 1 stack param = object pointer from MEM32(MEM32(0x4D6520)+0x58).
+     * Tail-calls the object's render/update method. */
+    uint32_t obj = MEM32(esp + 4);
+    static uint32_t call_count = 0;
+    call_count++;
+
+    if (call_count <= 10 || (call_count % 1000) == 0) {
+        uint32_t dev = MEM32(0x4D6520);
+        uint32_t sub = (dev > 0x10000 && dev < 0x4000000) ? MEM32(dev + 0x58) : 0xDEAD;
+        fprintf(stderr, "  [FE-PREP] sub_001D9280 #%u: [0x4D6520]=0x%08X [+0x58]=0x%08X obj=0x%08X\n",
+                call_count, dev, sub, obj);
+    }
+
+    if (obj == 0) {
+        esp += 4; return;
+    }
+
+    /* Object might be native pointer - convert to Xbox VA */
+    uint32_t obj_va = obj;
+    if (obj_va > 0x4000000) {
+        extern ptrdiff_t g_xbox_mem_offset;
+        if (g_xbox_mem_offset > 0) {
+            uint32_t off32 = (uint32_t)g_xbox_mem_offset;
+            if (obj_va >= off32)
+                obj_va = (obj_va - off32) % 0x04000000u;
+        }
+    }
+
+    /* Read vtable method at offset 0x1C */
+    uint32_t vtable_target = 0;
+    if (obj_va > 0x10000 && obj_va < 0x4000000) {
+        vtable_target = MEM32(obj_va + 0x1C);
+    } else if (obj > 0x10000) {
+        /* Try with original (possibly native) pointer directly */
+        vtable_target = MEM32(obj + 0x1C);
+    }
+
+    if (call_count <= 10 || (call_count % 1000) == 0)
+        fprintf(stderr, "  [FE-PREP] sub_001D9280 #%u: obj=0x%08X (va=0x%08X) vtable[0x1C]=0x%08X\n",
+                call_count, obj, obj_va, vtable_target);
+
+    if (vtable_target > 0x10000 && vtable_target < 0x400000) {
+        /* Valid Xbox VA - do the tail call */
+        eax = obj;
+        MEM32(esp + 4) = obj;  /* matches gen code: mov [esp+4], eax */
+        RECOMP_ITAIL(vtable_target);
+    }
+
+    esp += 4; return;
+}
 void sub_001D9290(void) { esp += 4; return; }
 void sub_001D92A0(void) { esp += 4; return; }
 void sub_001D92EF(void) { esp += 4; return; }
@@ -3858,22 +3923,51 @@ void sub_000171A0(void)
     frontend_obj = MEM32(game_base + 0x2E1D0);
 
     if (is_valid_game_ptr(frontend_obj)) {
+        /* FIX: Restore vtable pointer and entries if corrupted.
+         * xemu shows MEM32(0x4D4008) should be 0x003A9E7C (vtable in .rdata).
+         * RW linked-list code corrupts vtable ptr and entries [3],[4] to native ptrs.
+         * Original vtable (from XBE .rdata before corruption):
+         *   [0]=0x14760 [1]=0x14860 [2]=0x14C80 [3]=0x14D20
+         *   [4]=0x14D80 [5]=0x23C10 [6]=0x17740 [7]=0x15500 */
         vtable = MEM32(frontend_obj);
+        if (frontend_obj == 0x4D4008) {
+            if (vtable != 0x003A9E7C) {
+                if (call_count <= 3)
+                    fprintf(stderr, "  [FRONTEND] #%u: FIXING vtable ptr 0x%08X → 0x003A9E7C\n",
+                            call_count, vtable);
+                MEM32(frontend_obj) = 0x003A9E7C;
+                vtable = 0x003A9E7C;
+            }
+            /* Restore corrupted vtable entries [3] and [4] */
+            if (MEM32(vtable + 0xC) != 0x00014D20) {
+                if (call_count <= 3)
+                    fprintf(stderr, "  [FRONTEND] #%u: FIXING vt[3] 0x%08X → 0x00014D20\n",
+                            call_count, MEM32(vtable + 0xC));
+                MEM32(vtable + 0xC)  = 0x00014D20;
+                MEM32(vtable + 0x10) = 0x00014D80;
+            }
+        }
+
         if (is_valid_game_ptr(vtable)) {
             render_method = MEM32(vtable + 0xC);
 
             if (call_count <= 10 || (call_count % 5000) == 0) {
-                uint32_t vtable_xva = native_to_xbox_va(vtable);
-                fprintf(stderr, "  [FRONTEND] #%u: base=0x%08X fe_obj=0x%08X vtable=0x%08X(xva=0x%06X)\n",
-                        call_count, game_base, frontend_obj, vtable, vtable_xva);
-                fprintf(stderr, "    vtable[0..5]=0x%08X 0x%08X 0x%08X 0x%08X 0x%08X 0x%08X\n",
+                fprintf(stderr, "  [FRONTEND] #%u: fe_obj=0x%08X vtable=0x%06X\n",
+                        call_count, frontend_obj, vtable);
+                fprintf(stderr, "    vt[0..7]=0x%08X 0x%08X 0x%08X 0x%08X 0x%08X 0x%08X 0x%08X 0x%08X\n",
                         MEM32(vtable), MEM32(vtable+4), MEM32(vtable+8),
-                        render_method, MEM32(vtable+0x10), MEM32(vtable+0x14));
+                        render_method, MEM32(vtable+0x10), MEM32(vtable+0x14),
+                        MEM32(vtable+0x18), MEM32(vtable+0x1C));
             }
 
-            /* Make the vtable call - ICALL_SAFE handles native→Xbox VA conversion */
-            { uint32_t _icall_esp = g_esp;
-            PUSH32(esp, 0); RECOMP_ICALL_SAFE(render_method, _icall_esp);
+            if (render_method > 0x10000 && render_method < 0x400000) {
+                /* Valid Xbox VA - make the vtable call */
+                { uint32_t _icall_esp = g_esp;
+                PUSH32(esp, 0); RECOMP_ICALL_SAFE(render_method, _icall_esp);
+                }
+            } else if (call_count <= 10) {
+                fprintf(stderr, "  [FRONTEND] #%u: render_method=0x%08X (INVALID)\n",
+                        call_count, render_method);
             }
         } else {
             if (call_count <= 10)
@@ -3893,73 +3987,598 @@ void sub_000171A0(void)
 }
 
 /* =================================================================
- * sub_001AA100 - Game mode state machine (OVERRIDE)
+ * sub_001AA100 - Frontend initialization state machine (OVERRIDE)
  *
  * Original: 0x001AA100 - 0x001AA6A8 (1448 bytes, 346 insns)
  * Category: game_network
  * CC: stdcall, 1 param (game object base, usually 0x60EA00)
  *
- * This is a multi-phase initialization state machine (phases 1-0x17)
- * stored at ebp+0x144384. The problem: the phase field contains
- * garbage (0x3F800000 = 1.0f as IEEE 754) because the initialization
- * that would set it properly never ran. The function jumps to the
- * per-frame body (phase > 0x17) but crashes on corrupted internal
- * state (12B79C=huge count, native pointer leaks), returning 0.
+ * Multi-phase state machine stored at ebp+0x144384.
+ * Phases 1-6 initialize frontend screen data structures.
+ * Phase 6 checks B790/B794 (screen definition pointers).
+ * Phases 7-16 build render lists when screen definitions exist.
+ * Phase 0x13+ = per-frame body (ready to render).
  *
- * Fix: After a warm-up period, force return 1 so the outer state
- * machine (sub_000165F0) transitions from state 4 to state 5 (menus).
- * Also initialize the phase to 0x17 (completed) so the per-frame
- * body path is correct on subsequent calls.
+ * Previous override: skipped all phases → B790/B794 never populated
+ * → render list empty → no menus rendered.
+ *
+ * New approach: Run phases with safeguards. Initialize phase to 1
+ * if garbage, let it progress naturally. Skip dangerous ICALLs
+ * that crash on uninitialized vtables.
  * ================================================================= */
 void sub_001AA100(void)
 {
     static uint32_t call_count = 0;
-    uint32_t ebp_val;
+    uint32_t bp; /* game object base (ebp in original) */
 
-    /* stdcall: 1 param on stack (game object base) */
-    /* Stack: [esp] = return addr, [esp+4] = param */
+    /* stdcall: 1 param on stack */
     PUSH32(esp, ebx);
     PUSH32(esp, g_seh_ebp);
-    ebp_val = MEM32(esp + 0xC); /* param = game object base (0x60EA00) */
+    bp = MEM32(esp + 0xC);
     PUSH32(esp, esi);
     PUSH32(esp, edi);
 
     call_count++;
 
-    if (call_count <= 10 || (call_count % 1000) == 0) {
-        fprintf(stderr, "  [1AA100-OVR] #%u ebp=0x%08X phase=0x%08X\n",
-                call_count, ebp_val, MEM32(ebp_val + 0x144384));
+    uint32_t phase = MEM32(bp + 0x144384);
+
+    if (call_count <= 50 || (call_count % 1000) == 0) {
+        fprintf(stderr, "  [1AA100] #%u bp=0x%08X phase=%u B790=0x%08X B794=0x%08X B79C=%u\n",
+                call_count, bp, phase,
+                MEM32(bp + 0x12B790), MEM32(bp + 0x12B794),
+                MEM32(bp + 0x12B79C));
     }
 
-    /* Initialize phase to 0x17 (completed) if it's garbage */
-    if (MEM32(ebp_val + 0x144384) > 0x100) {
-        fprintf(stderr, "  [1AA100-OVR] Fixing garbage phase 0x%08X → 0x17\n",
-                MEM32(ebp_val + 0x144384));
-        MEM32(ebp_val + 0x144384) = 0x17;
+    /* Fix garbage phase on first call */
+    if (phase > 0x100) {
+        fprintf(stderr, "  [1AA100] Fixing garbage phase 0x%08X → 1\n", phase);
+        MEM32(bp + 0x144384) = 1;
+        phase = 1;
     }
 
-    /* After 30 frames of warmup, return 1 to trigger state 4→5 */
-    if (call_count >= 30) {
-        if (call_count == 30) {
-            fprintf(stderr, "  [1AA100-OVR] FORCING return 1 after %u frames → state 5\n",
-                    call_count);
-            /* Set the "done" flag that the caller checks */
-            MEM32(ebp_val + 0x144384) = 0x17;
+    /* Early exit flag check (original code) */
+    if (MEM8(0x55927C) != 0) {
+        goto ret0;
+    }
+
+    /* ---- Phase state machine ---- */
+    switch (phase) {
+    case 0:
+        /* Not initialized yet — set to 1 */
+        MEM32(bp + 0x144384) = 1;
+        goto ret0;
+
+    case 1:
+        /* Phase 1: vtable calls on 0x4CFB20 and 0x4D0770.
+         * These are RW camera/scene objects. Skip the ICALLs
+         * (they may crash on uninitialized vtables) and just
+         * call sub_001B5A80 + advance. */
+        fprintf(stderr, "  [1AA100] Phase 1: skip ICALLs, call sub_001B5A80\n");
+        ecx = bp;
+        PUSH32(esp, 0); sub_001B5A80();
+        MEM32(bp + 0x12B7A0) = 0;
+        MEM32(bp + 0x144384) = 3;
+        goto ret0;
+
+    case 2:
+        /* Fallthrough to phase 3 */
+        MEM32(bp + 0x144384) = 3;
+        /* fall through */
+
+    case 3: {
+        /* Phase 3: call sub_0018B250 (check if something is ready) */
+        edi = bp + 0x1265C0;
+        PUSH32(esp, 0); sub_0018B250();
+        if ((eax & 0xFF) == 0) {
+            if (call_count <= 50)
+                fprintf(stderr, "  [1AA100] Phase 3: sub_0018B250 returned 0, waiting...\n");
+            goto ret0;
         }
-        /* Return 1: transition allowed */
+        fprintf(stderr, "  [1AA100] Phase 3 → 4: sub_0018B250 ready\n");
+        MEM32(bp + 0x144384) = 4;
+        /* fall through */
+    }
+
+    case 4: {
+        /* Phase 4: call sub_0013EA20 (audio/sound bank init).
+         * Audio system (DirectSound) is stubbed, so this may never return 1.
+         * Skip after a few attempts. */
+        static uint32_t phase4_tries = 0;
+        phase4_tries++;
+        PUSH32(esp, 0x40E120);
+        PUSH32(esp, 0); sub_0013EA20();
+        if ((eax & 0xFF) == 0) {
+            if (phase4_tries <= 5) {
+                fprintf(stderr, "  [1AA100] Phase 4: sub_0013EA20 returned 0 (try %u)\n",
+                        phase4_tries);
+                if (phase4_tries >= 5) {
+                    fprintf(stderr, "  [1AA100] Phase 4: skipping audio init (stubbed)\n");
+                    MEM32(bp + 0x144384) = 5;
+                    goto ret0; /* will advance next call */
+                }
+                goto ret0;
+            }
+            /* Already advanced phase, fall through */
+        } else {
+            fprintf(stderr, "  [1AA100] Phase 4 → 5: audio ready\n");
+        }
+        MEM32(bp + 0x144384) = 5;
+        /* fall through */
+    }
+
+    case 5: {
+        /* Phase 5: iterate scene descriptors (B7A8 array).
+         * Call vtable[0] on each descriptor object. */
+        uint32_t desc_count = MEM32(bp + 0x12B79C);
+        uint32_t desc_idx = MEM32(bp + 0x12B7A0);
+        if (desc_count > 100) {
+            /* Garbage count (often 0x45BAD0 = same as B790 pointer) — skip */
+            fprintf(stderr, "  [1AA100] Phase 5: garbage desc_count=0x%X, zeroing\n", desc_count);
+            MEM32(bp + 0x12B79C) = 0;
+            desc_count = 0;
+        }
+        /* If no descriptors, advance to phase 6 */
+        if (desc_idx >= desc_count || desc_count == 0) {
+            fprintf(stderr, "  [1AA100] Phase 5 → 6: descriptors done (%u/%u)\n",
+                    desc_idx, desc_count);
+            MEM32(bp + 0x144384) = 6;
+            goto phase6;
+        }
+        /* Try calling vtable[0] on each descriptor */
+        while (desc_idx < desc_count) {
+            uint32_t desc = MEM32(bp + desc_idx * 4 + 0x12B7A8);
+            if (desc == 0 || desc > 0x4000000) {
+                desc_idx++;
+                continue;
+            }
+            uint32_t vt = MEM32(desc);
+            if (vt == 0 || vt > 0x4000000) {
+                desc_idx++;
+                continue;
+            }
+            uint32_t method = MEM32(vt);
+            if (method == 0 || method > 0x4000000) {
+                desc_idx++;
+                continue;
+            }
+            fprintf(stderr, "  [1AA100] Phase 5: desc[%u]=0x%08X vt=0x%08X [0]=0x%08X\n",
+                    desc_idx, desc, vt, method);
+            ecx = desc;
+            { uint32_t _icall_esp = g_esp;
+            PUSH32(esp, 0); RECOMP_ICALL_SAFE(method, _icall_esp);
+            }
+            if ((eax & 0xFF) == 0) {
+                goto ret0;
+            }
+            desc_idx++;
+            MEM32(bp + 0x12B7A0) = desc_idx;
+        }
+        MEM32(bp + 0x144384) = 6;
+        /* fall through */
+    }
+
+    case 6:
+    phase6: {
+        /* Phase 6: check B790|B794 (screen definition pointers).
+         * If populated (non-zero), proceed to build render lists.
+         * If zero AND camera is gameplay (0x4D4290), go to per-frame body.
+         * If zero AND camera is menu (0x4D4008), set up default scene
+         * descriptors from within the base object. */
+        uint32_t b790 = MEM32(bp + 0x12B790);
+        uint32_t b794 = MEM32(bp + 0x12B794);
+        fprintf(stderr, "  [1AA100] Phase 6: B790=0x%08X B794=0x%08X cam=0x%08X\n",
+                b790, b794, MEM32(0x4D5370));
+
+        if ((b790 | b794) != 0) {
+            /* Screen definitions exist → proceed to phase 7 */
+            fprintf(stderr, "  [1AA100] Phase 6: screen defs found → phase 7\n");
+            MEM32(bp + 0x144384) = 7;
+            goto phase7;
+        }
+
+        if (MEM32(0x4D5370) == 0x4D4290) {
+            /* Gameplay camera → skip to per-frame body */
+            fprintf(stderr, "  [1AA100] Phase 6: gameplay camera → phase 0x13\n");
+            MEM32(bp + 0x144384) = 0x13;
+            goto phase_body;
+        }
+
+        /* Menu camera — set up default scene descriptors from base object */
+        uint32_t sd0 = bp + 0x130790;
+        uint32_t sd1 = bp + 0x132C00;
+        MEM32(bp + 0x12B7A8) = sd0;
+        MEM32(bp + 0x12B7AC) = sd1;
+        MEM8(sd0 + 0x19BC) = 0;
+        MEM8(sd1 + 0x19BC) = 1;
+        MEM32(bp + 0x12B79C) = 2; /* 2 scene descriptors */
+        fprintf(stderr, "  [1AA100] Phase 6: set default scene descs: sd0=0x%08X sd1=0x%08X\n",
+                sd0, sd1);
+        MEM32(bp + 0x144384) = 0x13;
+        goto phase_body;
+    }
+
+    case 7:
+    phase7: {
+        /* Phase 7: sub_0018E820 + sub_001888F0 */
+        esi = bp + 0x126B50;
+        PUSH32(esp, 0); sub_0018E820();
+
+        if (MEM8(bp + 0x144380) != 0) {
+            MEM8(bp + 0x12DFA9) = 1;
+            MEM8(bp + 0x130789) = 1;
+        }
+        MEM32(bp + 0x144384) = 8;
+
+        ebx = 0x60E040;
+        PUSH32(esp, 0); sub_001888F0();
+        if ((eax & 0xFF) == 0) {
+            fprintf(stderr, "  [1AA100] Phase 7: sub_001888F0 returned 0, waiting...\n");
+            goto ret0;
+        }
+        fprintf(stderr, "  [1AA100] Phase 7 → 8: ready\n");
+        MEM32(bp + 0x144384) = 9; /* skip phase 8 (render entry init) for now */
+        /* fall through to phase 9 */
+    }
+
+    case 8:
+        /* Phase 8: render entry initialization — just advance */
+        MEM32(bp + 0x144384) = 9;
+        /* fall through */
+
+    case 9: {
+        /* Phase 9: sub_0019AE10 — BUILD THE RENDER LIST.
+         * sub_0019AE10 has its own internal state machine at render_base+0x08.
+         * State 0 = uninitialized (returns 0 immediately).
+         * State 1 = begin loading screen resources.
+         * Must set to 1 to kick off initialization. */
+        uint32_t render_base = bp + 0x12ADB0;
+        uint32_t rlist_state = MEM32(render_base + 0x08);
+        if (rlist_state == 0 || rlist_state > 0x18) {
+            fprintf(stderr, "  [1AA100] Phase 9: render_list state=0x%X (bad), setting to 1\n",
+                    rlist_state);
+            MEM32(render_base + 0x08) = 1;
+            /* Also clear other render list fields to avoid garbage */
+            MEM8(render_base) = 0;
+            MEM32(render_base + 0x04) = 0;
+            MEM32(render_base + 0x0C) = 0;
+        }
+        if (call_count <= 50 || (call_count % 100) == 0) {
+            fprintf(stderr, "  [1AA100] Phase 9: sub_0019AE10(0x%08X) rlist_state=%u\n",
+                    render_base, MEM32(render_base + 0x08));
+        }
+        PUSH32(esp, render_base);
+        PUSH32(esp, 0); sub_0019AE10();
+        fprintf(stderr, "  [1AA100] Phase 9: sub_0019AE10 returned %u\n", eax & 0xFF);
+        if ((eax & 0xFF) == 0) {
+            goto ret0;
+        }
+        MEM32(bp + 0x144384) = 0x13; /* skip to per-frame body */
+        fprintf(stderr, "  [1AA100] Phase 9 → 0x13: render list built!\n");
+        fprintf(stderr, "  [1AA100]   render_list: [+0]=0x%08X [+4]=0x%08X [+8]=0x%08X\n",
+                MEM32(render_base), MEM32(render_base + 4), MEM32(render_base + 8));
+        goto phase_body;
+    }
+
+    case 0x0A: case 0x0B: case 0x0C: case 0x0D:
+    case 0x0E: case 0x0F: case 0x10: case 0x11:
+    case 0x12:
+        /* Phases 10-18: intermediate phases we skip for now */
+        MEM32(bp + 0x144384) = 0x13;
+        goto phase_body;
+
+    case 0x13:
+    default:
+    phase_body:
+        /* Per-frame body: the frontend is initialized, return 1
+         * to allow the outer state machine to transition. */
+        if (call_count <= 50 || (call_count % 1000) == 0) {
+            fprintf(stderr, "  [1AA100] Phase 0x13 (body): return 1\n");
+        }
+        /* Return 1: initialization complete */
         POP32(esp, edi);
         POP32(esp, esi);
         POP32(esp, g_seh_ebp);
         SET_LO8(eax, 1);
         POP32(esp, ebx);
-        esp += 8; return; /* ret 4 (stdcall) */
+        esp += 8; return;
     }
 
-    /* First 30 frames: return 0 (let other init happen) */
+ret0:
     POP32(esp, edi);
     POP32(esp, esi);
     POP32(esp, g_seh_ebp);
     SET_LO8(eax, 0);
     POP32(esp, ebx);
     esp += 8; return; /* ret 4 (stdcall) */
+}
+
+/* =================================================================
+ * sub_00014D20 - Frontend render method (OVERRIDE)
+ *
+ * Original: 0x00014D20 - 0x00014D7B (91 bytes, 25 insns)
+ * Category: game_render, CC: cdecl, 0 params
+ *
+ * Called from sub_000171A0 via vtable[3] of frontend object 0x4D4008.
+ * Original code:
+ *   1. Calls sub_0034C2E0(0,0,0xF3,0,1.0f,0) - D3D Clear (83K function!)
+ *   2. Checks MEM32(0x557A70) against screen object addresses
+ *   3. If match, calls sub_001AE6F0(0x60EA00, byte_from_0x55609E)
+ *
+ * Override: replace sub_0034C2E0 with a proper D3D clear, log the
+ * condition value, and call sub_001AE6F0 to enable menu rendering.
+ * ================================================================= */
+void sub_00014D20(void)
+{
+    static uint32_t call_count = 0;
+    uint32_t screen_obj;
+
+    call_count++;
+
+    /* Step 0: Initialize frontend state.
+     * Do NOT force MEM32(0x557A70) to non-zero - that causes sub_001C67D0
+     * to be called in the state 5 loop (recomp_0000.c line 10304), which
+     * freezes on native heap pointers. Keep 0x557A70=0 so that code path
+     * is skipped. We call sub_001AE6F0 unconditionally below anyway. */
+    if (call_count == 1) {
+        SMEM8(0x55609E) = -1;
+        fprintf(stderr, "  [FE-INIT] phase=-1, screen_obj left at 0 (avoids sub_001C67D0)\n");
+    }
+
+    /* Step 1: Clear the screen (replaces 83K sub_0034C2E0 call).
+     * The gen code pushes (0, 0, 0xF3, 0, 1.0f, 0) = Clear(0, NULL, 0xF3, 0x000000, 1.0f, 0).
+     * We skip the massive function and clear directly via our D3D8 layer. */
+    {
+        IDirect3DDevice8 *dev = d3d8_GetDevice();
+        if (dev) {
+            dev->lpVtbl->Clear(dev, 0, NULL, 0x07, 0x00000000, 1.0f, 0);
+        }
+    }
+
+    /* Step 2: Check condition - which screen object is active? */
+    screen_obj = MEM32(0x557A70);
+    MEM8(0x4D6B30) = 1;  /* original code sets this flag */
+
+    /* NOTE: screen_obj should be one of 0x559648/0x55A408/0x55CB60/0x55A118
+     * but the frontend init code (sub_0006FC90 chain) that populates 0x557A70
+     * never ran because state 6 (case 5 in switch) is never reached.
+     * State progression: 1→7→4→5 skips state 6 which calls sub_001AA990.
+     * Without 0x557A70, sub_001AE6F0 is never called and no im2d menu draws happen. */
+    if (call_count <= 10 || (call_count % 5000) == 0) {
+        fprintf(stderr, "  [FE-RENDER] sub_00014D20 #%u: screen_obj=0x%08X phase=%d\n",
+                call_count, screen_obj, (int32_t)SMEM8(0x55609E));
+        /* Dump nearby state to help debug the init chain */
+        if (call_count <= 3) {
+            fprintf(stderr, "    obj+0x1B8=0x%08X [567174]=0x%08X [567178]=0x%08X\n",
+                    MEM32(0x4D4008 + 0x1B8), MEM32(0x567174), MEM32(0x567178));
+            fprintf(stderr, "    vt@3A9E7C: [0..7]=0x%X 0x%X 0x%X 0x%X 0x%X 0x%X 0x%X 0x%X\n",
+                    MEM32(0x3A9E7C+0), MEM32(0x3A9E7C+4), MEM32(0x3A9E7C+8),
+                    MEM32(0x3A9E7C+0xC), MEM32(0x3A9E7C+0x10), MEM32(0x3A9E7C+0x14),
+                    MEM32(0x3A9E7C+0x18), MEM32(0x3A9E7C+0x1C));
+        }
+    }
+
+    /* Step 3: Always render menu via our override (gen code is stubbed) */
+    {
+        int32_t phase = (int32_t)SMEM8(0x55609E);
+        if (call_count <= 20 || (call_count % 5000) == 0)
+            fprintf(stderr, "  [FE-RENDER] #%u: Calling sub_001AE6F0(0x60EA00, %d)\n",
+                    call_count, phase);
+        PUSH32(esp, (uint32_t)phase);
+        PUSH32(esp, 0x60EA00);
+        PUSH32(esp, 0); sub_001AE6F0();
+    }
+
+    /* Step 4: Present frame. The normal RW pipeline calls Present through
+     * sub_001D9420 → sub_001DDAF0 → sub_00351090. But since we're rendering
+     * directly via im2d, we present here. */
+    d3d8_PresentFrame();
+
+    /* ret (cdecl, caller cleanup) */
+    esp += 4; return;
+}
+
+/* =================================================================
+ * sub_001AE6F0 - Frontend Render Dispatch (OVERRIDE)
+ *
+ * Original: 0x001AE6F0 - 0x001AEAA0 (944 bytes, 213 insns)
+ * CC: stdcall, 2 params (base_obj, phase), returns void
+ *
+ * Original call sequence:
+ *   sub_001891F0 → sub_0003FEE0 → sub_001D9290 → sub_00040660 →
+ *   sub_0003C810 → sub_00040500 → sub_00189040 → sub_000405F0 →
+ *   sub_0034CBF0 → sub_0034D530 → sub_0034C8A0 × 2 → sub_0034C2E0 →
+ *   sub_001AD350 → sub_00188E10 → sub_0017F670 → sub_00031690 →
+ *   sub_0018DE00 → sub_0017F6E0 → sub_0019A3E0 → sub_00189150 →
+ *   sub_00188EE0
+ *
+ * Many of these (0x34xxxx-0x35xxxx) depend on MEM32(0x35FB48) and crash.
+ * We call the safe ones and skip the D3D-dependent ones.
+ * ================================================================= */
+void sub_001AE6F0(void)
+{
+    static uint32_t call_count = 0;
+    call_count++;
+
+    /* stdcall: 2 params on stack: base_obj at [esp+4], phase at [esp+8] */
+    uint32_t base_obj = MEM32(esp + 4);
+    int32_t  phase    = (int32_t)MEM32(esp + 8);
+    uint32_t render_base = base_obj + 0x12ADB0;
+
+    if (call_count <= 20 || (call_count % 5000) == 0) {
+        fprintf(stderr, "  [FE-DISPATCH] sub_001AE6F0 #%u: base=0x%X phase=%d\n",
+                call_count, base_obj, phase);
+        fprintf(stderr, "    render_list: [+0]=0x%08X [+4]=0x%08X [+8]=0x%08X\n",
+                MEM32(render_base), MEM32(render_base + 4), MEM32(render_base + 8));
+        fprintf(stderr, "    B790=0x%08X B794=0x%08X B79C=%u B7C0=%u\n",
+                MEM32(base_obj + 0x12B790), MEM32(base_obj + 0x12B794),
+                MEM32(base_obj + 0x12B79C), MEM32(base_obj + 0x12B7C0));
+    }
+
+    /* Set registers as original code expects */
+    esi = 0x60E040;
+    edi = 0x4D6170;
+    ebx = 0;
+
+    /* D3D clear */
+    {
+        IDirect3DDevice8 *dev = d3d8_GetDevice();
+        MEM8(0x4D6B30) = 0;
+        if (dev)
+            dev->lpVtbl->Clear(dev, 0, NULL, 0x07, 0x00000000, 1.0f, 0);
+    }
+
+    /* NOTE: Most original sub_001AE6F0 functions depend on either:
+     * - MEM32(0x35FB48) D3D device context (sub_0003FEE0, sub_00040660, etc.)
+     * - Scene descriptor pointers that point to unmapped Xbox memory
+     * Both paths cause SKIP-READ floods or crashes. Disabled for now.
+     *
+     * Dump render list data on first call to understand structure. */
+    if (call_count <= 3) {
+        uint32_t res_ptr = MEM32(render_base + 4);
+        fprintf(stderr, "    [FE] render_list resource at 0x%08X\n", res_ptr);
+        fprintf(stderr, "    [FE] 0x4A1E94 (screen list) = 0x%08X\n", MEM32(0x4A1E94));
+        if (res_ptr != 0 && res_ptr < 0x4000000) {
+            /* Dump first 256 bytes of the resource data */
+            fprintf(stderr, "    [FE] Resource data dump (first 64 dwords):\n");
+            for (int i = 0; i < 64; i += 4) {
+                fprintf(stderr, "      [+%03X] %08X %08X %08X %08X\n",
+                        i * 4,
+                        MEM32(res_ptr + i * 4),
+                        MEM32(res_ptr + i * 4 + 4),
+                        MEM32(res_ptr + i * 4 + 8),
+                        MEM32(res_ptr + i * 4 + 12));
+            }
+        }
+        /* Dump B7A8 scene descriptor array */
+        fprintf(stderr, "    [FE] Scene descriptors (B7A8):\n");
+        for (int i = 0; i < 4; i++) {
+            uint32_t desc_raw = MEM32(base_obj + 0x12B7A8 + i * 4);
+            fprintf(stderr, "      B7A8[%d] = 0x%08X", i, desc_raw);
+            /* Try resolving native ptr → Xbox VA */
+            uint32_t desc = desc_raw;
+            if (desc_raw >= 0x10000000 && desc_raw < 0x84000000) {
+                desc = desc_raw % 0x4000000;
+                fprintf(stderr, " → Xbox VA 0x%08X", desc);
+            }
+            fprintf(stderr, "\n");
+            if (desc != 0 && desc < 0x4000000) {
+                fprintf(stderr, "        vt=0x%08X [+4]=0x%08X [+8]=0x%08X [+C]=0x%08X\n",
+                        MEM32(desc), MEM32(desc+4), MEM32(desc+8), MEM32(desc+0xC));
+                fprintf(stderr, "        [+10]=0x%08X [+14]=0x%08X [+40]=0x%08X\n",
+                        MEM32(desc+0x10), MEM32(desc+0x14), MEM32(desc+0x40));
+            }
+        }
+
+        /* Dump B790 (screen definition pointer) */
+        uint32_t b790 = MEM32(base_obj + 0x12B790);
+        fprintf(stderr, "    [FE] B790 = 0x%08X\n", b790);
+        if (b790 != 0 && b790 < 0x4000000) {
+            fprintf(stderr, "      B790 data: ");
+            for (int i = 0; i < 16; i++)
+                fprintf(stderr, "%08X ", MEM32(b790 + i * 4));
+            fprintf(stderr, "\n");
+        }
+
+        /* Dump screen list at 0x4A1E94 */
+        uint32_t scr_list = MEM32(0x4A1E94);
+        fprintf(stderr, "    [FE] Screen list at 0x%08X:\n", scr_list);
+        if (scr_list != 0 && scr_list < 0x4000000) {
+            /* +0x10 = entry array */
+            uint32_t entries_base = scr_list + 0x10;
+            uint32_t entry_count = MEM32(scr_list + 0x10 + 0x10);  /* count at entries+0x10? */
+            fprintf(stderr, "      list header: ");
+            for (int i = 0; i < 8; i++)
+                fprintf(stderr, "%08X ", MEM32(scr_list + i * 4));
+            fprintf(stderr, "\n");
+            fprintf(stderr, "      list[+0x10..+0x30]: ");
+            for (int i = 0; i < 8; i++)
+                fprintf(stderr, "%08X ", MEM32(entries_base + i * 4));
+            fprintf(stderr, "\n");
+        }
+
+        /* Dump render list entries (+0x10 = screen IDs) */
+        fprintf(stderr, "    [FE] Render list screen IDs:\n");
+        fprintf(stderr, "      [+10]=0x%08X (id0) [+14]=0x%08X (id1)\n",
+                MEM32(render_base + 0x10), MEM32(render_base + 0x14));
+        uint32_t rptr = MEM32(render_base + 4);
+        if (rptr != 0 && rptr < 0x4000000) {
+            /* Try sub_001AEF80-style search: the resource has screen entries */
+            uint32_t scr_ent = MEM32(0x4A1E94);
+            if (scr_ent != 0 && scr_ent < 0x4000000) {
+                uint32_t arr_base = scr_ent + 0x10;
+                uint32_t arr_data = MEM32(arr_base + 0xC); /* array entries at +0xC */
+                uint32_t arr_count = MEM32(arr_base + 0x10); /* count at +0x10 */
+                fprintf(stderr, "      screen array: base=0x%08X count=%u\n",
+                        arr_data, arr_count);
+                if (arr_data != 0 && arr_data < 0x4000000 && arr_count > 0) {
+                    uint32_t max_show = (arr_count < 20) ? arr_count : 20;
+                    for (uint32_t i = 0; i < max_show; i++) {
+                        uint32_t ent = arr_data + i * 0x20;
+                        fprintf(stderr, "        [%u] id=0x%08X flag=0x%02X name=",
+                                i, MEM32(ent), MEM8(ent + 0x1E));
+                        /* Print string at ent+4 if it looks like ASCII */
+                        for (int j = 4; j < 0x1E; j++) {
+                            uint8_t c = MEM8(ent + j);
+                            if (c == 0) break;
+                            if (c >= 0x20 && c < 0x7F)
+                                fprintf(stderr, "%c", c);
+                            else {
+                                fprintf(stderr, ".");
+                                break;
+                            }
+                        }
+                        fprintf(stderr, "\n");
+                    }
+                }
+            }
+        }
+    }
+
+    /* Post-render functions DISABLED — they access scene descriptors
+     * with pointers to unmapped Xbox memory (0x92xxxxxx range).
+     * Original functions: sub_00188E10, sub_0017F670, sub_0018DE00,
+     * sub_0017F6E0, sub_0019A3E0, sub_00189150, sub_00188EE0 */
+
+    if (call_count <= 20 || (call_count % 5000) == 0) {
+        fprintf(stderr, "  [FE-DISPATCH] sub_001AE6F0 #%u DONE\n", call_count);
+    }
+
+    /* stdcall: clean up 2 params (8 bytes) + return address */
+    esp += 12; return; /* ret 8 */
+}
+
+/* sub_001AE732 - mid-function entry of sub_001AE6F0 (STUB)
+ * Same native pointer problems. Just forward to sub_001AE6F0. */
+void sub_001AE732(void)
+{
+    /* Push fake params for stdcall */
+    PUSH32(esp, 0xFFFFFFFF); /* phase = -1 */
+    PUSH32(esp, 0x60EA00);   /* base_obj */
+    PUSH32(esp, 0);
+    sub_001AE6F0();
+}
+
+/* =================================================================
+ * sub_0034C2E0 - D3D Rendering State Machine (STUB)
+ *
+ * Original: 0x0034C2E0 - 0x00360A54 (83828 bytes, 20371 insns)
+ * CC: cdecl, 6 params on stack, returns void
+ *
+ * The original reads MEM32(0x35FB48) which is a native heap pointer
+ * (RW engine allocates the D3D state object on native heap).
+ * MEM32() can't access native pointers → crash.
+ *
+ * Called from ~60 places in the recompiled code. Params are typically:
+ * (flags, rect_count, clear_flags, color, depth, stencil)
+ * We handle the "clear" case via our D3D8 layer in sub_00014D20.
+ * All other calls are no-ops for now.
+ * ================================================================= */
+void sub_0034C2E0(void)
+{
+    static uint32_t call_count = 0;
+    call_count++;
+    if (call_count <= 5 || (call_count % 50000) == 0)
+        fprintf(stderr, "  [D3D-SM] sub_0034C2E0 STUB #%u (6 params skipped)\n", call_count);
+    /* cdecl: caller cleans up the 6 params (24 bytes) */
+    esp += 4; return;
 }

@@ -34,11 +34,38 @@ The goal is to translate the original x86 Xbox code into a native Windows execut
 - Addresses are always shown as hex with 0x prefix (e.g., 0x001D2807)
 - Xbox kernel function names use their original Xbox names with `xbox_` prefix when reimplemented
 
-## Current Work State (Session 38)
+## Current Work State (Session 39)
 
-### Status: Im2d rendering pipeline + game audio events working
-Game boots, reaches state 5 (menus), renders debug HUD via im2d, plays audio on state transitions.
-**Current blockers**: Frontend object vtable not initialized (camera obj at 0x4D4008 has zero render method), game's menu rendering code never called.
+### Status: Screen entry population pipeline fixed
+Game boots, reaches state 5 (menus), frontend init phases run properly, 39+ screen definitions registered in screen array. Rendering pipeline not yet connected.
+**Current blockers**: Screen list sub-object vtable is NULL (C++ constructor never ran), need to either populate vtable or bypass vtable calls in render dispatch.
+
+### Session 39 Changes (2026-03-13)
+- **sub_001AA100 REWRITTEN**: Full phase state machine (phases 1-9 → 0x13) instead of simple 30-frame skip
+  - Phase 1: sub_001B5A80 (scene init)
+  - Phase 3: sub_0018B250 (resource check)
+  - Phase 4: sub_0013EA20 (audio init, timeout after 5 tries)
+  - Phase 5: Scene descriptor sanitization (garbage count fix)
+  - Phase 6: B790/B794 screen definition check (already populated at 0x0045BAD0)
+  - Phase 7: sub_0018E820 + sub_001888F0
+  - Phase 9: sub_0019AE10 (render list builder) — successfully creates resource at 0x01C7D000
+- **sub_001AE6F0 overridden**: Frontend render dispatch, currently D3D clear + diagnostics
+  - Original calls sub_001AD350 (render list dispatch) → sub_0034D530 (79K render) → im2d
+  - Both disabled due to native pointer issues
+- **Screen list garbage data IDENTIFIED AND FIXED**:
+  - Screen list sub-object at 0x004AF590 had 0x3F800000 (1.0f) in count/index fields
+  - sub_001AED70 (find-free-slot) was scanning from index 1065353216, writing entries beyond array
+  - PATCH: Zero count and index fields before sub_0001F7C0 screen registration
+- **Screen entry invalidation DISABLED** (gen patches):
+  - sub_001AEE20 (recomp_0004.c): vtable guard changed to keep entries active, not invalidate
+  - sub_0001F7C0 (recomp_0000.c): 19 invalidation blocks commented out (all had NULL vtable → eax=0 → decrement)
+  - Screen entries now persist with flag=1 (active) instead of being immediately cleared
+- **Screen list vtable = NULL**: Root cause is C++ constructor never ran for screen list sub-object
+  - Object at ebp+0x83E0 (0x004AF580 with Xbox base 0x004A71A0) initialized with data but no vtable
+  - RECOMP_ICALL_SAFE(0) returns eax=0, causing validation failure
+  - All 3 vtable methods (offsets +0, +8, +0xC) read MEM32(0+offset) = 0 → lookup fails
+- **recomp_0004.c gen patches**: sub_001AE6F0 `#if 0`, sub_001AEE20 vtable guard fix
+- **recomp_0000.c gen patches**: Screen list init PATCH, 19× invalidation disable, screen array trace
 
 ### Session 38 Changes
 - **Im2d rendering pipeline WORKING**: RwIm2DRenderPrimitive (sub_001DE900) overridden
@@ -207,10 +234,10 @@ Game boots, loads, runs gameplay loop. **Two rendering modes** toggled with V ke
 - **Gamepad**: Left stick = steer, RT/LT = gas/brake, A or RB = boost
 
 ### Gen File Patches (must re-apply after regen)
-1. **recomp_0000.c**: extern g_tick_110e0_count, sub_000165F0 entry/ESP traces, sub_00015570 vtable guard, sub_0003D9E0 #if 0, **sub_000636D0 #if 0**, jump table→C switch (replace_all), state traces, exit path traces, case 3 traces
+1. **recomp_0000.c**: extern g_tick_110e0_count, sub_000165F0 entry/ESP traces, sub_00015570 vtable guard, sub_0003D9E0 #if 0, **sub_000636D0 #if 0**, jump table→C switch (replace_all), state traces, exit path traces, case 3 traces, **screen list init PATCH before sub_0001F7C0** (zero idx/count at MEM32(0x4A1E94)+0x10+0x04/0x08), **19× screen entry invalidation disable** (comment out `MEM8(esi+0x1E)=LO8(ebx)` + `MEM32(edi+8)--`)
 2. **recomp_0002.c**: #if 0 around sub_00135040, sub_00135240
 3. **recomp_0003.c**: extern g_tick_110e0_count, flag clear, ESP+callee-saved save/restore, game loop traces
-4. **recomp_0004.c**: #if 0 around sub_001CFDD0, sub_001BEFF0, sub_001C1670, sub_001C1740, sub_001C66F0, sub_001AA100; vtable guards in sub_001B4170, sub_001B41F0, sub_001AEE20
+4. **recomp_0004.c**: #if 0 around sub_001CFDD0, sub_001BEFF0, sub_001C1670, sub_001C1740, sub_001C66F0, sub_001AA100, **sub_001AE6F0**; vtable guards in sub_001B4170, sub_001B41F0, **sub_001AEE20 vtable guard rewritten** (native ptr conversion, skip-without-invalidate)
 5. **recomp_0005.c**: #if 0 around 35 functions + sub_001DBDE0, sub_001DE900
 6. **recomp_0006.c**: #if 0 around sub_001FE1E0, sub_00221F20
 7. **recomp_0007.c**: #if 0 around sub_00244C51, sub_00249B7C, sub_00249B9C
@@ -219,5 +246,5 @@ Game boots, loads, runs gameplay loop. **Two rendering modes** toggled with V ke
 10. **recomp_dispatch.c**: add sub_001D1818/sub_001D2793 entries, size=22097
 11. **recomp_funcs.h**: add sub_001D1818/sub_001D2793 declarations
 
-### Manual Function Overrides (recomp_manual.c) - 34 functions
-Including sub_000636D0 (physics force), sub_0003D9E0 (render orchestrator stub), sub_000110E0 (frame pump), sub_001AA100 (state 4→5 transition), sub_001DE900 (im2d render → bridge), sub_001DBDE0 (im2d driver entry → bridge)
+### Manual Function Overrides (recomp_manual.c) - 36 functions
+Including sub_000636D0 (physics force), sub_0003D9E0 (render orchestrator stub), sub_000110E0 (frame pump), sub_001AA100 (full phase state machine 1-9→0x13), sub_001AE6F0 (frontend render dispatch), sub_001DE900 (im2d render → bridge), sub_001DBDE0 (im2d driver entry → bridge)
