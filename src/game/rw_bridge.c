@@ -261,13 +261,21 @@ int rw_bridge_camera_render(uint32_t camera_va)
          * Clear to dark blue so we can see the NV2A translated geometry. */
         extern int nv2a_pb_replay_is_active(void);
         extern void nv2a_pb_replay_frame(void);
-        if (nv2a_pb_replay_is_active()) {
+        {
             dev->lpVtbl->Clear(dev, 0, NULL, 1 /*D3DCLEAR_TARGET*/,
                                0xFF101030, 1.0f, 0);
             dev->lpVtbl->BeginScene(dev);
 
-            /* Draw push buffer replay geometry HERE, inside the render pass */
-            nv2a_pb_replay_frame();
+            /* Parse any live push buffer commands written by sub_0034C2E0 */
+            {
+                extern void parse_live_pushbuffer(void);
+                parse_live_pushbuffer();
+            }
+
+            /* Draw push buffer replay geometry (static capture from xemu) */
+            if (nv2a_pb_replay_is_active()) {
+                nv2a_pb_replay_frame();
+            }
 
             dev->lpVtbl->EndScene(dev);
             dev->lpVtbl->Present(dev, NULL, NULL, NULL, NULL);

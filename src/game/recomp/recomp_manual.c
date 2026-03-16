@@ -2079,10 +2079,99 @@ void sub_001DB2C0(void)
     esp += 4; return;
 }
 
+/* =================================================================
+ * sub_0034D530 - D3D8LTCG rendering pipeline (LIVE PUSH BUFFER)
+ *
+ * Called from the RW display pipeline every frame. Instead of the
+ * original 79K of NV2A push buffer generation code, we parse any
+ * push buffer commands that sub_0034C2E0 or other D3D functions
+ * wrote to our allocated push buffer, and translate them to D3D11.
+ * ================================================================= */
 volatile uint32_t g_d3d_render_count = 0;
+
+extern void pgraph_d3d11_init(void);
+extern void pgraph_d3d11_flush(void);
+extern int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param);
+
+void parse_live_pushbuffer(void)
+{
+    static int inited = 0;
+    if (!inited) { pgraph_d3d11_init(); inited = 1; }
+    /* Read push buffer pointers directly from the known fixed addresses,
+     * not from the device context (game's D3D init overwrites 0x35FB48). */
+    uint32_t pb_base = MEM32(0x35D69C);   /* Push buffer base */
+    uint32_t pb_write = MEM32(0x35D6A0);  /* Push buffer write pointer */
+
+    static uint32_t diag_count = 0;
+    diag_count++;
+    if (diag_count <= 10 || (diag_count % 1000) == 0) {
+        fprintf(stderr, "  [D3D8-LIVE] #%u pb_base=0x%08X pb_write=0x%08X delta=%d\n",
+                diag_count, pb_base, pb_write, (int)(pb_write - pb_base));
+    }
+
+    if (pb_base == 0 || pb_write <= pb_base) return;
+
+    uint32_t bytes_written = pb_write - pb_base;
+    if (bytes_written < 8 || bytes_written > 4 * 1024 * 1024) return;
+
+    uint32_t num_dwords = bytes_written / 4;
+    uint32_t pos = 0;
+    uint32_t method_count = 0;
+
+    while (pos < num_dwords) {
+        uint32_t header = MEM32(pb_base + pos * 4);
+        if (header == 0) { pos++; continue; }
+
+        /* Increasing method */
+        if ((header & 0xE0030003) == 0) {
+            uint32_t count = (header >> 18) & 0x7FF;
+            uint32_t method = header & 0x1FFC;
+            uint32_t subchan = (header >> 13) & 7;
+            if (count == 0 || pos + 1 + count > num_dwords) { pos++; continue; }
+            for (uint32_t i = 0; i < count; i++) {
+                uint32_t param = MEM32(pb_base + (pos + 1 + i) * 4);
+                pgraph_d3d11_method(subchan, method + i * 4, param);
+                method_count++;
+            }
+            pos += 1 + count;
+        }
+        /* Non-increasing method */
+        else if ((header & 0xE0030003) == 0x40000000) {
+            uint32_t count = (header >> 18) & 0x7FF;
+            uint32_t method = header & 0x1FFC;
+            uint32_t subchan = (header >> 13) & 7;
+            if (count == 0 || pos + 1 + count > num_dwords) { pos++; continue; }
+            for (uint32_t i = 0; i < count; i++) {
+                uint32_t param = MEM32(pb_base + (pos + 1 + i) * 4);
+                pgraph_d3d11_method(subchan, method, param);
+                method_count++;
+            }
+            pos += 1 + count;
+        }
+        else { pos++; }
+    }
+
+    if (method_count > 0) {
+        pgraph_d3d11_flush();
+        static uint32_t log_count = 0;
+        log_count++;
+        if (log_count <= 5 || (log_count % 300) == 0) {
+            fprintf(stderr, "  [D3D8-LIVE] Parsed %u methods from %u bytes of push buffer\n",
+                    method_count, bytes_written);
+        }
+    }
+
+    /* Reset write pointer for next frame */
+    MEM32(0x35D6A0) = pb_base;
+}
+
 void sub_0034D530(void)
 {
     g_d3d_render_count++;
+
+    /* Parse any push buffer commands written by D3D8 functions */
+    parse_live_pushbuffer();
+
     if (g_d3d_render_count <= 5 || (g_d3d_render_count % 10000) == 0)
         fprintf(stderr, "  [D3D8-RENDER] sub_0034D530 called #%u\n", g_d3d_render_count);
     eax = 0;
@@ -4573,12 +4662,54 @@ void sub_001AE732(void)
  * We handle the "clear" case via our D3D8 layer in sub_00014D20.
  * All other calls are no-ops for now.
  * ================================================================= */
+/* Write NV2A push buffer commands for Clear/Draw operations.
+ * This is a minimal reimplementation that writes the commands
+ * sub_0034D530's parser can pick up and translate to D3D11. */
+/* Write a dword to the push buffer using the fixed address pointers */
+static void pb_write_dword_fixed(uint32_t value)
+{
+    uint32_t write_ptr = MEM32(0x35D6A0);
+    uint32_t end_ptr = MEM32(0x35D6A4);
+    if (write_ptr + 4 < end_ptr) {
+        MEM32(write_ptr) = value;
+        MEM32(0x35D6A0) = write_ptr + 4;
+    }
+}
+
+/* Push buffer command encoding */
+#define PB_INC(method, count) (((count) << 18) | (method))
+#define PB_NONINC(method, count) (0x40000000 | ((count) << 18) | (method))
+
 void sub_0034C2E0(void)
 {
     static uint32_t call_count = 0;
     call_count++;
-    if (call_count <= 5 || (call_count % 50000) == 0)
-        fprintf(stderr, "  [D3D-SM] sub_0034C2E0 STUB #%u (6 params skipped)\n", call_count);
-    /* cdecl: caller cleans up the 6 params (24 bytes) */
+
+    /* Read the 6 cdecl params: count, rects, flags, color, z, stencil */
+    uint32_t p_count   = MEM32(esp + 4);
+    uint32_t p_rects   = MEM32(esp + 8);
+    uint32_t p_flags   = MEM32(esp + 12);
+    uint32_t p_color   = MEM32(esp + 16);
+    float    p_z       = MEMF(esp + 20);
+    uint32_t p_stencil = MEM32(esp + 24);
+
+    if (p_flags & 0xF3) {
+        /* Write NV2A Clear commands to push buffer */
+        pb_write_dword_fixed(PB_INC(0x01D4, 1));
+        pb_write_dword_fixed(p_color);
+
+        pb_write_dword_fixed(PB_INC(0x01D8, 2));
+        pb_write_dword_fixed((640 << 16) | 0);
+        pb_write_dword_fixed((480 << 16) | 0);
+
+        pb_write_dword_fixed(PB_INC(0x01D0, 1));
+        pb_write_dword_fixed(p_flags);
+    }
+
+    if (call_count <= 5 || (call_count % 50000) == 0) {
+        fprintf(stderr, "  [D3D-SM] sub_0034C2E0 #%u: flags=0x%X color=0x%08X pb_write=0x%08X\n",
+                call_count, p_flags, p_color, MEM32(0x35D6A0));
+    }
+
     esp += 4; return;
 }
