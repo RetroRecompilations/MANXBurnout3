@@ -2172,14 +2172,32 @@ void sub_0034D530(void)
 {
     g_d3d_render_count++;
 
-    if (g_d3d_render_count <= 5 || (g_d3d_render_count % 10000) == 0)
-        fprintf(stderr, "  [D3D8-RENDER] sub_0034D530 called #%u (invoking gen code)\n", g_d3d_render_count);
+    uint32_t pb_base = MEM32(0x35D69C);
+    uint32_t dev = MEM32(0x35FB48);
 
-    /* Call the generated D3D8LTCG code — it reads RW scene state and
-     * writes NV2A push buffer commands to 0x35D6A0. */
+    /* Reset device and global push buffer cursors to base before each call.
+     * D3D8LTCG writes via device+0x00 (not via 0x35D6A0). */
+    if (dev) {
+        MEM32(dev + 0x00) = pb_base;
+        MEM32(dev + 0x08) = pb_base;
+    }
+    MEM32(0x35D6A0) = pb_base;
+
+    /* Call the generated D3D8LTCG code */
     sub_0034D530_gen();
 
-    /* Parse the push buffer commands and translate to D3D11 */
+    /* Sync device cursor to global write pointer for parser */
+    uint32_t dev_pb_after = dev ? MEM32(dev + 0x00) : 0;
+    if (dev_pb_after > pb_base) {
+        MEM32(0x35D6A0) = dev_pb_after;
+    }
+
+    uint32_t bytes_written = dev_pb_after - pb_base;
+    if (g_d3d_render_count <= 10 || (g_d3d_render_count % 5000) == 0)
+        fprintf(stderr, "  [D3D8-RENDER] #%u: %u bytes written, ecx=0x%X\n",
+                g_d3d_render_count, bytes_written, ecx);
+
+    /* Parse push buffer commands and translate to D3D11 */
     parse_live_pushbuffer();
 }
 
