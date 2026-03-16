@@ -178,6 +178,9 @@ static struct {
     /* Stats */
     PgraphD3D11Stats stats;
 
+    /* Chyron scroll */
+    float chyron_scroll_offset;  /* Pixels to shift X for chyron text */
+
     /* Init flag */
     int initialized;
 } g_pg;
@@ -264,8 +267,6 @@ static void submit_draw(void)
         out[dst_idx].u     = u2f(src[_b + 2]); \
         out[dst_idx].v     = u2f(src[_b + 3]); \
         out[dst_idx].color = src[_b + 4]; \
-        if ((out[dst_idx].color & 0x00FFFFFF) == 0) \
-            out[dst_idx].color = 0xC0FF8040; /* debug: bright orange for black verts */ \
     } while(0)
 
     if (is_quads) {
@@ -287,6 +288,39 @@ static void submit_draw(void)
         }
     }
     #undef CONVERT_VERT
+
+    /* Chyron scroll: shift X for vertices in the chyron Y band (366-382).
+     * Simple continuous scroll — no per-vertex wrapping to avoid artifacts
+     * from split triangle-strip quads spanning the screen. */
+    if (g_pg.chyron_scroll_offset != 0.0f && out_vert_count >= 6) {
+        /* Check if this draw is in the chyron band */
+        int is_chyron = 1;
+        for (uint32_t i = 0; i < (out_vert_count < 8 ? out_vert_count : 8); i++) {
+            if (out[i].y < 360.0f || out[i].y > 390.0f) {
+                is_chyron = 0;
+                break;
+            }
+        }
+        if (is_chyron) {
+            /* Find the total text width */
+            float min_x = 9999.0f, max_x = -9999.0f;
+            for (uint32_t i = 0; i < out_vert_count; i++) {
+                if (out[i].x < min_x) min_x = out[i].x;
+                if (out[i].x > max_x) max_x = out[i].x;
+            }
+            float text_width = max_x - min_x;
+
+            /* Scroll loops: text slides left, then resets to start position.
+             * Total cycle = text scrolls fully off-left + re-enters from right. */
+            float cycle = text_width + 640.0f;
+            float scroll = fmodf(g_pg.chyron_scroll_offset, cycle);
+
+            /* Apply uniform shift to ALL vertices (no per-vertex wrap) */
+            for (uint32_t i = 0; i < out_vert_count; i++) {
+                out[i].x -= scroll;
+            }
+        }
+    }
 
     /* Log first few draws' vertex positions (once) */
     if (g_pg.stats.draw_calls < 3 && num_verts >= 3) {
@@ -345,10 +379,18 @@ static void submit_draw(void)
             case 0x03C24B80: tex = txd_find(&g_global_txd, "big_curve"); break;    /* 128x128 DXT5 */
             case 0x03C7BE00: tex = txd_find(&g_global_txd, "Buttons"); break;      /* 128x64 DXT5 */
             case 0x03C95700: tex = txd_find(&g_global_txd, "dpad"); break;          /* 32x16 DXT5 */
+            case 0x03C95980: tex = txd_find(&g_global_txd, "FE"); break;            /* 32x32 DXT5 */
             case 0x03CA1A80: tex = txd_find(&g_global_txd, "small_curve"); break;   /* 32x32 DXT5 */
             case 0x03D57000: tex = txd_find(&g_global_txd, "box_curve"); break;     /* 32x32 DXT5 */
             case 0x03CB9200: tex = txd_find(&g_global_txd, "grid"); break;          /* 16x16 DXT1 */
-            case 0x02EC0400: tex = NULL; break;  /* Render target / framebuffer — no texture */
+            case 0x02EC0400:
+                /* Render target / framebuffer texture — skip this draw entirely.
+                 * In xemu this shows the looping background video; in our recomp
+                 * the background is rendered separately. Drawing this as vertex-color
+                 * produces a solid white quad that washes out everything. */
+                dev->lpVtbl->EndScene(dev);
+                g_pg.inline_count = 0;
+                return;  /* Skip draw */
             case 0x021C4100:
                 /* Font atlas — create from captured DXT5 data on first use */
                 if (!g_pg.font_atlas) {
@@ -588,6 +630,11 @@ void pgraph_d3d11_flush(void)
         g_pg.in_draw = 0;
     }
     g_pg.stats.frames++;
+}
+
+void pgraph_d3d11_set_chyron_scroll(uint32_t pixels)
+{
+    g_pg.chyron_scroll_offset = (float)pixels;
 }
 
 void pgraph_d3d11_get_stats(PgraphD3D11Stats *out)

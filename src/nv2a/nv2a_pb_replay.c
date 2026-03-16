@@ -13,6 +13,9 @@
 #include <stdio.h>
 #include <string.h>
 
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
 /* Captured push buffer data (auto-generated from xemu) */
 #include "menu_pushbuffer_data.h"
 
@@ -24,6 +27,8 @@
 
 static int g_replay_active = 0;
 static uint32_t g_replay_frame = 0;
+static LARGE_INTEGER g_replay_start_time;
+static LARGE_INTEGER g_replay_freq;
 
 /*
  * Parse and dispatch push buffer commands through the D3D11 translator.
@@ -112,22 +117,67 @@ static void replay_pushbuffer(const uint32_t *data, uint32_t num_dwords)
  * Called once per frame when replay is active.
  * Feeds the captured push buffer through the translator.
  *
- * The first INLINE_ARRAY block at offset 0 has no BEGIN_END header
- * (we captured mid-stream). We skip to the first BEGIN_END at offset 0x12EC
- * to get clean command boundaries.
+ * The capture starts mid-stream: Draws 1-5 have no SET_TEXTURE_OFFSET
+ * because they inherited the font atlas (0x021C4100) from before our
+ * capture window. We inject that binding before replay to fix them.
  */
+/* Draw 5 (chyron text) location in push buffer.
+ * BEGIN_END(6) at dword 6175, INLINE_ARRAY at dword 6177 (1275 dwords),
+ * END at dword 7454. Vertex data starts at dword 6178 (header at 6177). */
+#define CHYRON_INLINE_HEADER  6177   /* NONINC INLINE_ARRAY header dword */
+#define CHYRON_INLINE_DATA    6178   /* First data dword */
+#define CHYRON_INLINE_COUNT   1275   /* Number of INLINE_ARRAY data dwords */
+
 void nv2a_pb_replay_frame(void)
 {
     if (!g_replay_active) return;
 
-    /* Skip the initial headerless INLINE_ARRAY block.
-     * First clean command is at dword offset 0x12EC/4 = 1211.
-     * The first block is 1210 dwords of raw vertex data with no header context,
-     * so we skip it and start from the first BEGIN_END. */
-    uint32_t start_dword = 0x12EC / 4;  /* = 1211 */
-    uint32_t remaining = MENU_PB_DWORDS - start_dword;
+    /* Inject inherited texture state: font atlas was active before capture.
+     * Draws 1-5 (menu text + chyron) rely on this being set. */
+    pgraph_d3d11_method(0, 0x1B00, 0x021C4100);  /* SET_TEXTURE_OFFSET[0] = font atlas */
+    pgraph_d3d11_method(0, 0x1B08, 0x40010303);   /* SET_TEXTURE_CONTROL0[0] = enabled */
 
-    replay_pushbuffer(&menu_pushbuffer_data[start_dword], remaining);
+    /* Replay push buffer in 3 segments, skipping Draw 5 (chyron) which
+     * we re-draw later with scroll animation applied.
+     * Segment 1: dwords 0 to 6174 (before Draw 5's BEGIN_END)
+     * Skip:      dwords 6175 to 7454 (Draw 5: BEGIN, INLINE_ARRAY, END)
+     * Segment 2: dwords 7455 to end (Draw 6 onwards) */
+    #define CHYRON_BEGIN_DWORD  6175
+    #define CHYRON_END_DWORD    7455  /* first dword after Draw 5's END */
+
+    replay_pushbuffer(menu_pushbuffer_data, CHYRON_BEGIN_DWORD);
+    replay_pushbuffer(&menu_pushbuffer_data[CHYRON_END_DWORD],
+                      MENU_PB_DWORDS - CHYRON_END_DWORD);
+
+    /* Re-draw the chyron text (Draw 5) ON TOP of the bottom panel.
+     * In the original push buffer, Draw 5 renders BEFORE the dark panel
+     * overlays (Draws 16-20). Without full NV2A combiner emulation,
+     * those overlays cover the chyron. Re-drawing it last fixes this. */
+    pgraph_d3d11_method(0, 0x1B00, 0x021C4100);  /* Font atlas texture */
+    pgraph_d3d11_method(0, 0x1B08, 0x40010303);   /* Texture enabled */
+
+    /* Apply time-based chyron scroll (smooth, independent of frame rate) */
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    double elapsed = (double)(now.QuadPart - g_replay_start_time.QuadPart)
+                   / (double)g_replay_freq.QuadPart;
+    /* ~50 pixels/sec scroll speed (matching original Burnout 3 chyron) */
+    uint32_t scroll_pixels = (uint32_t)(elapsed * 50.0);
+    pgraph_d3d11_set_chyron_scroll(scroll_pixels);
+
+    /* Emit BEGIN_END(6) = TRIANGLE_STRIP */
+    pgraph_d3d11_method(0, 0x17FC, 6);
+
+    /* Feed the chyron vertex data */
+    for (uint32_t i = 0; i < CHYRON_INLINE_COUNT; i++) {
+        pgraph_d3d11_method(0, 0x1818, menu_pushbuffer_data[CHYRON_INLINE_DATA + i]);
+    }
+
+    /* End draw */
+    pgraph_d3d11_method(0, 0x17FC, 0);
+
+    /* Clear chyron scroll */
+    pgraph_d3d11_set_chyron_scroll(0);
 }
 
 void nv2a_pb_replay_set_active(int active)
@@ -141,7 +191,9 @@ void nv2a_pb_replay_set_active(int active)
 
     if (active) {
         pgraph_d3d11_init();
-        fprintf(stderr, "[PB-REPLAY] Push buffer replay ENABLED (%u dwords, starting at 0x12EC)\n",
+        QueryPerformanceFrequency(&g_replay_freq);
+        QueryPerformanceCounter(&g_replay_start_time);
+        fprintf(stderr, "[PB-REPLAY] Push buffer replay ENABLED (%u dwords, font atlas pre-bound, chyron scroll active)\n",
                 MENU_PB_DWORDS);
     } else {
         fprintf(stderr, "[PB-REPLAY] Push buffer replay disabled\n");

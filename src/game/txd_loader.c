@@ -111,32 +111,56 @@ static uint32_t calc_texture_size(uint32_t width, uint32_t height, uint32_t xbox
     }
 }
 
-/** Morton decode (unswizzle) for Xbox NV2A textures.
- *  Separates interleaved x/y bits from a Morton code. */
-static void morton_decode(uint32_t code, uint32_t *x, uint32_t *y)
+/** Xbox NV2A texture unswizzle.
+ *  For square textures, this is pure Morton (Z-order) decoding.
+ *  For non-square textures (e.g. 256x64), the NV2A interleaves bits
+ *  up to the smaller dimension, then appends the remaining bits of
+ *  the larger dimension sequentially. */
+static void nv2a_unswizzle_coords(uint32_t index, uint32_t width, uint32_t height,
+                                   uint32_t *out_x, uint32_t *out_y)
 {
+    /* Count bits needed for each dimension */
+    uint32_t xbits = 0, ybits = 0;
+    { uint32_t w = width;  while (w > 1) { xbits++; w >>= 1; } }
+    { uint32_t h = height; while (h > 1) { ybits++; h >>= 1; } }
+
     uint32_t xi = 0, yi = 0;
-    int i;
-    for (i = 0; i < 16; i++) {
-        xi |= ((code >> (2 * i)) & 1) << i;
-        yi |= ((code >> (2 * i + 1)) & 1) << i;
+    uint32_t min_bits = xbits < ybits ? xbits : ybits;
+    uint32_t bit = 0, src_bit = 0;
+
+    /* Interleaved region: alternate x,y bits up to the smaller dimension */
+    for (bit = 0; bit < min_bits; bit++) {
+        xi |= ((index >> src_bit) & 1) << bit; src_bit++;
+        yi |= ((index >> src_bit) & 1) << bit; src_bit++;
     }
-    *x = xi;
-    *y = yi;
+
+    /* Remaining bits go to the larger dimension */
+    if (xbits > ybits) {
+        for (; bit < xbits; bit++) {
+            xi |= ((index >> src_bit) & 1) << bit; src_bit++;
+        }
+    } else if (ybits > xbits) {
+        for (; bit < ybits; bit++) {
+            yi |= ((index >> src_bit) & 1) << bit; src_bit++;
+        }
+    }
+
+    *out_x = xi;
+    *out_y = yi;
 }
 
-/** Unswizzle P8 (8-bit palettized) texture data.
- *  Xbox NV2A stores P8 pixels in Morton/Z-order. */
-static void unswizzle_p8(const uint8_t *src, uint8_t *dst,
-                          uint32_t width, uint32_t height)
+/** Generic unswizzle for any bytes-per-pixel.
+ *  Works for 8-bit, 16-bit, and 32-bit textures. */
+static void unswizzle_generic(const uint8_t *src, uint8_t *dst,
+                               uint32_t width, uint32_t height, uint32_t bpp)
 {
     uint32_t total = width * height;
     uint32_t i;
     for (i = 0; i < total; i++) {
         uint32_t x, y;
-        morton_decode(i, &x, &y);
+        nv2a_unswizzle_coords(i, width, height, &x, &y);
         if (x < width && y < height) {
-            dst[y * width + x] = src[i];
+            memcpy(dst + (y * width + x) * bpp, src + i * bpp, bpp);
         }
     }
 }
@@ -158,7 +182,7 @@ static uint8_t *convert_p8_to_argb(const uint8_t *tex_data, uint32_t data_avail,
     /* Unswizzle index data */
     uint8_t *unswizzled = (uint8_t *)malloc(idx_size);
     if (!unswizzled) return NULL;
-    unswizzle_p8(tex_data, unswizzled, width, height);
+    unswizzle_generic(tex_data, unswizzled, width, height, 1);
 
     /* Palette is 256 BGRA entries */
     const uint8_t *palette = tex_data + palette_offset;
@@ -332,6 +356,28 @@ int txd_load(const char *path, IDirect3DDevice8 *device, TXD_Dict *out_dict)
             pixel_data = converted;
             d3d_fmt = D3DFMT_A8R8G8B8;
             upload_size = width * height * 4;
+        }
+
+        /* Unswizzle non-DXT, non-linear, non-P8 textures (Morton/Z-order → linear) */
+        if (!converted && fmt_code != XBOX_FMT_DXT1 && fmt_code != XBOX_FMT_DXT3 &&
+            fmt_code != XBOX_FMT_DXT5 && fmt_code != XBOX_FMT_LIN_A8R8G8B8 &&
+            fmt_code != XBOX_FMT_LIN_X8R8G8B8 && fmt_code != XBOX_FMT_P8) {
+            uint32_t bpp = 0;
+            if (fmt_code == XBOX_FMT_A1R5G5B5 || fmt_code == XBOX_FMT_R5G6B5 ||
+                fmt_code == XBOX_FMT_A4R4G4B4)
+                bpp = 2;
+            else if (fmt_code == XBOX_FMT_A8R8G8B8 || fmt_code == XBOX_FMT_X8R8G8B8)
+                bpp = 4;
+            else if (fmt_code == XBOX_FMT_L8)
+                bpp = 1;
+
+            if (bpp > 0) {
+                converted = (uint8_t *)malloc(upload_size);
+                if (converted) {
+                    unswizzle_generic(pixel_data, converted, width, height, bpp);
+                    pixel_data = converted;
+                }
+            }
         }
 
         if (d3d_fmt == D3DFMT_UNKNOWN) {

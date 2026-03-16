@@ -38,6 +38,10 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param);
 /* Flush any pending draw commands (call at end of frame). */
 void pgraph_d3d11_flush(void);
 
+/* Set chyron scroll: pass frame counter to animate, 0 to disable.
+ * Applies horizontal scroll offset to vertices in the chyron Y band. */
+void pgraph_d3d11_set_chyron_scroll(uint32_t frame);
+
 /* Statistics */
 typedef struct {
     uint32_t frames;

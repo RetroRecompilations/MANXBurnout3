@@ -6,6 +6,7 @@ This project takes the original Xbox binary of **Burnout 3: Takedown** (2004, Cr
 
 ![Title intro video playing through the boot sequence](docs/screenshots/title.png)
 ![Intro video - racing footage from the original XMV videos](docs/screenshots/introvideo.png)
+![Main menu with full Burnout 3 logo, all options, and scrolling chyron](docs/screenshots/menu_main.png)
 
 ## Why This Is Interesting
 
@@ -24,42 +25,41 @@ The technical challenges are fascinating: translating x86 to x86-64 with a globa
 
 ## Current Status
 
-**Phase 5: Integration** — The game boots, loads all resources, transitions through state 4 (crash mode) → state 5 (menus/frontend), and runs the gameplay loop continuously. RenderWare rendering pipeline is connected to D3D11 via a rendering bridge.
+**Phase 5: Integration** — The game boots, loads all resources, transitions through state 4 (crash mode) → state 5 (menus/frontend), and renders the main menu with all UI elements. NV2A push buffer data captured from xemu is translated to D3D11 in real time.
 
 ### What's Working
+- **Full main menu rendering** — all 5 menu options (World Tour, Single Event, Multiplayer, Xbox Live, Driver Details) rendered via NV2A push buffer → D3D11 translation
+  - Burnout 3 logo, "Select Option" header, button prompts, scrolling chyron ticker
+  - 32 draw calls/frame, 3078 vertices, 11 texture bindings from Global.txd + captured font atlas
+  - Time-based smooth chyron scroll animation at 50px/sec
+  - Per-draw texture mapping via NV2A VRAM offset → Global.txd name lookup
 - **Boot video sequence** — Criterion logo, EA logo, and title intro videos play from pre-converted XMV→MP4 files via Media Foundation
 - Full game boot sequence through the original RenderWare engine init
-- **Game state machine**: loading → init → state 4 (crash) → state 5 (menus/frontend) — running continuously
+- **Game state machine**: loading → init → state 4 (crash) → state 5 (menus/frontend) — running continuously at ~32 FPS
 - **RW→D3D11 rendering bridge** — the original RenderWare display driver pipeline (sub_001DDAF0 → sub_00351090) routes through our D3D8→D3D11 layer
-- **Im2d 2D rendering pipeline** — RwIm2DRenderPrimitive (sub_001DE900) overridden to route pre-transformed 2D vertices through D3D8→D3D11. Debug HUD overlay renders game state indicator bars every frame. Auto scene management handles BeginScene/EndScene for im2d calls outside the 3D render pass.
-- **Im2d driver table** — display driver entry 0x0F (sub_001DBDE0) overridden as safety net; im2d callback table (0x7592CC) populated with render triangle/line callbacks
-- **Game audio events** — AWD sounds triggered on state transitions (Zoom on state 7→4, MenuIn on state 4→5, GlobeHigh startup chime). Sound effects connected to game state machine.
+- **Im2d 2D rendering pipeline** — RwIm2DRenderPrimitive (sub_001DE900) overridden to route pre-transformed 2D vertices through D3D8→D3D11
+- **Game audio events** — AWD sounds triggered on state transitions (Zoom on state 7→4, MenuIn on state 4→5, GlobeHigh startup chime)
 - **37 playable tracks** loaded from game files with fly camera and drive mode
 - **160 DXT textures per track** loaded from `static.dat` and mapped to geometry
 - **67 vehicle models** across 7 classes (Compact, Coupe, Heavy, etc.)
-- **AWD audio playback** — Fe.awd (50 sounds) and Generic.awd loaded, software mixer with 64 voices (16.16 fixed-point resampling, waveOut 48kHz stereo)
-- **MCPX APU audio emulation** — xemu's Voice Processor extracted and running standalone
-  - VP voice processing pipeline (256 voices, ADPCM decode, SGE page tables, envelope/filter)
-  - GP/EP DSP stubbed with direct mixbin passthrough
-  - Test tone generator (U key) confirms end-to-end audio pipeline
-- **NV2A GPU register emulation** — PMC, PBUS, PTIMER, PFB, PCRTC, PRAMDAC, PFIFO, PGRAPH handlers from xemu
-  - Push buffer command processing validated (viewport, clear, draws, flip)
-  - MMIO VEH instruction decoder intercepts 0xFD000000+ accesses
+- **AWD audio playback** — Fe.awd (50 sounds) and Generic.awd loaded, software mixer with 64 voices
+- **MCPX APU audio emulation** — xemu's Voice Processor extracted and running standalone (256 voices, ADPCM/PCM, envelopes, HRTF, filters)
+- **NV2A GPU translation** — push buffer method handler translates NV2A Kelvin methods (BEGIN_END, INLINE_ARRAY, texture state, viewport, blend/depth/cull) to D3D8→D3D11 calls
+- **Xbox texture unswizzle** — Morton/Z-order decode for non-DXT textures including non-square dimensions (A1R5G5B5, R5G6B5, A8R8G8B8, etc.)
 - **VEH fault handling** — divide-by-zero, access violations, and 32-bit overflow all handled gracefully
-- **Native pointer resolution** — RW allocator stores native heap pointers in Xbox memory; our `xbox_ptr_resolve()` and `ICALL_SAFE` handle transparent native↔Xbox VA conversion
+- **Native pointer resolution** — RW allocator stores native heap pointers in Xbox memory; transparent native↔Xbox VA conversion
 - File loading pipeline reads game resources into Xbox memory space
-- Physics model with heading-based steering and road interaction
 - Keyboard + gamepad input (XInput)
 - D3D11 rendering through a D3D8 compatibility layer
 
 ### What's Left
-- [ ] Frontend object vtable initialization (currently camera object, needs game object)
-- [ ] Route game's im2d callers through override pipeline (6 RW driver functions ready, awaiting menu code trigger)
+- [ ] Sub-menu navigation (New Profile, Save/Load, World Tour country/map selection)
+- [ ] NV2A register combiner emulation (currently hardcoded MODULATE blend mode)
+- [ ] Live push buffer interception (replace static capture with real-time game-driven rendering)
 - [ ] Connect game's DirectSound init (sub_00135040) to APU voice processor
 - [ ] Vehicle textures (`.btv` paint variant format)
 - [ ] Full collision / physics world initialization
-- [ ] Performance optimization (currently ~18 FPS with 1400+ draw calls per track)
-- [ ] Menu system and UI rendering through original code paths
+- [ ] Performance optimization
 
 ## How It Works
 
