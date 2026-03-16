@@ -85,6 +85,10 @@ static const IDirect3DDevice8Vtbl g_device_vtbl;
 /* ================================================================
  * Public frame pump (called from recompiled game code)
  * ================================================================ */
+/* When non-zero, d3d8_PresentFrame() only pumps messages (no Present).
+ * Used by push buffer replay to prevent extra presents causing flashing. */
+volatile int g_suppress_present = 0;
+
 void d3d8_PresentFrame(void)
 {
     /* Pump Windows messages */
@@ -95,8 +99,8 @@ void d3d8_PresentFrame(void)
         DispatchMessageA(&msg);
     }
 
-    /* Present the backbuffer (VSync = 1) */
-    if (g_device_state.swap_chain)
+    /* Present the backbuffer (VSync = 1), unless suppressed */
+    if (!g_suppress_present && g_device_state.swap_chain)
         IDXGISwapChain_Present(g_device_state.swap_chain, 1, 0);
 }
 

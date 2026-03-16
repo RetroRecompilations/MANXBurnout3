@@ -4806,17 +4806,19 @@ void game_frame_pump(void)
 
         if (!rw_bridge_frame_rendered()) {
             g_d3d_device->lpVtbl->EndScene(g_d3d_device);
-        }
-        menu_gui_begin_frame();
-        menu_gui_render();
-        if (!rw_bridge_frame_rendered()) {
-            /* Only present here if the bridge didn't render.
-             * When bridge is active, sub_001D9420 handles Present. */
+            menu_gui_begin_frame();
+            menu_gui_render();
+            /* Only present here if the bridge didn't render. */
             g_d3d_device->lpVtbl->Present(g_d3d_device, NULL, NULL, NULL, NULL);
             {
                 extern volatile uint32_t g_present_count;
                 g_present_count++;
             }
+        } else {
+            /* Bridge rendered — skip EndScene/Present (bridge did it).
+             * Still render ImGui overlay. */
+            menu_gui_begin_frame();
+            menu_gui_render();
         }
     }
 

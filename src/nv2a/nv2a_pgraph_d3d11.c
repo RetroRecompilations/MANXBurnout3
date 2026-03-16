@@ -334,18 +334,21 @@ static void submit_draw(void)
             }
         }
 
-        /* Match NV2A VRAM offset → Global.txd name (from xemu analysis) */
+        /* Match NV2A VRAM offset → Global.txd name (from xemu analysis).
+         * Offsets identified by capturing PGRAPH texture registers from xemu
+         * and matching by texture dimension + format code. */
         IDirect3DTexture8 *tex = NULL;
         uint32_t vram_off = g_pg.tex[0].offset;
         switch (vram_off) {
-            case 0x03C1ED00: tex = txd_find(&g_global_txd, "B3Logo"); break;
-            case 0x03C24700: tex = txd_find(&g_global_txd, "bg"); break;
-            case 0x03C24B80: tex = txd_find(&g_global_txd, "big_curve"); break;
-            case 0x03C7BE00: tex = txd_find(&g_global_txd, "Buttons"); break;
-            case 0x03C95700: tex = txd_find(&g_global_txd, "FE"); break;
-            case 0x03CA1A80: tex = txd_find(&g_global_txd, "FE"); break;
-            case 0x03D57000: tex = txd_find(&g_global_txd, "FE"); break;
-            case 0x03CB9200: tex = txd_find(&g_global_txd, "16_curve"); break;
+            case 0x03C1ED00: tex = txd_find(&g_global_txd, "B3Logo"); break;      /* 256x64 A1R5G5B5 */
+            case 0x03C24700: tex = txd_find(&g_global_txd, "bg"); break;           /* 64x32 DXT1 */
+            case 0x03C24B80: tex = txd_find(&g_global_txd, "big_curve"); break;    /* 128x128 DXT5 */
+            case 0x03C7BE00: tex = txd_find(&g_global_txd, "Buttons"); break;      /* 128x64 DXT5 */
+            case 0x03C95700: tex = txd_find(&g_global_txd, "dpad"); break;          /* 32x16 DXT5 */
+            case 0x03CA1A80: tex = txd_find(&g_global_txd, "small_curve"); break;   /* 32x32 DXT5 */
+            case 0x03D57000: tex = txd_find(&g_global_txd, "box_curve"); break;     /* 32x32 DXT5 */
+            case 0x03CB9200: tex = txd_find(&g_global_txd, "grid"); break;          /* 16x16 DXT1 */
+            case 0x02EC0400: tex = NULL; break;  /* Render target / framebuffer — no texture */
             case 0x021C4100:
                 /* Font atlas — create from captured DXT5 data on first use */
                 if (!g_pg.font_atlas) {
@@ -355,22 +358,28 @@ static void submit_draw(void)
                 }
                 tex = g_pg.font_atlas;
                 break;
-            default: tex = txd_find(&g_global_txd, "ramp"); break;  /* fallback */
+            case 0: tex = NULL; break;  /* No texture set — vertex color only */
+            default: tex = NULL; break; /* Unknown — render with vertex color only */
         }
 
-        dev->lpVtbl->SetTexture(dev, 0, (IDirect3DBaseTexture8 *)tex);
-
-        /* Set texture stage: MODULATE (texture × vertex color) */
-        dev->lpVtbl->SetTextureStageState(dev, 0, 1 /*D3DTSS_COLOROP*/, 4 /*D3DTOP_MODULATE*/);
-        dev->lpVtbl->SetTextureStageState(dev, 0, 2 /*D3DTSS_COLORARG1*/, 2 /*D3DTA_TEXTURE*/);
-        dev->lpVtbl->SetTextureStageState(dev, 0, 3 /*D3DTSS_COLORARG2*/, 0 /*D3DTA_DIFFUSE*/);
-        dev->lpVtbl->SetTextureStageState(dev, 0, 4 /*D3DTSS_ALPHAOP*/, 4 /*D3DTOP_MODULATE*/);
-        dev->lpVtbl->SetTextureStageState(dev, 0, 5 /*D3DTSS_ALPHAARG1*/, 2 /*D3DTA_TEXTURE*/);
-        dev->lpVtbl->SetTextureStageState(dev, 0, 6 /*D3DTSS_ALPHAARG2*/, 0 /*D3DTA_DIFFUSE*/);
-
-        /* Set texture address mode to CLAMP (prevents repeating artifacts) */
-        dev->lpVtbl->SetTextureStageState(dev, 0, 13 /*D3DTSS_ADDRESSU*/, 3 /*D3DTADDRESS_CLAMP*/);
-        dev->lpVtbl->SetTextureStageState(dev, 0, 14 /*D3DTSS_ADDRESSV*/, 3 /*D3DTADDRESS_CLAMP*/);
+        if (tex) {
+            dev->lpVtbl->SetTexture(dev, 0, (IDirect3DBaseTexture8 *)tex);
+            dev->lpVtbl->SetTextureStageState(dev, 0, 1 /*COLOROP*/, 4 /*MODULATE*/);
+            dev->lpVtbl->SetTextureStageState(dev, 0, 2 /*COLORARG1*/, 2 /*TEXTURE*/);
+            dev->lpVtbl->SetTextureStageState(dev, 0, 3 /*COLORARG2*/, 0 /*DIFFUSE*/);
+            dev->lpVtbl->SetTextureStageState(dev, 0, 4 /*ALPHAOP*/, 4 /*MODULATE*/);
+            dev->lpVtbl->SetTextureStageState(dev, 0, 5 /*ALPHAARG1*/, 2 /*TEXTURE*/);
+            dev->lpVtbl->SetTextureStageState(dev, 0, 6 /*ALPHAARG2*/, 0 /*DIFFUSE*/);
+            dev->lpVtbl->SetTextureStageState(dev, 0, 13 /*ADDRESSU*/, 3 /*CLAMP*/);
+            dev->lpVtbl->SetTextureStageState(dev, 0, 14 /*ADDRESSV*/, 3 /*CLAMP*/);
+        } else {
+            /* No texture — use vertex color only */
+            dev->lpVtbl->SetTexture(dev, 0, NULL);
+            dev->lpVtbl->SetTextureStageState(dev, 0, 1 /*COLOROP*/, 2 /*SELECTARG1*/);
+            dev->lpVtbl->SetTextureStageState(dev, 0, 2 /*COLORARG1*/, 0 /*DIFFUSE*/);
+            dev->lpVtbl->SetTextureStageState(dev, 0, 4 /*ALPHAOP*/, 2 /*SELECTARG1*/);
+            dev->lpVtbl->SetTextureStageState(dev, 0, 5 /*ALPHAARG1*/, 0 /*DIFFUSE*/);
+        }
     } else {
         dev->lpVtbl->SetTexture(dev, 0, NULL);
     }

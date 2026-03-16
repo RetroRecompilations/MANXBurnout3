@@ -134,6 +134,11 @@ void nv2a_pb_replay_set_active(int active)
 {
     g_replay_active = active;
     g_replay_frame = 0;
+
+    /* Suppress extra presents from recompiled code to prevent flashing */
+    extern volatile int g_suppress_present;
+    g_suppress_present = active ? 1 : 0;
+
     if (active) {
         pgraph_d3d11_init();
         fprintf(stderr, "[PB-REPLAY] Push buffer replay ENABLED (%u dwords, starting at 0x12EC)\n",
