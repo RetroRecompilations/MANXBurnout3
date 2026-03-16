@@ -257,7 +257,29 @@ int rw_bridge_camera_render(uint32_t camera_va)
     /* Check if we're in menu state — route to frontend menu renderer.
      * Menu detection: camera pointer at 0x4D5370 == 0x4D4008 (menus). */
     if (fe_menu_is_active()) {
-        /* Frontend menu: rendered entirely by fe_menu.c */
+        /* Frontend menu: push buffer replay replaces the placeholder.
+         * Clear to dark blue so we can see the NV2A translated geometry. */
+        extern int nv2a_pb_replay_is_active(void);
+        extern void nv2a_pb_replay_frame(void);
+        if (nv2a_pb_replay_is_active()) {
+            dev->lpVtbl->Clear(dev, 0, NULL, 1 /*D3DCLEAR_TARGET*/,
+                               0xFF101030, 1.0f, 0);
+            dev->lpVtbl->BeginScene(dev);
+
+            /* Draw push buffer replay geometry HERE, inside the render pass */
+            nv2a_pb_replay_frame();
+
+            dev->lpVtbl->EndScene(dev);
+            dev->lpVtbl->Present(dev, NULL, NULL, NULL, NULL);
+            {
+                extern volatile uint32_t g_present_count;
+                g_present_count++;
+            }
+            g_bridge_rendered = 1;
+            return 1;
+        }
+
+        /* Fallback: old placeholder menu */
         fe_menu_render_frame();
         g_bridge_rendered = 1;
 

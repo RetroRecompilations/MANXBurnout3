@@ -32,6 +32,8 @@ set(NV2A_SOURCES
     ${NV2A_DIR}/nv2a_core.c
     ${NV2A_DIR}/nv2a_mmio_hook.c
     ${NV2A_DIR}/nv2a_pb_test.c
+    ${NV2A_DIR}/nv2a_pgraph_d3d11.c
+    ${NV2A_DIR}/nv2a_pb_replay.c
 )
 
 # Game executable sources

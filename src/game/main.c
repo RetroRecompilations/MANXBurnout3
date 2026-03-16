@@ -2359,6 +2359,18 @@ void game_frame_pump(void)
                 g_key_prev = g_key_now;
             }
 
+            /* R key: toggle NV2A push buffer replay (xemu menu data) */
+            {
+                static int r_key_prev = 0;
+                int r_key_now = (GetAsyncKeyState('R') & 0x8000) ? 1 : 0;
+                if (r_key_now && !r_key_prev) {
+                    extern int nv2a_pb_replay_is_active(void);
+                    extern void nv2a_pb_replay_set_active(int active);
+                    nv2a_pb_replay_set_active(!nv2a_pb_replay_is_active());
+                }
+                r_key_prev = r_key_now;
+            }
+
             /* U key: play APU test tone (440Hz sine) */
             {
                 static int u_key_prev = 0;
@@ -4776,6 +4788,20 @@ void game_frame_pump(void)
         {
             extern void nv2a_pb_test_frame(void);
             nv2a_pb_test_frame();
+        }
+
+        /* NV2A push buffer replay (toggle with R key, auto-start after 60 frames) */
+        {
+            extern void nv2a_pb_replay_frame(void);
+            extern int nv2a_pb_replay_is_active(void);
+            extern void nv2a_pb_replay_set_active(int active);
+            static int replay_auto_started = 0;
+            extern volatile uint32_t g_present_count;
+            if (!replay_auto_started && g_present_count > 60) {
+                nv2a_pb_replay_set_active(1);
+                replay_auto_started = 1;
+            }
+            nv2a_pb_replay_frame();
         }
 
         if (!rw_bridge_frame_rendered()) {

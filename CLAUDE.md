@@ -34,11 +34,42 @@ The goal is to translate the original x86 Xbox code into a native Windows execut
 - Addresses are always shown as hex with 0x prefix (e.g., 0x001D2807)
 - Xbox kernel function names use their original Xbox names with `xbox_` prefix when reimplemented
 
-## Current Work State (Session 39)
+## Current Work State (Session 40)
 
-### Status: Screen entry population pipeline fixed
-Game boots, reaches state 5 (menus), frontend init phases run properly, 39+ screen definitions registered in screen array. Rendering pipeline not yet connected.
-**Current blockers**: Screen list sub-object vtable is NULL (C++ constructor never ran), need to either populate vtable or bypass vtable calls in render dispatch.
+### Status: NV2A push buffer → D3D11 translation WORKING
+Game boots, reaches state 5 (menus), and NV2A push buffer data captured from xemu is being successfully translated and rendered through D3D11. The Burnout 3 main menu layout (panels, text quads, angular design elements) is visible as colored geometry. Textures not yet bound.
+
+### Session 40 Changes (2026-03-15)
+- **NV2A PGRAPH → D3D11 translator** (`src/nv2a/nv2a_pgraph_d3d11.c/h`): New reusable module
+  - Intercepts NV2A Kelvin method calls from push buffer parser
+  - Handles: SET_BEGIN_END, INLINE_ARRAY, CLEAR_SURFACE, blend/depth/cull state, viewport
+  - Converts 5-dword inline vertices (X,Y,U,V,Color) to 28-byte XYZRHW+Diffuse+TEX1
+  - QUADS (mode 8) → triangle list conversion (6 verts per quad)
+  - Routes through D3D8 COM `DrawPrimitiveUP` → D3D11
+  - 24 draw calls/frame, 1079 vertices, correct Burnout 3 menu layout
+- **Push buffer replay** (`src/nv2a/nv2a_pb_replay.c`): Replays captured xemu data
+  - 32KB push buffer captured from xemu during menu rendering
+  - 268 NV2A command headers parsed, 6471 methods/frame dispatched
+  - Auto-activates after 60 frames for testing
+- **xemu debug session**: Comprehensive menu state capture
+  - Screen list vtable = 0x003A9FA4 (10 methods, all in gen code, NOT stubbed)
+  - 536 screen entries at 0x004B01B0, flag=2 (active)
+  - Frontend vtable at 0x003A9E7C confirmed, [3]=0x00014D20
+  - Render context at 0x35FB48 → NV2A push buffer DMA state
+  - sub_001AE6F0 NOT called during menus (wrong assumption corrected)
+  - Real chain: sub_00014D20 → sub_0034C2E0 + sub_0034D530 from RW pipeline
+  - Menu rendering uses INLINE_ARRAY with TRIANGLE_STRIP/QUADS, no im2d
+- **pgraph_method() updated**: Routes through D3D11 translator before legacy logging
+- **Bridge render path**: When replay active, clears to dark blue + draws replay geometry
+- **Captured push buffer data**: `src/nv2a/menu_pushbuffer_data.h` (embedded C array)
+
+### Session 40 Key Discovery: Menu Render Pipeline
+The original menu rendering does NOT use im2d or sub_001AE6F0. Instead:
+1. `sub_000171A0` → vtable[3] → `sub_00014D20` (per frame, calls sub_0034C2E0 for D3D clear)
+2. RW display pipeline → `sub_0034D530` (79K D3D8LTCG, writes NV2A push buffer commands)
+3. Push buffer contains: BEGIN_END(TRIANGLE_STRIP/QUADS) + INLINE_ARRAY vertex data
+4. Vertex format: float X, float Y, float U, float V, D3DCOLOR (20 bytes, 640×480 screen space)
+5. ~448 vertices/frame in ~25 draw batches = textured 2D quads for all menu UI elements
 
 ### Session 39 Changes (2026-03-13)
 - **sub_001AA100 REWRITTEN**: Full phase state machine (phases 1-9 → 0x13) instead of simple 30-frame skip
@@ -213,11 +244,12 @@ Game boots, loads, runs gameplay loop. **Two rendering modes** toggled with V ke
   - 15,196 lines across 55 files
 
 ### Next Steps
-1. Decode .btv vehicle texture format and apply to 3D models
-2. Populate AI car state block (0x410600) for traffic interactions
-3. Connect original RW rendering pipeline to D3D11 backend
-4. Long-term: fix the real physics world initialization
-5. Long-term: audio playback (DirectSound → XAudio2)
+1. **Bind Global.txd textures** to NV2A translator draws (UV coords already correct)
+2. **Fix frame flashing** — ensure single present per frame in replay mode
+3. **Wire live push buffer data** — make sub_0034D530 write to interceptable buffer
+4. **Populate screen list vtable** (0x003A9FA4) in recomp to unblock original code paths
+5. Decode .btv vehicle texture format and apply to 3D models
+6. Long-term: fix the real physics world initialization
 
 ### Key Input Addresses
 - Accumulators: 0x4D652C (throttle), 0x4D6530 (steering) - written by game_frame_pump()
