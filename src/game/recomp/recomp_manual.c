@@ -3429,9 +3429,38 @@ void sub_0003D9E0(void)
     PUSH32(esp, 0); sub_0002F330();
 
     /* sub_0034D530: D3D8LTCG rendering pipeline.
-     * Generates NV2A push buffer commands from RW scene state.
-     * Previously skipped; now enabled with populated device context. */
-    PUSH32(esp, 0); sub_0034D530();
+     * Original code builds a render state struct on the stack from game object
+     * fields, then passes a pointer to it. When edi==0 (menu path):
+     *   esp+0 = MEM32(esi+0x9B0), esp+4 = MEM32(esi+0x9B8),
+     *   esp+8 = MEM32(esi+0x9A8), ecx = &esp (struct pointer)
+     * sub_0034D530 reads MEM32(ecx) to get the render list. */
+    if (call_count <= 5)
+        fprintf(stderr, "  [RENDER] sub_0003D9E0 edi=%u esi=0x%X 9B0=0x%X 9B8=0x%X 9A8=0x%X 3C0=0x%X\n",
+                edi, esi, MEM32(esi + 0x9B0), MEM32(esi + 0x9B8), MEM32(esi + 0x9A8), MEM32(esi + 0x3C0));
+
+    if (TEST_Z(edi, edi)) {
+        /* Menu render path: build render state struct like original code */
+        uint32_t saved_esp = esp;
+        eax = MEM32(esi + 0x9B0);
+        uint32_t val_9a8 = MEM32(esi + 0x9A8);
+        uint32_t val_9b8 = MEM32(esi + 0x9B8);
+        uint32_t val_3c0 = MEM32(esi + 0x3C0);
+        MEM32(esp)     = eax;           /* render state ptr */
+        MEM32(esp + 4) = val_9b8;       /* render list count */
+        MEM32(esp + 8) = val_9a8;       /* render list base */
+        edx = val_9b8 + val_9b8;
+        eax = val_3c0 - edx;
+        MEMF(esp + 0x10) = 0.0f;
+        float f_3b168c = MEMF(0x3B168C);
+        ecx = esp;                       /* pointer to struct */
+        PUSH32(esp, ecx);                /* push struct pointer as param */
+        MEM32(esp + 0x10) = eax;
+        MEMF(esp + 0x18) = f_3b168c;
+        PUSH32(esp, 0); sub_0034D530();  /* call with render state */
+        esp = saved_esp;                 /* restore stack */
+    } else {
+        PUSH32(esp, 0); sub_0034D530();  /* non-menu path: original param=0 */
+    }
 
     /* sub_00040660: copies camera/matrix from RW tables */
     /* Only call if esi looks valid (should be 0x4D6170) */
