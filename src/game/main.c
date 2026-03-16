@@ -1540,24 +1540,58 @@ static BOOL init_subsystems(void)
             MEM32(fake_device + 0x08) = pb_start;
             MEM32(fake_device + 0x0C) = pb_end - pb_start;
 
-            /* Fake render target / surface descriptors.
-             * Fields +0x794, +0x784, +0x7A8 are read as ptrs to surfaces. */
+            /* Render target / surface descriptors.
+             * Fields +0x784, +0x794, +0x7A8 are pointers to surface objects.
+             * sub_0034D530 dereferences these at +0x10 (width) and +0x14 (height).
+             * sub_0034C2E0 reads +0x1A04/+0x1A08 as surface pointers. */
             {
                 uint32_t fake_surf = xbox_HeapAlloc(0x1000, 16);
                 if (fake_surf) {
+                    /* Render target surface (offset 0 in block) */
+                    MEM32(fake_surf + 0x10) = 640;   /* width */
+                    MEM32(fake_surf + 0x14) = 480;   /* height */
+                    MEM32(fake_surf + 0x0C) = 0x00060006;  /* format/flags (A8R8G8B8) */
                     MEM32(fake_device + 0x784) = fake_surf;
+
+                    /* Depth/stencil surface (offset 0x100) */
+                    MEM32(fake_surf + 0x100 + 0x10) = 640;
+                    MEM32(fake_surf + 0x100 + 0x14) = 480;
+                    MEM32(fake_surf + 0x100 + 0x0C) = 0x00020002;  /* D24S8-like */
                     MEM32(fake_device + 0x794) = fake_surf + 0x100;
+
+                    /* Back buffer surface (offset 0x200) */
+                    MEM32(fake_surf + 0x200 + 0x10) = 640;
+                    MEM32(fake_surf + 0x200 + 0x14) = 480;
+                    MEM32(fake_surf + 0x200 + 0x0C) = 0x00060006;
                     MEM32(fake_device + 0x7A8) = fake_surf + 0x200;
+
+                    /* Surface state fields (1A04-1A18) — point to surfaces */
+                    MEM32(fake_device + 0x1A04) = fake_surf;          /* RT surface ptr */
+                    MEM32(fake_device + 0x1A08) = fake_surf + 0x100;  /* depth surface ptr */
+                    MEM32(fake_device + 0x1A14) = fake_surf;          /* == 1A04 for equality check */
+                    MEM32(fake_device + 0x1A18) = fake_surf;          /* alternate surface */
                 }
             }
 
-            /* Render state fields */
-            MEM32(fake_device + 0x1A04) = 0;
-            MEM32(fake_device + 0x1A14) = 0;
-            MEM32(fake_device + 0x1A18) = 0;
-            MEM32(fake_device + 0x1AD4) = 0;
+            /* Viewport / dimension fields.
+             * sub_0034D530 writes 0xEE0-0xEF4 from surface dimensions.
+             * Pre-populate for 640x480 so early reads return valid data. */
+            MEM32(fake_device + 0xEE0) = 640;    /* viewport width */
+            MEM32(fake_device + 0xEE4) = 480;    /* viewport height */
+            MEM32(fake_device + 0xEE8) = 640;    /* scale X */
+            MEM32(fake_device + 0xEEC) = 480;    /* scale Y */
+            MEM32(fake_device + 0xEF0) = 640;    /* clip width */
+            MEM32(fake_device + 0xEF4) = 480;    /* clip height */
             MEMF(fake_device + 0xEF8) = 0.0f;
             MEMF(fake_device + 0xEFC) = 0.0f;
+
+            /* Maximum dimension fields (used in scaling calculations) */
+            MEM32(fake_device + 0x954) = 640;
+            MEM32(fake_device + 0x958) = 480;
+
+            /* Render state / misc */
+            MEM32(fake_device + 0x1AD4) = 0;
+            MEM32(fake_device + 0x7CC) = 0;  /* render state flags */
 
             /* +0x9B8: render list pointer */
             {

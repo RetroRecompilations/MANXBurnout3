@@ -2165,17 +2165,22 @@ void parse_live_pushbuffer(void)
     MEM32(0x35D6A0) = pb_base;
 }
 
+/* Forward declare the generated D3D8LTCG render pipeline */
+extern void sub_0034D530_gen(void);
+
 void sub_0034D530(void)
 {
     g_d3d_render_count++;
 
-    /* Parse any push buffer commands written by D3D8 functions */
-    parse_live_pushbuffer();
-
     if (g_d3d_render_count <= 5 || (g_d3d_render_count % 10000) == 0)
-        fprintf(stderr, "  [D3D8-RENDER] sub_0034D530 called #%u\n", g_d3d_render_count);
-    eax = 0;
-    esp += 16; return; /* ret 12: pop 12 bytes of args + 4 byte ret addr */
+        fprintf(stderr, "  [D3D8-RENDER] sub_0034D530 called #%u (invoking gen code)\n", g_d3d_render_count);
+
+    /* Call the generated D3D8LTCG code — it reads RW scene state and
+     * writes NV2A push buffer commands to 0x35D6A0. */
+    sub_0034D530_gen();
+
+    /* Parse the push buffer commands and translate to D3D11 */
+    parse_live_pushbuffer();
 }
 
 /* ── Im2D render overrides ──────────────────────────────────── */
@@ -3404,6 +3409,11 @@ void sub_0003D9E0(void)
     ecx = edi;
     eax = esi;
     PUSH32(esp, 0); sub_0002F330();
+
+    /* sub_0034D530: D3D8LTCG rendering pipeline.
+     * Generates NV2A push buffer commands from RW scene state.
+     * Previously skipped; now enabled with populated device context. */
+    PUSH32(esp, 0); sub_0034D530();
 
     /* sub_00040660: copies camera/matrix from RW tables */
     /* Only call if esi looks valid (should be 0x4D6170) */
