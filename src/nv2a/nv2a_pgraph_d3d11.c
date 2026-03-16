@@ -30,6 +30,37 @@ extern TXD_Dict g_global_txd;
 extern int g_textures_loaded;
 extern IDirect3DTexture8 *txd_find(const TXD_Dict *dict, const char *name);
 
+/* Font atlas DXT5 data captured from xemu */
+#include "font_atlas_data.h"
+
+/* Create a D3D8 texture from raw DXT5 data */
+static IDirect3DTexture8 *create_dxt5_texture(IDirect3DDevice8 *dev,
+    uint32_t width, uint32_t height, const void *dxt5_data, uint32_t data_size)
+{
+    IDirect3DTexture8 *tex = NULL;
+    /* D3DFMT_DXT5 = 0x35545844 ('DXT5') on Xbox, mapped to DXGI_FORMAT_BC3 in our layer.
+     * Our d3d8 layer uses format code 0x0F for DXT5. */
+    HRESULT hr = dev->lpVtbl->CreateTexture(dev, width, height, 1,
+        0 /*Usage*/, 0x0F /*DXT5*/, 0 /*D3DPOOL_DEFAULT*/, &tex);
+    if (hr != 0 || !tex) {
+        fprintf(stderr, "[PGRAPH-D3D11] Failed to create font atlas texture: hr=0x%08X\n", hr);
+        return NULL;
+    }
+
+    /* Lock and fill with DXT5 data */
+    D3DLOCKED_RECT lr = {0};
+    hr = tex->lpVtbl->LockRect(tex, 0, &lr, NULL, 0);
+    if (hr == 0 && lr.pBits) {
+        memcpy(lr.pBits, dxt5_data, data_size);
+        tex->lpVtbl->UnlockRect(tex, 0);
+        fprintf(stderr, "[PGRAPH-D3D11] Created font atlas: %ux%u DXT5 (%u bytes)\n",
+                width, height, data_size);
+    } else {
+        fprintf(stderr, "[PGRAPH-D3D11] Failed to lock font atlas: hr=0x%08X\n", hr);
+    }
+    return tex;
+}
+
 /* ══════════════════════════════════════════════════════════════════════
  * NV2A method constants (from nv2a_regs.h, subset for translator)
  * ══════════════════════════════════════════════════════════════════════ */
@@ -139,8 +170,9 @@ static struct {
         int enabled;         /* Decoded from control0 bit 30 */
     } tex[4];
 
-    /* Cached texture pointer for menu rendering */
-    void *menu_texture;      /* IDirect3DTexture8* from Global.txd */
+    /* Cached texture pointers */
+    void *menu_texture;           /* IDirect3DTexture8* from Global.txd */
+    IDirect3DTexture8 *font_atlas; /* Created from captured DXT5 data */
     int texture_lookup_done;
 
     /* Stats */
@@ -314,7 +346,15 @@ static void submit_draw(void)
             case 0x03CA1A80: tex = txd_find(&g_global_txd, "FE"); break;
             case 0x03D57000: tex = txd_find(&g_global_txd, "FE"); break;
             case 0x03CB9200: tex = txd_find(&g_global_txd, "16_curve"); break;
-            case 0x021C4100: tex = txd_find(&g_global_txd, "WaterFresnel"); break; /* likely font atlas */
+            case 0x021C4100:
+                /* Font atlas — create from captured DXT5 data on first use */
+                if (!g_pg.font_atlas) {
+                    g_pg.font_atlas = create_dxt5_texture(dev,
+                        FONT_ATLAS_WIDTH, FONT_ATLAS_HEIGHT,
+                        font_atlas_dxt5, FONT_ATLAS_SIZE);
+                }
+                tex = g_pg.font_atlas;
+                break;
             default: tex = txd_find(&g_global_txd, "ramp"); break;  /* fallback */
         }
 
