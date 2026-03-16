@@ -262,17 +262,41 @@ int rw_bridge_camera_render(uint32_t camera_va)
         extern int nv2a_pb_replay_is_active(void);
         extern void nv2a_pb_replay_frame(void);
         {
-            dev->lpVtbl->Clear(dev, 0, NULL, 1 /*D3DCLEAR_TARGET*/,
-                               0xFF101030, 1.0f, 0);
+            dev->lpVtbl->Clear(dev, 0, NULL,
+                               D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER,
+                               0xFF000000, 1.0f, 0);
             dev->lpVtbl->BeginScene(dev);
 
-            /* Parse any live push buffer commands written by sub_0034C2E0 */
+            /* Layer 1: Background video (Titles30.mp4 — looping gameplay footage) */
+            {
+                extern int video_open(const char *path);
+                extern int video_update(float dt);
+                extern void video_render(void);
+                extern int video_is_finished(void);
+
+                static int bg_video_started = 0;
+                if (!bg_video_started) {
+                    if (video_open("Burnout 3 Takedown\\ovid\\mp4\\Titles30.mp4") == 0) {
+                        fprintf(stderr, "[RW-BRIDGE] Menu background video opened\n");
+                    }
+                    bg_video_started = 1;
+                }
+
+                int vr = video_update(1.0f / 60.0f);
+                if (vr == -1) {
+                    /* Video finished — loop it */
+                    video_open("Burnout 3 Takedown\\ovid\\mp4\\Titles30.mp4");
+                }
+                video_render();  /* Renders fullscreen quad with video frame */
+            }
+
+            /* Layer 2: Parse any live push buffer commands */
             {
                 extern void parse_live_pushbuffer(void);
                 parse_live_pushbuffer();
             }
 
-            /* Draw push buffer replay geometry (static capture from xemu) */
+            /* Layer 3: NV2A menu overlay (static capture from xemu) */
             if (nv2a_pb_replay_is_active()) {
                 nv2a_pb_replay_frame();
             }
