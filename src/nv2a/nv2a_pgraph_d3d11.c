@@ -23,6 +23,13 @@
 #include "../d3d/d3d8_xbox.h"
 extern IDirect3DDevice8 *xbox_GetD3DDevice(void);
 
+/* Global.txd texture lookup */
+typedef struct { char name[24]; IDirect3DTexture8 *texture; uint32_t width, height, format; } TXD_Entry;
+typedef struct { TXD_Entry entries[512]; int count; } TXD_Dict;
+extern TXD_Dict g_global_txd;
+extern int g_textures_loaded;
+extern IDirect3DTexture8 *txd_find(const TXD_Dict *dict, const char *name);
+
 /* ══════════════════════════════════════════════════════════════════════
  * NV2A method constants (from nv2a_regs.h, subset for translator)
  * ══════════════════════════════════════════════════════════════════════ */
@@ -48,9 +55,9 @@ extern IDirect3DDevice8 *xbox_GetD3DDevice(void);
 #define NV097_SET_SURFACE_CLIP_HORIZONTAL 0x0200
 #define NV097_SET_SURFACE_CLIP_VERTICAL 0x0204
 
-#define NV097_SET_TEXTURE_FORMAT        0x1B00  /* +0x40 per stage */
-#define NV097_SET_TEXTURE_ADDRESS       0x1B04
-#define NV097_SET_TEXTURE_CONTROL0      0x1B08
+#define NV097_SET_TEXTURE_OFFSET        0x1B00  /* +0x40 per stage */
+#define NV097_SET_TEXTURE_FORMAT        0x1B04  /* +0x40 per stage */
+#define NV097_SET_TEXTURE_CONTROL0      0x1B08  /* +0x40 per stage */
 
 /* NV2A draw modes → D3D primitive types */
 static int nv2a_draw_mode_to_d3d(uint32_t mode) {
@@ -123,6 +130,18 @@ static struct {
     float vp_scale[4];
     uint32_t surface_clip_h;
     uint32_t surface_clip_v;
+
+    /* Texture state per stage (4 stages) */
+    struct {
+        uint32_t offset;     /* NV2A VRAM offset (method 0x1B00) */
+        uint32_t format;     /* Format register (method 0x1B04) */
+        uint32_t control0;   /* Control0 register (method 0x1B08) */
+        int enabled;         /* Decoded from control0 bit 30 */
+    } tex[4];
+
+    /* Cached texture pointer for menu rendering */
+    void *menu_texture;      /* IDirect3DTexture8* from Global.txd */
+    int texture_lookup_done;
 
     /* Stats */
     PgraphD3D11Stats stats;
@@ -253,24 +272,68 @@ static void submit_draw(void)
     IDirect3DDevice8 *dev = xbox_GetD3DDevice();
     if (!dev) return;
 
-    /* Set up 2D render state */
+    /* Set up 2D render state — always enable alpha for menu transparency */
     dev->lpVtbl->SetRenderState(dev, D3DRS_ZENABLE, FALSE);
     dev->lpVtbl->SetRenderState(dev, D3DRS_LIGHTING, FALSE);
     dev->lpVtbl->SetRenderState(dev, D3DRS_CULLMODE, D3DCULL_NONE);
-    dev->lpVtbl->SetRenderState(dev, D3DRS_ALPHABLENDENABLE,
-                                 g_pg.blend_enable ? TRUE : FALSE);
-    if (g_pg.blend_enable) {
-        dev->lpVtbl->SetRenderState(dev, D3DRS_SRCBLEND,
-                                     nv2a_blend_to_d3d(g_pg.blend_sfactor));
-        dev->lpVtbl->SetRenderState(dev, D3DRS_DESTBLEND,
-                                     nv2a_blend_to_d3d(g_pg.blend_dfactor));
-    }
+    dev->lpVtbl->SetRenderState(dev, D3DRS_ALPHABLENDENABLE, TRUE);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
 
     /* Set FVF for pre-transformed 2D with texture */
     dev->lpVtbl->SetVertexShader(dev, D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
 
-    /* TODO: bind texture from NV2A texture state */
-    dev->lpVtbl->SetTexture(dev, 0, NULL);
+    /* Bind texture from Global.txd based on NV2A VRAM offset.
+     * We match the push buffer's SET_TEXTURE_OFFSET value to known
+     * Global.txd entries identified via xemu dimension/format matching. */
+    if (g_textures_loaded) {
+        /* Build lookup table on first use */
+        if (!g_pg.texture_lookup_done) {
+            g_pg.texture_lookup_done = 1;
+            fprintf(stderr, "[PGRAPH-D3D11] Texture lookup init (global_txd has %d textures)\n",
+                    g_global_txd.count);
+            /* Dump all texture names+sizes for reference */
+            for (int ti = 0; ti < g_global_txd.count; ti++) {
+                fprintf(stderr, "    [%3d] %-24s %3ux%-3u fmt=0x%X\n",
+                        ti, g_global_txd.entries[ti].name,
+                        g_global_txd.entries[ti].width,
+                        g_global_txd.entries[ti].height,
+                        g_global_txd.entries[ti].format);
+            }
+        }
+
+        /* Match NV2A VRAM offset → Global.txd name (from xemu analysis) */
+        IDirect3DTexture8 *tex = NULL;
+        uint32_t vram_off = g_pg.tex[0].offset;
+        switch (vram_off) {
+            case 0x03C1ED00: tex = txd_find(&g_global_txd, "B3Logo"); break;
+            case 0x03C24700: tex = txd_find(&g_global_txd, "bg"); break;
+            case 0x03C24B80: tex = txd_find(&g_global_txd, "big_curve"); break;
+            case 0x03C7BE00: tex = txd_find(&g_global_txd, "Buttons"); break;
+            case 0x03C95700: tex = txd_find(&g_global_txd, "FE"); break;
+            case 0x03CA1A80: tex = txd_find(&g_global_txd, "FE"); break;
+            case 0x03D57000: tex = txd_find(&g_global_txd, "FE"); break;
+            case 0x03CB9200: tex = txd_find(&g_global_txd, "16_curve"); break;
+            case 0x021C4100: tex = txd_find(&g_global_txd, "WaterFresnel"); break; /* likely font atlas */
+            default: tex = txd_find(&g_global_txd, "ramp"); break;  /* fallback */
+        }
+
+        dev->lpVtbl->SetTexture(dev, 0, (IDirect3DBaseTexture8 *)tex);
+
+        /* Set texture stage: MODULATE (texture × vertex color) */
+        dev->lpVtbl->SetTextureStageState(dev, 0, 1 /*D3DTSS_COLOROP*/, 4 /*D3DTOP_MODULATE*/);
+        dev->lpVtbl->SetTextureStageState(dev, 0, 2 /*D3DTSS_COLORARG1*/, 2 /*D3DTA_TEXTURE*/);
+        dev->lpVtbl->SetTextureStageState(dev, 0, 3 /*D3DTSS_COLORARG2*/, 0 /*D3DTA_DIFFUSE*/);
+        dev->lpVtbl->SetTextureStageState(dev, 0, 4 /*D3DTSS_ALPHAOP*/, 4 /*D3DTOP_MODULATE*/);
+        dev->lpVtbl->SetTextureStageState(dev, 0, 5 /*D3DTSS_ALPHAARG1*/, 2 /*D3DTA_TEXTURE*/);
+        dev->lpVtbl->SetTextureStageState(dev, 0, 6 /*D3DTSS_ALPHAARG2*/, 0 /*D3DTA_DIFFUSE*/);
+
+        /* Set texture address mode to CLAMP (prevents repeating artifacts) */
+        dev->lpVtbl->SetTextureStageState(dev, 0, 13 /*D3DTSS_ADDRESSU*/, 3 /*D3DTADDRESS_CLAMP*/);
+        dev->lpVtbl->SetTextureStageState(dev, 0, 14 /*D3DTSS_ADDRESSV*/, 3 /*D3DTADDRESS_CLAMP*/);
+    } else {
+        dev->lpVtbl->SetTexture(dev, 0, NULL);
+    }
 
     /* Begin scene if needed */
     dev->lpVtbl->BeginScene(dev);
@@ -414,13 +477,35 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
         g_pg.surface_clip_v = param;
         return 1;
 
-    /* ── Texture (stub for now) ── */
+    /* ── Texture state tracking (4 stages, 0x40 stride) ── */
+    case NV097_SET_TEXTURE_OFFSET:
+    case NV097_SET_TEXTURE_OFFSET + 0x40:
+    case NV097_SET_TEXTURE_OFFSET + 0x80:
+    case NV097_SET_TEXTURE_OFFSET + 0xC0:
+    {
+        int stage = (method - NV097_SET_TEXTURE_OFFSET) / 0x40;
+        g_pg.tex[stage].offset = param;
+        return 1;
+    }
     case NV097_SET_TEXTURE_FORMAT:
     case NV097_SET_TEXTURE_FORMAT + 0x40:
     case NV097_SET_TEXTURE_FORMAT + 0x80:
     case NV097_SET_TEXTURE_FORMAT + 0xC0:
-        /* TODO: decode texture format, create D3D11 SRV */
+    {
+        int stage = (method - NV097_SET_TEXTURE_FORMAT) / 0x40;
+        g_pg.tex[stage].format = param;
         return 1;
+    }
+    case NV097_SET_TEXTURE_CONTROL0:
+    case NV097_SET_TEXTURE_CONTROL0 + 0x40:
+    case NV097_SET_TEXTURE_CONTROL0 + 0x80:
+    case NV097_SET_TEXTURE_CONTROL0 + 0xC0:
+    {
+        int stage = (method - NV097_SET_TEXTURE_CONTROL0) / 0x40;
+        g_pg.tex[stage].control0 = param;
+        g_pg.tex[stage].enabled = (param >> 30) & 1;
+        return 1;
+    }
 
     default:
         /* Check if it's in a known range we can safely ignore */
