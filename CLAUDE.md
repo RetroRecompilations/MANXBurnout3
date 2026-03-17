@@ -34,10 +34,38 @@ The goal is to translate the original x86 Xbox code into a native Windows execut
 - Addresses are always shown as hex with 0x prefix (e.g., 0x001D2807)
 - Xbox kernel function names use their original Xbox names with `xbox_` prefix when reimplemented
 
-## Current Work State (Session 40)
+## Current Work State (Session 42)
 
-### Status: NV2A push buffer → D3D11 translation WORKING
-Game boots, reaches state 5 (menus), and NV2A push buffer data captured from xemu is being successfully translated and rendered through D3D11. The Burnout 3 main menu layout (panels, text quads, angular design elements) is visible as colored geometry. Textures not yet bound.
+### Status: Menu rendering WORKING via captured push buffer, live pipeline BLOCKED
+Game boots, reaches state 5 (menus), and NV2A push buffer data captured from xemu is being successfully translated and rendered through D3D11. Full Burnout 3 main menu with textures, chyron scroll, and interactive selection. Live render pipeline blocked by D3D device context initialization.
+
+### Session 42 Changes (2026-03-17)
+- **Live render pipeline investigation**: Attempted to enable original sub_001AE6F0 call chain
+  - sub_0003FEE0 (RW state setup) crashes on uninitialized D3D device context fields
+  - Even with D3D8LTCG mid-entry stubs, gen code walks pointer chains through device+0xCA0+
+  - sub_001AD350 (render list dispatch) returns immediately: render entry table res[+24]=NULL
+  - Render entry table populated by sub_0003FEE0 chain → circular dependency
+- **D3D8LTCG mid-entry stubs added** (recomp_manual.c):
+  - sub_0034F5B0 (70K render state flush) — stubbed, returns current PB position
+  - sub_003558A0 (45K render state flush) — stubbed, returns current PB position
+  - sub_0034D410 (79K render state flush) — stubbed, returns current PB position
+  - These are all entry points into the same giant D3D8LTCG function (ends at 0x360A54)
+- **D3D device context snapshot captured from xemu** (`src/nv2a/d3d_device_snapshot.h`):
+  - Device is STATIC at 0x0035D6A0 (in D3D8LTCG section), NOT heap-allocated
+  - 16KB snapshot captured during menu rendering (game state 5, cam=0x4D4008)
+  - Loaded at boot via memcpy, with PB/surface/viewport fixups
+  - Capture script: `tools/xemu_debug/capture_d3d_device.py`
+- **Key findings**:
+  - Render list resource at 0x01C7D000: res[+08]=native ptr, res[+24]=NULL (entry table)
+  - sub_0003FEE0 STILL crashes even with snapshot — 16KB contains hundreds of xemu
+    heap pointers (0x0078xxxx etc.) that can't be trivially fixed up
+  - Screen entries exist (1736 at 0x4B01B0) but never processed for rendering
+  - sub_0003FEE0 calls: sub_0034F5B0, sub_003518E0, sub_003558A0, sub_0003FE10,
+    sub_0034D410, sub_00040CF0 — gen code walks deep pointer chains in device state
+- **Remaining blocker**: sub_0003FEE0's gen code reads device fields that contain
+  xemu-specific heap pointers (surfaces, textures, render targets) which don't exist
+  in our environment. Need to either: (a) allocate matching objects at same Xbox VAs,
+  or (b) write a manual sub_0003FEE0 override that does only the safe operations
 
 ### Session 40 Changes (2026-03-15)
 - **NV2A PGRAPH → D3D11 translator** (`src/nv2a/nv2a_pgraph_d3d11.c/h`): New reusable module
@@ -244,12 +272,12 @@ Game boots, loads, runs gameplay loop. **Two rendering modes** toggled with V ke
   - 15,196 lines across 55 files
 
 ### Next Steps
-1. **Bind Global.txd textures** to NV2A translator draws (UV coords already correct)
-2. **Fix frame flashing** — ensure single present per frame in replay mode
-3. **Wire live push buffer data** — make sub_0034D530 write to interceptable buffer
-4. **Populate screen list vtable** (0x003A9FA4) in recomp to unblock original code paths
-5. Decode .btv vehicle texture format and apply to 3D models
-6. Long-term: fix the real physics world initialization
+1. **Write manual sub_0003FEE0 override** — implement only the safe operations (matrix copy
+   from game obj to device, viewport setup) without calling D3D8LTCG state flush functions.
+   Or: capture and fix up ALL heap pointers in the device snapshot (surface objects, etc.)
+2. **Fix frame rate** — currently 32fps (was 60fps); investigate present timing / vsync
+3. Decode .btv vehicle texture format and apply to 3D models
+4. Long-term: fix the real physics world initialization
 
 ### Key Input Addresses
 - Accumulators: 0x4D652C (throttle), 0x4D6530 (steering) - written by game_frame_pump()
@@ -273,10 +301,10 @@ Game boots, loads, runs gameplay loop. **Two rendering modes** toggled with V ke
 5. **recomp_0005.c**: #if 0 around 35 functions + sub_001DBDE0, sub_001DE900
 6. **recomp_0006.c**: #if 0 around sub_001FE1E0, sub_00221F20
 7. **recomp_0007.c**: #if 0 around sub_00244C51, sub_00249B7C, sub_00249B9C
-8. **recomp_0022.c**: #if 0 around sub_00351770, sub_003518E0, sub_0034D530
+8. **recomp_0022.c**: #if 0 around sub_00351770, sub_003518E0, sub_0034D530, **sub_0034D410, sub_0034F5B0, sub_003558A0** (Session 42)
 9. **recomp_stubs.c**: #if 0 around sub_00351A20
 10. **recomp_dispatch.c**: add sub_001D1818/sub_001D2793 entries, size=22097
 11. **recomp_funcs.h**: add sub_001D1818/sub_001D2793 declarations
 
-### Manual Function Overrides (recomp_manual.c) - 36 functions
-Including sub_000636D0 (physics force), sub_0003D9E0 (render orchestrator stub), sub_000110E0 (frame pump), sub_001AA100 (full phase state machine 1-9→0x13), sub_001AE6F0 (frontend render dispatch), sub_001DE900 (im2d render → bridge), sub_001DBDE0 (im2d driver entry → bridge)
+### Manual Function Overrides (recomp_manual.c) - 39 functions
+Including sub_000636D0 (physics force), sub_0003D9E0 (render orchestrator stub), sub_000110E0 (frame pump), sub_001AA100 (full phase state machine 1-9→0x13), sub_001AE6F0 (frontend render dispatch), sub_001DE900 (im2d render → bridge), sub_001DBDE0 (im2d driver entry → bridge), **sub_0034F5B0, sub_003558A0, sub_0034D410** (D3D8LTCG mid-entry stubs, Session 42)

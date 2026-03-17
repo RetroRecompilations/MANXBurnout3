@@ -150,6 +150,9 @@ void sub_00249B9C(void);
 void sub_003518E0(void);
 void sub_00351770(void);
 void sub_00351A20(void);
+void sub_0034F5B0(void);
+void sub_003558A0(void);
+void sub_0034D410(void);
 void sub_001C1670(void);
 void sub_001D7180(void);
 void sub_001D7857(void);
@@ -304,6 +307,9 @@ static const struct {
     { 0x003518E0u, (recomp_func_t)sub_003518E0 },
     { 0x00351770u, (recomp_func_t)sub_00351770 },
     { 0x00351A20u, (recomp_func_t)sub_00351A20 },
+    { 0x0034F5B0u, (recomp_func_t)sub_0034F5B0 },
+    { 0x003558A0u, (recomp_func_t)sub_003558A0 },
+    { 0x0034D410u, (recomp_func_t)sub_0034D410 },
     { 0x001C1670u, (recomp_func_t)sub_001C1670 },
     { 0x001D7180u, (recomp_func_t)sub_001D7180 },
     { 0x001D7857u, (recomp_func_t)sub_001D7857 },
@@ -1293,6 +1299,40 @@ void sub_00351770(void)
     eax = write_ptr;  /* return allocated address */
     esp += 8;     /* ret 4: pop return addr (4) + 1 param (4) */
     return;
+}
+
+
+/**
+ * D3D8LTCG render state flush — mid-function entry point stubs
+ *
+ * The D3D8LTCG library has ONE giant function (0x0034D410-0x00360A54, ~80K)
+ * with multiple entry points depending on which dirty flags are set:
+ *   sub_0034D410 (top)    — 79K, cdecl 0 params, ret 8 (2 stack params)
+ *   sub_0034D530           — 79K, our live push buffer override (ret 12)
+ *   sub_0034F5B0           — 70K, cdecl 0 params, called from sub_0003FEE0
+ *   sub_003558A0           — 45K, cdecl 0 params, returns new PB position
+ *
+ * These are called by sub_0003FEE0 and other RW display pipeline functions.
+ * On Xbox, they flush accumulated D3D state changes to NV2A push buffer.
+ * In our environment, we handle push buffer output in sub_0034D530, so
+ * these mid-entry stubs just return the current push buffer position.
+ */
+void sub_0034F5B0(void)
+{
+    eax = MEM32(0x35D6A0);  /* current write pointer */
+    esp += 4; return;
+}
+
+void sub_003558A0(void)
+{
+    eax = MEM32(0x35D6A0);  /* current write pointer */
+    esp += 4; return;
+}
+
+void sub_0034D410(void)
+{
+    eax = MEM32(0x35D6A0);
+    esp += 12; return;  /* ret 8: pop ret + 2 params */
 }
 
 
@@ -4565,15 +4605,13 @@ void sub_001AE6F0(void)
     uint32_t base_obj = MEM32(esp + 4);
     int32_t  phase    = (int32_t)MEM32(esp + 8);
     uint32_t render_base = base_obj + 0x12ADB0;
+    int log = (call_count <= 20 || (call_count % 5000) == 0);
 
-    if (call_count <= 20 || (call_count % 5000) == 0) {
+    if (log) {
         fprintf(stderr, "  [FE-DISPATCH] sub_001AE6F0 #%u: base=0x%X phase=%d\n",
                 call_count, base_obj, phase);
         fprintf(stderr, "    render_list: [+0]=0x%08X [+4]=0x%08X [+8]=0x%08X\n",
                 MEM32(render_base), MEM32(render_base + 4), MEM32(render_base + 8));
-        fprintf(stderr, "    B790=0x%08X B794=0x%08X B79C=%u B7C0=%u\n",
-                MEM32(base_obj + 0x12B790), MEM32(base_obj + 0x12B794),
-                MEM32(base_obj + 0x12B79C), MEM32(base_obj + 0x12B7C0));
     }
 
     /* Set registers as original code expects */
@@ -4589,121 +4627,18 @@ void sub_001AE6F0(void)
             dev->lpVtbl->Clear(dev, 0, NULL, 0x07, 0x00000000, 1.0f, 0);
     }
 
-    /* NOTE: Most original sub_001AE6F0 functions depend on either:
-     * - MEM32(0x35FB48) D3D device context (sub_0003FEE0, sub_00040660, etc.)
-     * - Scene descriptor pointers that point to unmapped Xbox memory
-     * Both paths cause SKIP-READ floods or crashes. Disabled for now.
+    /* Session 42: sub_0003FEE0 STILL crashes even with xemu snapshot because
+     * the device context (16KB) contains hundreds of xemu heap pointers that
+     * can't be trivially fixed up. The gen code walks deep pointer chains.
      *
-     * Dump render list data on first call to understand structure. */
-    if (call_count <= 3) {
-        uint32_t res_ptr = MEM32(render_base + 4);
-        fprintf(stderr, "    [FE] render_list resource at 0x%08X\n", res_ptr);
-        fprintf(stderr, "    [FE] 0x4A1E94 (screen list) = 0x%08X\n", MEM32(0x4A1E94));
-        if (res_ptr != 0 && res_ptr < 0x4000000) {
-            /* Dump first 256 bytes of the resource data */
-            fprintf(stderr, "    [FE] Resource data dump (first 64 dwords):\n");
-            for (int i = 0; i < 64; i += 4) {
-                fprintf(stderr, "      [+%03X] %08X %08X %08X %08X\n",
-                        i * 4,
-                        MEM32(res_ptr + i * 4),
-                        MEM32(res_ptr + i * 4 + 4),
-                        MEM32(res_ptr + i * 4 + 8),
-                        MEM32(res_ptr + i * 4 + 12));
-            }
-        }
-        /* Dump B7A8 scene descriptor array */
-        fprintf(stderr, "    [FE] Scene descriptors (B7A8):\n");
-        for (int i = 0; i < 4; i++) {
-            uint32_t desc_raw = MEM32(base_obj + 0x12B7A8 + i * 4);
-            fprintf(stderr, "      B7A8[%d] = 0x%08X", i, desc_raw);
-            /* Try resolving native ptr → Xbox VA */
-            uint32_t desc = desc_raw;
-            if (desc_raw >= 0x10000000 && desc_raw < 0x84000000) {
-                desc = desc_raw % 0x4000000;
-                fprintf(stderr, " → Xbox VA 0x%08X", desc);
-            }
-            fprintf(stderr, "\n");
-            if (desc != 0 && desc < 0x4000000) {
-                fprintf(stderr, "        vt=0x%08X [+4]=0x%08X [+8]=0x%08X [+C]=0x%08X\n",
-                        MEM32(desc), MEM32(desc+4), MEM32(desc+8), MEM32(desc+0xC));
-                fprintf(stderr, "        [+10]=0x%08X [+14]=0x%08X [+40]=0x%08X\n",
-                        MEM32(desc+0x10), MEM32(desc+0x14), MEM32(desc+0x40));
-            }
-        }
+     * The xemu snapshot IS loaded at 0x0035D6A0 (original Xbox address) with
+     * PB/surface/viewport fixups applied. This provides proper scalar state
+     * (matrices, flags, dimensions) for other D3D functions that work.
+     *
+     * Menu rendering continues via captured push buffer replay. */
 
-        /* Dump B790 (screen definition pointer) */
-        uint32_t b790 = MEM32(base_obj + 0x12B790);
-        fprintf(stderr, "    [FE] B790 = 0x%08X\n", b790);
-        if (b790 != 0 && b790 < 0x4000000) {
-            fprintf(stderr, "      B790 data: ");
-            for (int i = 0; i < 16; i++)
-                fprintf(stderr, "%08X ", MEM32(b790 + i * 4));
-            fprintf(stderr, "\n");
-        }
-
-        /* Dump screen list at 0x4A1E94 */
-        uint32_t scr_list = MEM32(0x4A1E94);
-        fprintf(stderr, "    [FE] Screen list at 0x%08X:\n", scr_list);
-        if (scr_list != 0 && scr_list < 0x4000000) {
-            /* +0x10 = entry array */
-            uint32_t entries_base = scr_list + 0x10;
-            uint32_t entry_count = MEM32(scr_list + 0x10 + 0x10);  /* count at entries+0x10? */
-            fprintf(stderr, "      list header: ");
-            for (int i = 0; i < 8; i++)
-                fprintf(stderr, "%08X ", MEM32(scr_list + i * 4));
-            fprintf(stderr, "\n");
-            fprintf(stderr, "      list[+0x10..+0x30]: ");
-            for (int i = 0; i < 8; i++)
-                fprintf(stderr, "%08X ", MEM32(entries_base + i * 4));
-            fprintf(stderr, "\n");
-        }
-
-        /* Dump render list entries (+0x10 = screen IDs) */
-        fprintf(stderr, "    [FE] Render list screen IDs:\n");
-        fprintf(stderr, "      [+10]=0x%08X (id0) [+14]=0x%08X (id1)\n",
-                MEM32(render_base + 0x10), MEM32(render_base + 0x14));
-        uint32_t rptr = MEM32(render_base + 4);
-        if (rptr != 0 && rptr < 0x4000000) {
-            /* Try sub_001AEF80-style search: the resource has screen entries */
-            uint32_t scr_ent = MEM32(0x4A1E94);
-            if (scr_ent != 0 && scr_ent < 0x4000000) {
-                uint32_t arr_base = scr_ent + 0x10;
-                uint32_t arr_data = MEM32(arr_base + 0xC); /* array entries at +0xC */
-                uint32_t arr_count = MEM32(arr_base + 0x10); /* count at +0x10 */
-                fprintf(stderr, "      screen array: base=0x%08X count=%u\n",
-                        arr_data, arr_count);
-                if (arr_data != 0 && arr_data < 0x4000000 && arr_count > 0) {
-                    uint32_t max_show = (arr_count < 20) ? arr_count : 20;
-                    for (uint32_t i = 0; i < max_show; i++) {
-                        uint32_t ent = arr_data + i * 0x20;
-                        fprintf(stderr, "        [%u] id=0x%08X flag=0x%02X name=",
-                                i, MEM32(ent), MEM8(ent + 0x1E));
-                        /* Print string at ent+4 if it looks like ASCII */
-                        for (int j = 4; j < 0x1E; j++) {
-                            uint8_t c = MEM8(ent + j);
-                            if (c == 0) break;
-                            if (c >= 0x20 && c < 0x7F)
-                                fprintf(stderr, "%c", c);
-                            else {
-                                fprintf(stderr, ".");
-                                break;
-                            }
-                        }
-                        fprintf(stderr, "\n");
-                    }
-                }
-            }
-        }
-    }
-
-    /* Post-render functions DISABLED — they access scene descriptors
-     * with pointers to unmapped Xbox memory (0x92xxxxxx range).
-     * Original functions: sub_00188E10, sub_0017F670, sub_0018DE00,
-     * sub_0017F6E0, sub_0019A3E0, sub_00189150, sub_00188EE0 */
-
-    if (call_count <= 20 || (call_count % 5000) == 0) {
+    if (log)
         fprintf(stderr, "  [FE-DISPATCH] sub_001AE6F0 #%u DONE\n", call_count);
-    }
 
     /* stdcall: clean up 2 params (8 bytes) + return address */
     esp += 12; return; /* ret 8 */

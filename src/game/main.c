@@ -1513,96 +1513,88 @@ static BOOL init_subsystems(void)
         }
     }
 
-    /* 2e. Pre-initialize D3D8 device context.
+    /* 2e. D3D8 device context initialization from xemu snapshot.
      *
-     * The Xbox D3D8 device context is a large structure (~8KB) pointed to
-     * by MEM32(0x35FB48). Functions like sub_0034C2E0 read fields at offsets
-     * +0x1A04, +0x1A08, etc. Without initialization, 0x35FB48 = 0 and all
-     * field accesses become near-null dereferences (0xFFFFFFF8 etc.).
+     * The Xbox D3D8 device context is a STATIC structure at 0x0035D6A0
+     * within the D3D8LTCG library section (discovered via xemu capture).
+     * It's NOT heap-allocated. The XBE loads uninitialized data there;
+     * we overlay it with a runtime snapshot captured from xemu during
+     * menu rendering to give the D3D8LTCG gen code proper state.
      *
-     * Allocating a zeroed buffer means device field reads return 0 (safe
-     * defaults) rather than faulting. This lets D3D8 init code proceed even
-     * though the actual GPU hardware doesn't exist.
+     * Pointer fixups needed:
+     *   - +0x00/+0x04/+0x08: PB GPU addresses → our PB virtual addresses
+     *   - +0x784/+0x794/+0x7A8: Surface ptrs → our fake surfaces
+     *   - +0x1A04/+0x1A08: These are at 0x35F0C4/0x35F10C (D3D section) = OK
      */
     {
-        /* Allocate 16KB for the D3D8 device context — offsets go up to ~0x2500 */
-        uint32_t fake_device = xbox_HeapAlloc(0x4000, 16);  /* 16 KB */
-        if (fake_device) {
-            uint32_t pb_start = MEM32(0x35D6A0);  /* push buffer write ptr */
-            uint32_t pb_end   = MEM32(0x35D6A4);  /* push buffer end ptr */
+        #include "../../src/nv2a/d3d_device_snapshot.h"
 
-            MEM32(0x35FB48) = fake_device;
+        uint32_t dev = 0x0035D6A0;  /* Original Xbox address (static, in D3D section) */
+        uint32_t pb_start = MEM32(0x35D69C);  /* Our push buffer base */
+        uint32_t pb_end   = MEM32(0x35D6A4);  /* Our push buffer end */
 
-            /* Push buffer pointers — D3D functions check device[0] < device[4]
-             * to decide if they need to flush. Set current = start, end = end. */
-            MEM32(fake_device + 0x00) = pb_start;
-            MEM32(fake_device + 0x04) = pb_end;
-            MEM32(fake_device + 0x08) = pb_start;
-            MEM32(fake_device + 0x0C) = pb_end - pb_start;
+        /* Copy xemu snapshot over the static data */
+        memcpy((void*)XBOX_PTR(dev), d3d_device_snapshot, D3D_DEVICE_SNAPSHOT_SIZE);
+        fprintf(stderr, "  D3D8 device: loaded %u-byte xemu snapshot at 0x%08X\n",
+                D3D_DEVICE_SNAPSHOT_SIZE, dev);
 
-            /* Render target / surface descriptors.
-             * Fields +0x784, +0x794, +0x7A8 are pointers to surface objects.
-             * sub_0034D530 dereferences these at +0x10 (width) and +0x14 (height).
-             * sub_0034C2E0 reads +0x1A04/+0x1A08 as surface pointers. */
-            {
-                uint32_t fake_surf = xbox_HeapAlloc(0x1000, 16);
-                if (fake_surf) {
-                    /* Render target surface (offset 0 in block) */
-                    MEM32(fake_surf + 0x10) = 640;   /* width */
-                    MEM32(fake_surf + 0x14) = 480;   /* height */
-                    MEM32(fake_surf + 0x0C) = 0x00060006;  /* format/flags (A8R8G8B8) */
-                    MEM32(fake_device + 0x784) = fake_surf;
+        /* Point the global to the original address */
+        MEM32(0x35FB48) = dev;
 
-                    /* Depth/stencil surface (offset 0x100) */
-                    MEM32(fake_surf + 0x100 + 0x10) = 640;
-                    MEM32(fake_surf + 0x100 + 0x14) = 480;
-                    MEM32(fake_surf + 0x100 + 0x0C) = 0x00020002;  /* D24S8-like */
-                    MEM32(fake_device + 0x794) = fake_surf + 0x100;
+        /* Fix up push buffer pointers (xemu had GPU physical addresses) */
+        MEM32(dev + 0x00) = pb_start;   /* PB write cursor */
+        MEM32(dev + 0x04) = pb_end;     /* PB end */
+        MEM32(dev + 0x08) = pb_start;   /* PB base */
+        MEM32(dev + 0x0C) = pb_end - pb_start;  /* PB size */
 
-                    /* Back buffer surface (offset 0x200) */
-                    MEM32(fake_surf + 0x200 + 0x10) = 640;
-                    MEM32(fake_surf + 0x200 + 0x14) = 480;
-                    MEM32(fake_surf + 0x200 + 0x0C) = 0x00060006;
-                    MEM32(fake_device + 0x7A8) = fake_surf + 0x200;
+        /* Fix up surface pointers — allocate fake surfaces like before */
+        {
+            uint32_t fake_surf = xbox_HeapAlloc(0x1000, 16);
+            if (fake_surf) {
+                /* Render target surface */
+                MEM32(fake_surf + 0x10) = 640;
+                MEM32(fake_surf + 0x14) = 480;
+                MEM32(fake_surf + 0x0C) = 0x00060006;
+                MEM32(dev + 0x784) = fake_surf;
 
-                    /* Surface state fields (1A04-1A18) — point to surfaces */
-                    MEM32(fake_device + 0x1A04) = fake_surf;          /* RT surface ptr */
-                    MEM32(fake_device + 0x1A08) = fake_surf + 0x100;  /* depth surface ptr */
-                    MEM32(fake_device + 0x1A14) = fake_surf;          /* == 1A04 for equality check */
-                    MEM32(fake_device + 0x1A18) = fake_surf;          /* alternate surface */
-                }
+                /* Depth/stencil surface */
+                MEM32(fake_surf + 0x100 + 0x10) = 640;
+                MEM32(fake_surf + 0x100 + 0x14) = 480;
+                MEM32(fake_surf + 0x100 + 0x0C) = 0x00020002;
+                MEM32(dev + 0x794) = fake_surf + 0x100;
+
+                /* Back buffer surface */
+                MEM32(fake_surf + 0x200 + 0x10) = 640;
+                MEM32(fake_surf + 0x200 + 0x14) = 480;
+                MEM32(fake_surf + 0x200 + 0x0C) = 0x00060006;
+                MEM32(dev + 0x7A8) = fake_surf + 0x200;
+
+                /* Surface state fields — keep snapshot's D3D-section pointers
+                 * for +0x1A04 (0x35F0C4) and +0x1A08 (0x35F10C) but also
+                 * set up our fake surfaces as fallbacks */
+                MEM32(dev + 0x1A04) = fake_surf;
+                MEM32(dev + 0x1A08) = fake_surf + 0x100;
+                MEM32(dev + 0x1A14) = fake_surf;
+                MEM32(dev + 0x1A18) = fake_surf;
             }
-
-            /* Viewport / dimension fields.
-             * sub_0034D530 writes 0xEE0-0xEF4 from surface dimensions.
-             * Pre-populate for 640x480 so early reads return valid data. */
-            MEM32(fake_device + 0xEE0) = 640;    /* viewport width */
-            MEM32(fake_device + 0xEE4) = 480;    /* viewport height */
-            MEM32(fake_device + 0xEE8) = 640;    /* scale X */
-            MEM32(fake_device + 0xEEC) = 480;    /* scale Y */
-            MEM32(fake_device + 0xEF0) = 640;    /* clip width */
-            MEM32(fake_device + 0xEF4) = 480;    /* clip height */
-            MEMF(fake_device + 0xEF8) = 0.0f;
-            MEMF(fake_device + 0xEFC) = 0.0f;
-
-            /* Maximum dimension fields (used in scaling calculations) */
-            MEM32(fake_device + 0x954) = 640;
-            MEM32(fake_device + 0x958) = 480;
-
-            /* Render state / misc */
-            MEM32(fake_device + 0x1AD4) = 0;
-            MEM32(fake_device + 0x7CC) = 0;  /* render state flags */
-
-            /* +0x9B8: render list pointer */
-            {
-                uint32_t fake_rl = xbox_HeapAlloc(0x2000, 16);
-                if (fake_rl)
-                    MEM32(fake_device + 0x9B8) = fake_rl;
-            }
-
-            fprintf(stderr, "  D3D8 device context: at Xbox VA 0x%08X (PB 0x%08X-0x%08X)\n",
-                    fake_device, pb_start, pb_end);
         }
+
+        /* Override viewport dimensions (snapshot may have wrong values) */
+        MEM32(dev + 0x954) = 640;
+        MEM32(dev + 0x958) = 480;
+        MEM32(dev + 0xEE0) = 640;
+        MEM32(dev + 0xEE4) = 480;
+        MEM32(dev + 0xEE8) = 640;
+        MEM32(dev + 0xEEC) = 480;
+        MEM32(dev + 0xEF0) = 640;
+        MEM32(dev + 0xEF4) = 480;
+
+        /* Render state flags */
+        MEM32(dev + 0x7CC) = 0;
+        MEM32(dev + 0x1AD4) = 0;
+
+        fprintf(stderr, "  D3D8 device context: at Xbox VA 0x%08X (PB 0x%08X-0x%08X)\n",
+                dev, pb_start, pb_end);
     }
 
     /* 3. Graphics (D3D8→D3D11) */
