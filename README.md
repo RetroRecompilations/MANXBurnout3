@@ -25,7 +25,7 @@ The technical challenges are fascinating: translating x86 to x86-64 with a globa
 
 ## Current Status
 
-**Phase 5: Integration** — The game boots, loads all resources, transitions through state 4 (crash mode) → state 5 (menus/frontend), and renders the main menu with all UI elements. NV2A push buffer data captured from xemu is translated to D3D11 in real time.
+**Phase 5: Integration** — The game boots, loads all resources, transitions through state 4 (crash mode) → state 5 (menus/frontend), and renders the main menu with all UI elements. The D3D8LTCG rendering pipeline has been un-stubbed with a live NV2A push buffer translation pipeline proven end-to-end.
 
 ### What's Working
 - **Full main menu rendering** — all 5 menu options (World Tour, Single Event, Multiplayer, Xbox Live, Driver Details) rendered via NV2A push buffer → D3D11 translation
@@ -33,6 +33,7 @@ The technical challenges are fascinating: translating x86 to x86-64 with a globa
   - 32 draw calls/frame, 3078 vertices, 11 texture bindings from Global.txd + captured font atlas
   - Time-based smooth chyron scroll animation at 50px/sec
   - Per-draw texture mapping via NV2A VRAM offset → Global.txd name lookup
+- **Live NV2A push buffer pipeline** — the original D3D8LTCG rendering function (sub_0034D530, 79KB / 20K lines of generated C) has been un-stubbed and runs cleanly, writing NV2A viewport/transform commands to a 4MB push buffer each frame. Device cursor sync, per-frame buffer reset, and live parser all operational. D3D8 device context populated with surface descriptors, viewport, and push buffer pointers.
 - **Boot video sequence** — Criterion logo, EA logo, and title intro videos play from pre-converted XMV→MP4 files via Media Foundation
 - Full game boot sequence through the original RenderWare engine init
 - **Game state machine**: loading → init → state 4 (crash) → state 5 (menus/frontend) — running continuously at ~32 FPS
@@ -53,9 +54,10 @@ The technical challenges are fascinating: translating x86 to x86-64 with a globa
 - D3D11 rendering through a D3D8 compatibility layer
 
 ### What's Left
+- [ ] Regenerate sub_00351090 (RW scene traversal) — disassembler found 0 functions in D3D section, needs function boundary detection for XDK library code
 - [ ] Sub-menu navigation (New Profile, Save/Load, World Tour country/map selection)
 - [ ] NV2A register combiner emulation (currently hardcoded MODULATE blend mode)
-- [ ] Live push buffer interception (replace static capture with real-time game-driven rendering)
+- [ ] Connect RW scene traversal to live push buffer pipeline (render list population)
 - [ ] Connect game's DirectSound init (sub_00135040) to APU voice processor
 - [ ] Vehicle textures (`.btv` paint variant format)
 - [ ] Full collision / physics world initialization

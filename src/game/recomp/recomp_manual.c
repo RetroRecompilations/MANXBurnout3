@@ -2151,6 +2151,14 @@ void parse_live_pushbuffer(void)
         else { pos++; }
     }
 
+    /* Log raw push buffer contents for first few frames */
+    if (method_count > 0 && diag_count <= 3) {
+        fprintf(stderr, "  [D3D8-LIVE] Raw PB (%u dwords):", bytes_written / 4);
+        for (uint32_t d = 0; d < bytes_written / 4 && d < 20; d++)
+            fprintf(stderr, " %08X", MEM32(pb_base + d * 4));
+        fprintf(stderr, "\n");
+    }
+
     if (method_count > 0) {
         pgraph_d3d11_flush();
         static uint32_t log_count = 0;
@@ -2197,7 +2205,7 @@ void sub_0034D530(void)
         fprintf(stderr, "  [D3D8-RENDER] #%u: %u bytes written, ecx=0x%X\n",
                 g_d3d_render_count, bytes_written, ecx);
 
-    /* Parse push buffer commands and translate to D3D11 */
+    /* Parse push buffer commands (gen code output) and translate to D3D11 */
     parse_live_pushbuffer();
 }
 
@@ -3428,15 +3436,23 @@ void sub_0003D9E0(void)
     eax = esi;
     PUSH32(esp, 0); sub_0002F330();
 
+    if (call_count <= 5)
+        fprintf(stderr, "  [RENDER] post-0002F330: 9B0=0x%X 9B8=0x%X 9A8=0x%X 3B0=0x%X\n",
+                MEM32(esi + 0x9B0), MEM32(esi + 0x9B8), MEM32(esi + 0x9A8), MEM32(esi + 0x3B0));
+
     /* sub_0034D530: D3D8LTCG rendering pipeline.
      * Original code builds a render state struct on the stack from game object
      * fields, then passes a pointer to it. When edi==0 (menu path):
      *   esp+0 = MEM32(esi+0x9B0), esp+4 = MEM32(esi+0x9B8),
      *   esp+8 = MEM32(esi+0x9A8), ecx = &esp (struct pointer)
      * sub_0034D530 reads MEM32(ecx) to get the render list. */
-    if (call_count <= 5)
-        fprintf(stderr, "  [RENDER] sub_0003D9E0 edi=%u esi=0x%X 9B0=0x%X 9B8=0x%X 9A8=0x%X 3C0=0x%X\n",
-                edi, esi, MEM32(esi + 0x9B0), MEM32(esi + 0x9B8), MEM32(esi + 0x9A8), MEM32(esi + 0x3C0));
+    if (call_count <= 5) {
+        /* Also check what sub_0002F330 sets up (it modifies render state) */
+        uint32_t pre_9b0 = MEM32(esi + 0x9B0);
+        uint32_t pre_9b8 = MEM32(esi + 0x9B8);
+        fprintf(stderr, "  [RENDER] sub_0003D9E0 #%u: edi=%u esi=0x%X pre: 9B0=0x%X 9B8=0x%X 9A8=0x%X 3C0=0x%X 3B0=0x%X\n",
+                call_count, edi, esi, pre_9b0, pre_9b8, MEM32(esi + 0x9A8), MEM32(esi + 0x3C0), MEM32(esi + 0x3B0));
+    }
 
     if (TEST_Z(edi, edi)) {
         /* Menu render path: build render state struct like original code */
