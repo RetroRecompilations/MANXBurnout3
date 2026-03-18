@@ -4860,8 +4860,9 @@ void sub_001AE6F0(void)
     ebx = 0;
     MEM32(0x60E170) = ebx;
 
-    /* sub_0034CBF0 — set RT/DS dirty flags before sub_0003FEE0.
-     * Pass 0,0 like xemu does during menus (uses device+0x1A04/1A08). */
+    /* sub_0034CBF0 — RT/DS setup + full render state flush.
+     * Force device pointer before call. Pass 0,0 = use current RT/DS. */
+    MEM32(0x35FB48) = 0x0035D6A0;
     PUSH32(esp, 0);  /* DS param = 0 (use current) */
     PUSH32(esp, 0);  /* RT param = 0 (use current) */
     PUSH32(esp, 0); sub_0034CBF0();
