@@ -1595,6 +1595,17 @@ static BOOL init_subsystems(void)
 
         fprintf(stderr, "  D3D8 device context: at Xbox VA 0x%08X (PB 0x%08X-0x%08X)\n",
                 dev, pb_start, pb_end);
+
+        /* Load render context snapshot from xemu.
+         * 0x4D6770 is the render input struct passed to sub_0034D530 from sub_001AE6F0.
+         * Contains viewport dimensions, view/projection matrices, and surface references
+         * that the D3D8LTCG gen code needs to produce push buffer draw commands. */
+        {
+            #include "../../src/nv2a/render_input_snapshot.h"
+            memcpy((void*)XBOX_PTR(RENDER_INPUT_ADDR), render_input_snapshot, RENDER_INPUT_SIZE);
+            fprintf(stderr, "  Render context: loaded %u bytes at 0x%08X\n",
+                    RENDER_INPUT_SIZE, RENDER_INPUT_ADDR);
+        }
     }
 
     /* 3. Graphics (D3D8→D3D11) */
