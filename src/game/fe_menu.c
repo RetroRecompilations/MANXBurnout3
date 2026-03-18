@@ -426,32 +426,13 @@ void fe_menu_update(float dt)
         }
         break;
 
+    case FE_SCREEN_WORLD_TOUR:
     case FE_SCREEN_RACE_SETUP:
     case FE_SCREEN_TIME_ATTACK:
     case FE_SCREEN_ROAD_RAGE:
-        /* Race setup screens: Enter starts the race */
-        if (enter_edge) {
-            fprintf(stderr, "[FE-MENU] START RACE from screen %d\n", g_fe_screen);
-            fe_start_race(g_fe_screen);
-        }
-        if (esc_edge) {
-            int back_cursor = 0;
-            if (g_fe_screen == FE_SCREEN_TIME_ATTACK)  back_cursor = 1;
-            if (g_fe_screen == FE_SCREEN_ROAD_RAGE)    back_cursor = 2;
-            g_fe_screen = FE_SCREEN_SINGLE;
-            g_fe_cursor = back_cursor;
-            fprintf(stderr, "[FE-MENU] Back -> Single Event\n");
-        }
-        break;
-
-    case FE_SCREEN_WORLD_TOUR:
     case FE_SCREEN_CRASH_SELECT:
     case FE_SCREEN_DRIVER_DETAILS:
-        /* Other sub-screens: ESC goes back to parent */
-        if (enter_edge && g_fe_screen == FE_SCREEN_CRASH_SELECT) {
-            fprintf(stderr, "[FE-MENU] START CRASH from screen %d\n", g_fe_screen);
-            fe_start_race(g_fe_screen);
-        }
+        /* Sub-screens: ESC goes back to parent */
         if (esc_edge) {
             if (g_fe_screen == FE_SCREEN_WORLD_TOUR) {
                 g_fe_screen = FE_SCREEN_MAIN;
