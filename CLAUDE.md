@@ -275,11 +275,11 @@ Game boots, loads, runs gameplay loop. **Two rendering modes** toggled with V ke
   - 15,196 lines across 55 files
 
 ### Next Steps
-1. **Populate render entry table** — res[+24] at render list resource 0x01C7D000 is NULL.
-   Need to understand how screen widgets populate draw commands into this table.
-   May require enabling sub_00040CF0 (camera/projection setup with device ptr fixups)
-2. **Capture more xemu snapshots** — device state pointers (surfaces at 0x0078B020 etc.)
-   and render list resource contents during active menu rendering
+1. **Capture push buffers for sub-menus** from xemu (SINGLE EVENT, OPTIONS, etc.) and
+   drive PB replay from game's menu selection state for interactive menu navigation
+2. **Un-stub sub_0034CBF0** — write manual override to set render state dirty flags
+   (surface+0x80000, device+0x1A04/1A08 swap) without D3D pointer chain walks,
+   enabling sub_0034D530_gen to flush actual vertex data
 3. Decode .btv vehicle texture format and apply to 3D models
 4. Long-term: fix the real physics world initialization
 
