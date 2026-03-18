@@ -29,6 +29,12 @@ void fe_menu_update(float dt);
  *  Returns -1 if not in a PB-mapped menu state. */
 int fe_menu_get_pb_state(void);
 
+/** Returns 1 if a race is active (gameplay mode). */
+int fe_menu_is_racing(void);
+
+/** Stop the current race and return to menus. */
+void fe_menu_stop_race(void);
+
 #ifdef __cplusplus
 }
 #endif

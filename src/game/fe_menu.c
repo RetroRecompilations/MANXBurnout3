@@ -91,6 +91,8 @@ static const char *g_single_menu_labels[FE_SINGLE_ITEMS] = {
 
 static int g_fe_screen = FE_SCREEN_MAIN;  /* Skip title, start on main menu */
 int g_fe_cursor = 0;  /* exported for PB replay cursor overlay */
+static int g_race_active = 0;
+static void fe_start_race(int screen);
 static float g_fe_timer = 0.0f;
 static float g_fe_flash = 0.0f;   /* "Press Start" blink timer */
 static int g_fe_initialized = 0;
@@ -350,6 +352,17 @@ void fe_menu_update(float dt)
     g_fe_timer += dt;
     g_fe_flash += dt;
 
+    /* If racing, check for Escape to return to menus */
+    if (g_race_active) {
+        static int esc_prev_race = 0;
+        int esc_now_race = (GetAsyncKeyState(VK_ESCAPE) & 0x8000);
+        if (esc_now_race && !esc_prev_race) {
+            fe_menu_stop_race();  /* public function defined below */
+        }
+        esc_prev_race = esc_now_race;
+        return;  /* Don't process menu input during gameplay */
+    }
+
     /* Edge-detected input — arrow keys + WASD + Enter/Esc */
     int up_now    = (GetAsyncKeyState(VK_UP)     & 0x8000) || (GetAsyncKeyState('W') & 0x8000);
     int down_now  = (GetAsyncKeyState(VK_DOWN)   & 0x8000) || (GetAsyncKeyState('S') & 0x8000);
@@ -413,13 +426,32 @@ void fe_menu_update(float dt)
         }
         break;
 
-    case FE_SCREEN_WORLD_TOUR:
     case FE_SCREEN_RACE_SETUP:
     case FE_SCREEN_TIME_ATTACK:
     case FE_SCREEN_ROAD_RAGE:
+        /* Race setup screens: Enter starts the race */
+        if (enter_edge) {
+            fprintf(stderr, "[FE-MENU] START RACE from screen %d\n", g_fe_screen);
+            fe_start_race(g_fe_screen);
+        }
+        if (esc_edge) {
+            int back_cursor = 0;
+            if (g_fe_screen == FE_SCREEN_TIME_ATTACK)  back_cursor = 1;
+            if (g_fe_screen == FE_SCREEN_ROAD_RAGE)    back_cursor = 2;
+            g_fe_screen = FE_SCREEN_SINGLE;
+            g_fe_cursor = back_cursor;
+            fprintf(stderr, "[FE-MENU] Back -> Single Event\n");
+        }
+        break;
+
+    case FE_SCREEN_WORLD_TOUR:
     case FE_SCREEN_CRASH_SELECT:
     case FE_SCREEN_DRIVER_DETAILS:
-        /* Sub-screens: ESC goes back to parent */
+        /* Other sub-screens: ESC goes back to parent */
+        if (enter_edge && g_fe_screen == FE_SCREEN_CRASH_SELECT) {
+            fprintf(stderr, "[FE-MENU] START CRASH from screen %d\n", g_fe_screen);
+            fe_start_race(g_fe_screen);
+        }
         if (esc_edge) {
             if (g_fe_screen == FE_SCREEN_WORLD_TOUR) {
                 g_fe_screen = FE_SCREEN_MAIN;
@@ -567,6 +599,70 @@ int fe_menu_render_frame(void)
     dev->lpVtbl->EndScene(dev);
 
     return 1;
+}
+
+/*
+ * Start a race — disable PB replay, load track, switch to gameplay rendering.
+ */
+static void fe_start_race(int screen)
+{
+    /* Disable PB replay — this lets the bridge render gameplay instead */
+    extern void nv2a_pb_replay_set_active(int active);
+    nv2a_pb_replay_set_active(0);
+
+    /* Load a track (pick first available based on game mode) */
+    extern int rw_load_track(const char *path);
+    extern int rw_has_track(void);
+
+    /* Try loading a default track if none loaded */
+    if (!rw_has_track()) {
+        /* Try common track paths */
+        const char *tracks[] = {
+            "Burnout 3 Takedown\\Tracks\\US\\C1_V1\\streamed.dat",
+            "Burnout 3 Takedown\\Tracks\\EU\\C1_V1\\streamed.dat",
+            "Burnout 3 Takedown\\Tracks\\US\\C2_V1\\streamed.dat",
+            NULL
+        };
+        for (int i = 0; tracks[i]; i++) {
+            FILE *f = fopen(tracks[i], "rb");
+            if (f) {
+                fclose(f);
+                fprintf(stderr, "[FE-MENU] Loading track: %s\n", tracks[i]);
+                rw_load_track(tracks[i]);
+                break;
+            }
+        }
+    }
+
+    g_race_active = 1;
+    g_fe_screen = FE_SCREEN_MAIN;  /* Reset menu state for when we return */
+
+    fprintf(stderr, "[FE-MENU] Race started! ESC to return to menus.\n");
+    fprintf(stderr, "[FE-MENU] Controls: WASD=drive, Shift=boost\n");
+
+    /* Update window title */
+    HWND hwnd = FindWindowA(NULL, "Burnout 3: Takedown - Static Recompilation");
+    if (!hwnd) hwnd = GetActiveWindow();
+    if (hwnd) SetWindowTextA(hwnd, "Burnout 3 — RACING");
+}
+
+int fe_menu_is_racing(void)
+{
+    return g_race_active;
+}
+
+void fe_menu_stop_race(void)
+{
+    if (!g_race_active) return;
+    g_race_active = 0;
+
+    /* Re-enable PB replay */
+    extern void nv2a_pb_replay_set_active(int active);
+    nv2a_pb_replay_set_active(1);
+
+    g_fe_screen = FE_SCREEN_MAIN;
+    g_fe_cursor = 0;
+    fprintf(stderr, "[FE-MENU] Returned to menus\n");
 }
 
 /*
