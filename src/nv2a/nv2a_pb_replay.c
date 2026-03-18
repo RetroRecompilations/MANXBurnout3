@@ -102,14 +102,15 @@ static void init_pb_table(void)
 }
 
 /*
- * Detect current menu state from Xbox memory.
- * The game's screen entry system tracks which screen is active.
- * We use keyboard shortcuts (1-8) to manually switch for now,
- * plus automatic detection from the game's screen entry vtables.
+ * Detect current menu state.
+ * Uses fe_menu.c state machine (driven by keyboard/gamepad input)
+ * with number key overrides for direct access.
  */
+extern int fe_menu_get_pb_state(void);
+
 static int detect_menu_state(void)
 {
-    /* Check for keyboard override (number keys 1-8) */
+    /* Number key overrides for direct access */
     if (GetAsyncKeyState('1') & 0x8000) return MENU_MAIN;
     if (GetAsyncKeyState('2') & 0x8000) return MENU_WORLD_TOUR;
     if (GetAsyncKeyState('3') & 0x8000) return MENU_SINGLE_EVENT;
@@ -119,9 +120,11 @@ static int detect_menu_state(void)
     if (GetAsyncKeyState('7') & 0x8000) return MENU_CRASH_SELECT;
     if (GetAsyncKeyState('8') & 0x8000) return MENU_DRIVER_DETAILS;
 
-    /* TODO: Auto-detect from game's screen entry vtable at 0x4B01B0.
-     * Different menu screens activate different screen entries.
-     * For now, maintain current state until keyboard override. */
+    /* Auto-detect from fe_menu state machine */
+    int pb_state = fe_menu_get_pb_state();
+    if (pb_state >= 0 && pb_state < MENU_COUNT)
+        return pb_state;
+
     return g_current_menu;
 }
 

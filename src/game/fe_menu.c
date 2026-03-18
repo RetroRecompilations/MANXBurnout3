@@ -65,19 +65,28 @@ typedef struct {
 } FEVertex;
 
 /* ── Menu state ──────────────────────────────────────────────── */
-#define FE_SCREEN_TITLE      0
-#define FE_SCREEN_MAIN       1
-#define FE_SCREEN_SINGLE     2
-#define FE_SCREEN_TRACK      3
+/* Menu screens matching the captured PB states */
+#define FE_SCREEN_TITLE            0
+#define FE_SCREEN_MAIN             1
+#define FE_SCREEN_SINGLE           2
+#define FE_SCREEN_TRACK            3
+#define FE_SCREEN_WORLD_TOUR       4
+#define FE_SCREEN_RACE_SETUP       5
+#define FE_SCREEN_TIME_ATTACK      6
+#define FE_SCREEN_ROAD_RAGE        7
+#define FE_SCREEN_CRASH_SELECT     8
+#define FE_SCREEN_DRIVER_DETAILS   9
 
-#define FE_MAIN_ITEMS        4
+/* Main menu: 5 items matching the PB capture */
+#define FE_MAIN_ITEMS        5
 static const char *g_main_menu_labels[FE_MAIN_ITEMS] = {
-    "WORLD TOUR", "SINGLE EVENT", "CRASH", "OPTIONS"
+    "WORLD TOUR", "SINGLE EVENT", "MULTIPLAYER", "XBOX LIVE", "DRIVER DETAILS"
 };
 
-#define FE_SINGLE_ITEMS      3
+/* Single Event sub-menu: 4 items */
+#define FE_SINGLE_ITEMS      4
 static const char *g_single_menu_labels[FE_SINGLE_ITEMS] = {
-    "RACE", "ROAD RAGE", "BURNING LAP"
+    "RACE", "TIME ATTACK", "ROAD RAGE", "CRASH"
 };
 
 static int g_fe_screen = FE_SCREEN_TITLE;
@@ -362,54 +371,72 @@ void fe_menu_update(float dt)
         if (enter_edge) {
             g_fe_screen = FE_SCREEN_MAIN;
             g_fe_cursor = 0;
-            if (g_awd_fe) awd_play(g_awd_fe, "MenuIn", false);
         }
         break;
 
     case FE_SCREEN_MAIN:
-        if (up_edge) {
-            g_fe_cursor = (g_fe_cursor + FE_MAIN_ITEMS - 1) % FE_MAIN_ITEMS;
-            if (g_awd_fe) awd_play(g_awd_fe, "Beep", false);
-        }
-        if (down_edge) {
-            g_fe_cursor = (g_fe_cursor + 1) % FE_MAIN_ITEMS;
-            if (g_awd_fe) awd_play(g_awd_fe, "Beep", false);
-        }
+        if (up_edge)   g_fe_cursor = (g_fe_cursor + FE_MAIN_ITEMS - 1) % FE_MAIN_ITEMS;
+        if (down_edge) g_fe_cursor = (g_fe_cursor + 1) % FE_MAIN_ITEMS;
         if (enter_edge) {
-            if (g_fe_cursor == 1) { /* Single Event */
-                g_fe_screen = FE_SCREEN_SINGLE;
-                g_fe_cursor = 0;
-                if (g_awd_fe) awd_play(g_awd_fe, "MenuIn", false);
-            } else if (g_fe_cursor == 3) { /* Options - placeholder */
-                if (g_awd_fe) awd_play(g_awd_fe, "Beep", false);
-            } else {
-                if (g_awd_fe) awd_play(g_awd_fe, "MenuIn", false);
+            int prev_cursor = g_fe_cursor;
+            switch (g_fe_cursor) {
+            case 0: g_fe_screen = FE_SCREEN_WORLD_TOUR;   g_fe_cursor = 0; break;
+            case 1: g_fe_screen = FE_SCREEN_SINGLE;       g_fe_cursor = 0; break;
+            case 2: /* MULTIPLAYER — no PB capture, stay */ break;
+            case 3: /* XBOX LIVE — no PB capture, stay */   break;
+            case 4: g_fe_screen = FE_SCREEN_DRIVER_DETAILS; g_fe_cursor = 0; break;
             }
+            if (g_fe_screen != FE_SCREEN_MAIN)
+                fprintf(stderr, "[FE-MENU] Main -> %s\n", g_main_menu_labels[prev_cursor]);
         }
         if (esc_edge) {
             g_fe_screen = FE_SCREEN_TITLE;
-            if (g_awd_fe) awd_play(g_awd_fe, "MenuOut", false);
         }
         break;
 
     case FE_SCREEN_SINGLE:
-        if (up_edge) {
-            g_fe_cursor = (g_fe_cursor + FE_SINGLE_ITEMS - 1) % FE_SINGLE_ITEMS;
-            if (g_awd_fe) awd_play(g_awd_fe, "Beep", false);
-        }
-        if (down_edge) {
-            g_fe_cursor = (g_fe_cursor + 1) % FE_SINGLE_ITEMS;
-            if (g_awd_fe) awd_play(g_awd_fe, "Beep", false);
-        }
+        if (up_edge)   g_fe_cursor = (g_fe_cursor + FE_SINGLE_ITEMS - 1) % FE_SINGLE_ITEMS;
+        if (down_edge) g_fe_cursor = (g_fe_cursor + 1) % FE_SINGLE_ITEMS;
         if (enter_edge) {
-            /* TODO: Start race - transition to gameplay state */
-            if (g_awd_fe) awd_play(g_awd_fe, "Zoom", false);
-            fprintf(stderr, "[FE-MENU] Selected: %s\n", g_single_menu_labels[g_fe_cursor]);
+            int prev_cursor = g_fe_cursor;
+            switch (g_fe_cursor) {
+            case 0: g_fe_screen = FE_SCREEN_RACE_SETUP;   g_fe_cursor = 0; break;
+            case 1: g_fe_screen = FE_SCREEN_TIME_ATTACK;  g_fe_cursor = 0; break;
+            case 2: g_fe_screen = FE_SCREEN_ROAD_RAGE;    g_fe_cursor = 0; break;
+            case 3: g_fe_screen = FE_SCREEN_CRASH_SELECT; g_fe_cursor = 0; break;
+            }
+            fprintf(stderr, "[FE-MENU] Single Event -> %s\n", g_single_menu_labels[prev_cursor]);
         }
         if (esc_edge) {
             g_fe_screen = FE_SCREEN_MAIN;
-            g_fe_cursor = 1;
-            if (g_awd_fe) awd_play(g_awd_fe, "MenuOut", false);
+            g_fe_cursor = 1; /* Return to SINGLE EVENT highlighted */
+        }
+        break;
+
+    case FE_SCREEN_WORLD_TOUR:
+    case FE_SCREEN_RACE_SETUP:
+    case FE_SCREEN_TIME_ATTACK:
+    case FE_SCREEN_ROAD_RAGE:
+    case FE_SCREEN_CRASH_SELECT:
+    case FE_SCREEN_DRIVER_DETAILS:
+        /* Sub-screens: ESC goes back to parent */
+        if (esc_edge) {
+            if (g_fe_screen == FE_SCREEN_WORLD_TOUR) {
+                g_fe_screen = FE_SCREEN_MAIN;
+                g_fe_cursor = 0;
+            } else if (g_fe_screen == FE_SCREEN_DRIVER_DETAILS) {
+                g_fe_screen = FE_SCREEN_MAIN;
+                g_fe_cursor = 4;
+            } else {
+                /* Race/Time Attack/Road Rage/Crash -> Single Event */
+                int back_cursor = 0;
+                if (g_fe_screen == FE_SCREEN_TIME_ATTACK)  back_cursor = 1;
+                if (g_fe_screen == FE_SCREEN_ROAD_RAGE)    back_cursor = 2;
+                if (g_fe_screen == FE_SCREEN_CRASH_SELECT) back_cursor = 3;
+                g_fe_screen = FE_SCREEN_SINGLE;
+                g_fe_cursor = back_cursor;
+            }
+            fprintf(stderr, "[FE-MENU] Back -> screen %d\n", g_fe_screen);
         }
         break;
     }
@@ -540,4 +567,25 @@ int fe_menu_render_frame(void)
     dev->lpVtbl->EndScene(dev);
 
     return 1;
+}
+
+/*
+ * Map fe_menu screen state to PB replay index.
+ * Must match MENU_xxx enum in nv2a_pb_replay.c:
+ *   0=MAIN, 1=WORLD_TOUR, 2=SINGLE_EVENT, 3=RACE_SETUP,
+ *   4=TIME_ATTACK, 5=ROAD_RAGE, 6=CRASH_SELECT, 7=DRIVER_DETAILS
+ */
+int fe_menu_get_pb_state(void)
+{
+    switch (g_fe_screen) {
+    case FE_SCREEN_MAIN:           return 0;
+    case FE_SCREEN_WORLD_TOUR:     return 1;
+    case FE_SCREEN_SINGLE:         return 2;
+    case FE_SCREEN_RACE_SETUP:     return 3;
+    case FE_SCREEN_TIME_ATTACK:    return 4;
+    case FE_SCREEN_ROAD_RAGE:      return 5;
+    case FE_SCREEN_CRASH_SELECT:   return 6;
+    case FE_SCREEN_DRIVER_DETAILS: return 7;
+    default:                       return 0; /* title → show main menu */
+    }
 }

@@ -25,6 +25,10 @@ int fe_menu_render_frame(void);
 /** Process input for menu navigation. Call once per frame. */
 void fe_menu_update(float dt);
 
+/** Get the current PB replay menu index (0-7, matches MENU_xxx enum in nv2a_pb_replay.c).
+ *  Returns -1 if not in a PB-mapped menu state. */
+int fe_menu_get_pb_state(void);
+
 #ifdef __cplusplus
 }
 #endif
