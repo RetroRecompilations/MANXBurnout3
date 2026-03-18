@@ -89,7 +89,7 @@ static const char *g_single_menu_labels[FE_SINGLE_ITEMS] = {
     "RACE", "TIME ATTACK", "ROAD RAGE", "CRASH"
 };
 
-static int g_fe_screen = FE_SCREEN_TITLE;
+static int g_fe_screen = FE_SCREEN_MAIN;  /* Skip title, start on main menu */
 static int g_fe_cursor = 0;
 static float g_fe_timer = 0.0f;
 static float g_fe_flash = 0.0f;   /* "Press Start" blink timer */
@@ -339,8 +339,10 @@ void fe_menu_init(void)
 
 int fe_menu_is_active(void)
 {
-    uint32_t cam_ptr = FMEM32(ADDR_CAM_PTR);
-    return (cam_ptr == CAM_MENUS);
+    /* Game state 5 = menus/frontend (more reliable than cam_ptr which
+     * gets overwritten with native/mirror addresses by gen code) */
+    uint32_t game_state = FMEM32(ADDR_GAME_STATE);
+    return (game_state == 5);
 }
 
 void fe_menu_update(float dt)
@@ -348,11 +350,11 @@ void fe_menu_update(float dt)
     g_fe_timer += dt;
     g_fe_flash += dt;
 
-    /* Edge-detected input */
+    /* Edge-detected input — arrow keys + WASD + Enter/Esc */
     int up_now    = (GetAsyncKeyState(VK_UP)     & 0x8000) || (GetAsyncKeyState('W') & 0x8000);
     int down_now  = (GetAsyncKeyState(VK_DOWN)   & 0x8000) || (GetAsyncKeyState('S') & 0x8000);
     int enter_now = (GetAsyncKeyState(VK_RETURN) & 0x8000) || (GetAsyncKeyState(VK_SPACE) & 0x8000);
-    int esc_now   = (GetAsyncKeyState(VK_ESCAPE) & 0x8000);
+    int esc_now   = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) || (GetAsyncKeyState(VK_BACK) & 0x8000);
 
     int up_edge    = up_now && !g_fe_prev_up;
     int down_edge  = down_now && !g_fe_prev_down;
@@ -363,8 +365,6 @@ void fe_menu_update(float dt)
     g_fe_prev_down  = down_now;
     g_fe_prev_enter = enter_now;
     g_fe_prev_esc   = esc_now;
-
-    /* Play menu sounds on input */
 
     switch (g_fe_screen) {
     case FE_SCREEN_TITLE:
