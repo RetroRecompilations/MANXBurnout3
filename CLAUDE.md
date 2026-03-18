@@ -36,8 +36,8 @@ The goal is to translate the original x86 Xbox code into a native Windows execut
 
 ## Current Work State (Session 42)
 
-### Status: Menu rendering WORKING via captured push buffer, live pipeline BLOCKED
-Game boots, reaches state 5 (menus), and NV2A push buffer data captured from xemu is being successfully translated and rendered through D3D11. Full Burnout 3 main menu with textures, chyron scroll, and interactive selection. Live render pipeline blocked by D3D device context initialization.
+### Status: Menu rendering at 60fps, manual sub_0003FEE0 override WORKING
+Game boots, reaches state 5 (menus), and NV2A push buffer data captured from xemu renders through D3D11. Full Burnout 3 main menu with textures, chyron scroll, and interactive selection at 60fps. Manual sub_0003FEE0 override enabled with proper D3D clear + render dispatch.
 
 ### Session 42 Changes (2026-03-17)
 - **Live render pipeline investigation**: Attempted to enable original sub_001AE6F0 call chain
@@ -62,10 +62,13 @@ Game boots, reaches state 5 (menus), and NV2A push buffer data captured from xem
   - Screen entries exist (1736 at 0x4B01B0) but never processed for rendering
   - sub_0003FEE0 calls: sub_0034F5B0, sub_003518E0, sub_003558A0, sub_0003FE10,
     sub_0034D410, sub_00040CF0 — gen code walks deep pointer chains in device state
-- **Remaining blocker**: sub_0003FEE0's gen code reads device fields that contain
-  xemu-specific heap pointers (surfaces, textures, render targets) which don't exist
-  in our environment. Need to either: (a) allocate matching objects at same Xbox VAs,
-  or (b) write a manual sub_0003FEE0 override that does only the safe operations
+- **Manual sub_0003FEE0 override** (recomp_manual.c):
+  - Performs safe matrix copies (game_obj+0x500→+0x6E0, device+0xCA0→game_obj+0x540)
+  - Calls sub_0034C2E0 (D3D clear) and sub_001AD350 ×3 (render dispatch)
+  - Skips D3D8LTCG state flush (sub_0034F5B0/sub_003558A0/sub_0034D410)
+  - Skips sub_00040CF0 (walks device pointer chains)
+  - **Restored 60fps** (was 32fps with direct D3D clear in sub_001AE6F0)
+  - Gen code disabled in recomp_0000.c (#if 0)
 
 ### Session 40 Changes (2026-03-15)
 - **NV2A PGRAPH → D3D11 translator** (`src/nv2a/nv2a_pgraph_d3d11.c/h`): New reusable module
@@ -272,10 +275,11 @@ Game boots, loads, runs gameplay loop. **Two rendering modes** toggled with V ke
   - 15,196 lines across 55 files
 
 ### Next Steps
-1. **Write manual sub_0003FEE0 override** — implement only the safe operations (matrix copy
-   from game obj to device, viewport setup) without calling D3D8LTCG state flush functions.
-   Or: capture and fix up ALL heap pointers in the device snapshot (surface objects, etc.)
-2. **Fix frame rate** — currently 32fps (was 60fps); investigate present timing / vsync
+1. **Populate render entry table** — res[+24] at render list resource 0x01C7D000 is NULL.
+   Need to understand how screen widgets populate draw commands into this table.
+   May require enabling sub_00040CF0 (camera/projection setup with device ptr fixups)
+2. **Capture more xemu snapshots** — device state pointers (surfaces at 0x0078B020 etc.)
+   and render list resource contents during active menu rendering
 3. Decode .btv vehicle texture format and apply to 3D models
 4. Long-term: fix the real physics world initialization
 
@@ -306,5 +310,5 @@ Game boots, loads, runs gameplay loop. **Two rendering modes** toggled with V ke
 10. **recomp_dispatch.c**: add sub_001D1818/sub_001D2793 entries, size=22097
 11. **recomp_funcs.h**: add sub_001D1818/sub_001D2793 declarations
 
-### Manual Function Overrides (recomp_manual.c) - 39 functions
-Including sub_000636D0 (physics force), sub_0003D9E0 (render orchestrator stub), sub_000110E0 (frame pump), sub_001AA100 (full phase state machine 1-9→0x13), sub_001AE6F0 (frontend render dispatch), sub_001DE900 (im2d render → bridge), sub_001DBDE0 (im2d driver entry → bridge), **sub_0034F5B0, sub_003558A0, sub_0034D410** (D3D8LTCG mid-entry stubs, Session 42)
+### Manual Function Overrides (recomp_manual.c) - 40 functions
+Including sub_000636D0 (physics force), sub_0003D9E0 (render orchestrator stub), sub_000110E0 (frame pump), sub_001AA100 (full phase state machine 1-9→0x13), sub_001AE6F0 (frontend render dispatch), sub_001DE900 (im2d render → bridge), sub_001DBDE0 (im2d driver entry → bridge), **sub_0003FEE0** (RW frame render, Session 42), **sub_0034F5B0, sub_003558A0, sub_0034D410** (D3D8LTCG mid-entry stubs, Session 42)
