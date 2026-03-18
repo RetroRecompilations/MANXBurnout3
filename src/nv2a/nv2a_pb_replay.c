@@ -189,55 +189,56 @@ static void replay_pushbuffer(const uint32_t *data, uint32_t num_dwords)
     pgraph_d3d11_flush();
 }
 
-/*
- * Draw a cursor highlight overlay using D3D8 DrawPrimitiveUP.
- * Renders a semi-transparent orange bar at the selected menu item position.
- */
-extern IDirect3DDevice8 *d3d8_GetDevice(void);
 extern int fe_menu_get_pb_state(void);
 
-/* Per-menu item positions (Y coordinates for each cursor position) */
-/* Main menu: 5 items (WORLD TOUR, SINGLE EVENT, MULTIPLAYER, XBOX LIVE, DRIVER DETAILS) */
-static const float main_menu_y[] = { 200, 240, 280, 320, 360 };
-/* Single Event: 4 items */
-static const float single_event_y[] = { 220, 260, 300, 340 };
+/* Menu item labels for window title display */
+static const char *main_items[] = { "WORLD TOUR", "SINGLE EVENT", "MULTIPLAYER", "XBOX LIVE", "DRIVER DETAILS" };
+static const char *single_items[] = { "RACE", "TIME ATTACK", "ROAD RAGE", "CRASH" };
 
-static void draw_cursor_overlay(int menu, int cursor)
+static void update_menu_title(int menu, int cursor)
 {
-    IDirect3DDevice8 *dev = d3d8_GetDevice();
-    if (!dev) return;
+    char title[256];
+    const char *sel = "";
 
-    /* Determine Y position based on menu and cursor */
-    float y = 0;
-    int valid = 0;
-    if (menu == MENU_MAIN && cursor < 5) {
-        y = main_menu_y[cursor];
-        valid = 1;
-    } else if (menu == MENU_SINGLE_EVENT && cursor < 4) {
-        y = single_event_y[cursor];
-        valid = 1;
+    switch (menu) {
+    case MENU_MAIN:
+        if (cursor < 5) sel = main_items[cursor];
+        snprintf(title, sizeof(title), "Burnout 3 — Main Menu [%s]", sel);
+        break;
+    case MENU_SINGLE_EVENT:
+        if (cursor < 4) sel = single_items[cursor];
+        snprintf(title, sizeof(title), "Burnout 3 — Single Event [%s]", sel);
+        break;
+    case MENU_WORLD_TOUR:
+        snprintf(title, sizeof(title), "Burnout 3 — World Tour");
+        break;
+    case MENU_RACE_SETUP:
+        snprintf(title, sizeof(title), "Burnout 3 — Race Setup");
+        break;
+    case MENU_TIME_ATTACK:
+        snprintf(title, sizeof(title), "Burnout 3 — Time Attack");
+        break;
+    case MENU_ROAD_RAGE:
+        snprintf(title, sizeof(title), "Burnout 3 — Road Rage");
+        break;
+    case MENU_CRASH_SELECT:
+        snprintf(title, sizeof(title), "Burnout 3 — Crash Select");
+        break;
+    case MENU_DRIVER_DETAILS:
+        snprintf(title, sizeof(title), "Burnout 3 — Driver Details");
+        break;
+    default:
+        snprintf(title, sizeof(title), "Burnout 3: Takedown");
+        break;
     }
-    /* Other sub-menus don't have cursor navigation yet */
-    if (!valid) return;
 
-    /* Draw a semi-transparent highlight bar */
-    float x1 = 120, x2 = 520;
-    float y1 = y - 4, y2 = y + 22;
-    uint32_t color = 0x40FF8800;  /* semi-transparent orange */
-
-    struct { float x, y, z, rhw; uint32_t color; } verts[6] = {
-        { x1, y1, 0, 1, color }, { x2, y1, 0, 1, color }, { x1, y2, 0, 1, color },
-        { x1, y2, 0, 1, color }, { x2, y1, 0, 1, color }, { x2, y2, 0, 1, color },
-    };
-
-    dev->lpVtbl->BeginScene(dev);
-    dev->lpVtbl->SetTexture(dev, 0, NULL);
-    dev->lpVtbl->SetRenderState(dev, 7, 0);    /* D3DRS_ZENABLE = FALSE */
-    dev->lpVtbl->SetRenderState(dev, 27, 1);   /* D3DRS_ALPHABLENDENABLE = TRUE */
-    dev->lpVtbl->SetRenderState(dev, 19, 5);   /* D3DRS_SRCBLEND = SRCALPHA */
-    dev->lpVtbl->SetRenderState(dev, 20, 6);   /* D3DRS_DESTBLEND = INVSRCALPHA */
-    dev->lpVtbl->DrawPrimitiveUP(dev, 4, 2, verts, 20); /* TRIANGLELIST, 2 tris */
-    dev->lpVtbl->EndScene(dev);
+    /* Find and update the game window */
+    HWND hwnd = FindWindowA(NULL, NULL);
+    /* Try known window class or enumerate */
+    hwnd = FindWindowA("Burnout3Class", NULL);
+    if (!hwnd) hwnd = FindWindowA(NULL, "Burnout 3: Takedown - Static Recompilation");
+    if (!hwnd) hwnd = GetActiveWindow();
+    if (hwnd) SetWindowTextA(hwnd, title);
 }
 
 /*
@@ -298,10 +299,15 @@ void nv2a_pb_replay_frame(void)
         }
     }
 
-    /* Draw cursor highlight overlay on top of the PB replay */
+    /* Update window title with current selection */
     {
-        extern int g_fe_cursor;  /* from fe_menu.c */
-        draw_cursor_overlay(g_current_menu, g_fe_cursor);
+        extern int g_fe_cursor;
+        static int prev_menu = -1, prev_cursor = -1;
+        if (g_current_menu != prev_menu || g_fe_cursor != prev_cursor) {
+            update_menu_title(g_current_menu, g_fe_cursor);
+            prev_menu = g_current_menu;
+            prev_cursor = g_fe_cursor;
+        }
     }
 }
 
