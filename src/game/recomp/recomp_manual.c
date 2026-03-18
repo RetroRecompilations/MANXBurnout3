@@ -4887,6 +4887,12 @@ void sub_001AE6F0(void)
     ebx = 0;
     MEM32(0x60E170) = ebx;
 
+    /* sub_00189040 — frontend screen widget renderer.
+     * SKIPPED: walks pointer chains through frontend object (0x60E040)
+     * that reference uninitialized screen widget data → MIRROR-FAIL flood.
+     * This is the function that would generate D3D draw calls to populate
+     * the device state tables, but it needs proper screen widget init. */
+
     /* sub_0034CBF0 — RT/DS setup + full render state flush.
      * Force device pointer before call. Pass 0,0 = use current RT/DS. */
     MEM32(0x35FB48) = 0x0035D6A0;
