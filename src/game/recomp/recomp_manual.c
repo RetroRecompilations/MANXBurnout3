@@ -153,6 +153,7 @@ void sub_00351A20(void);
 void sub_0034F5B0(void);
 void sub_003558A0(void);
 void sub_0034D410(void);
+void sub_0003FEE0(void);
 void sub_001C1670(void);
 void sub_001D7180(void);
 void sub_001D7857(void);
@@ -310,6 +311,7 @@ static const struct {
     { 0x0034F5B0u, (recomp_func_t)sub_0034F5B0 },
     { 0x003558A0u, (recomp_func_t)sub_003558A0 },
     { 0x0034D410u, (recomp_func_t)sub_0034D410 },
+    { 0x0003FEE0u, (recomp_func_t)sub_0003FEE0 },
     { 0x001C1670u, (recomp_func_t)sub_001C1670 },
     { 0x001D7180u, (recomp_func_t)sub_001D7180 },
     { 0x001D7857u, (recomp_func_t)sub_001D7857 },
@@ -1332,6 +1334,134 @@ void sub_003558A0(void)
 void sub_0034D410(void)
 {
     eax = MEM32(0x35D6A0);
+    esp += 12; return;  /* ret 8: pop ret + 2 params */
+}
+
+
+/**
+ * sub_0003FEE0 - RW frame render function (MANUAL OVERRIDE)
+ *
+ * Original: 0x0003FEE0 - 0x000402C0 (992 bytes, 234 insns)
+ * CC: stdcall, 2 params (game_obj at [ebp+8], scene_desc at [ebp+C])
+ *
+ * This is the COMPLETE frame render function — it does:
+ *   1. D3D state flush (sub_0034F5B0) — SKIP (stubbed)
+ *   2. PB space check / kick (sub_003518E0) — SKIP (stubbed)
+ *   3. PB begin (sub_003558A0) — SKIP (stubbed)
+ *   4. Matrix copy: sub_0003FE10 (game_obj+0x500 → game_obj+0x6E0)
+ *   5. Scene descriptor copy to game_obj+0x660
+ *   6. D3D render state (sub_0034D410) — SKIP (stubbed)
+ *   7. Copy device+0xCA0 to game_obj+0x540 (state block)
+ *   8. sub_00040CF0 (camera setup) — SKIP (walks device ptrs)
+ *   9. Matrix ops: sub_001AF280, sub_001CF153, sub_00040310
+ *  10. D3D clear: sub_0034C2E0 (our override)
+ *  11. Render dispatch: sub_001AD350 × 3 passes
+ *  12. Post-render cleanup
+ *
+ * Manual override: performs safe matrix/state copies, calls D3D clear
+ * and render dispatch, skips D3D8LTCG state flush operations.
+ */
+void sub_0003FE10(void);  /* matrix copy helper */
+void sub_0003FEE0(void)
+{
+    static uint32_t call_count = 0;
+    call_count++;
+    int log = (call_count <= 10 || (call_count % 5000) == 0);
+
+    /* stdcall frame: push ebp, mov ebp esp */
+    uint32_t saved_ebp;
+    PUSH32(esp, saved_ebp);
+    uint32_t frame_ebp = esp;
+
+    /* Read params */
+    uint32_t game_obj   = MEM32(frame_ebp + 8);   /* param 1: game render object (0x4D6170) */
+    uint32_t scene_desc = MEM32(frame_ebp + 0xC);  /* param 2: scene descriptor (or zeroed) */
+
+    uint32_t dev = MEM32(0x35FB48);  /* device context at 0x0035D6A0 */
+
+    if (log)
+        fprintf(stderr, "  [FEE0] #%u: game_obj=0x%X scene=0x%X dev=0x%X\n",
+                call_count, game_obj, scene_desc, dev);
+
+    /* ── Step 1-3: D3D state flush — SKIP (stubs handle these) ── */
+
+    /* ── Step 4: Matrix copy via sub_0003FE10 ──
+     * Copies 4 matrices (256 bytes) from game_obj+0x500 to game_obj+0x6E0.
+     * sub_0003FE10 reads edx=src, eax=dst (via register params from caller). */
+    if (game_obj != 0 && game_obj < 0x4000000) {
+        edx = game_obj + 0x500;
+        eax = game_obj + 0x6E0;
+        PUSH32(esp, 0); sub_0003FE10();
+    }
+
+    /* ── Step 5: Copy scene descriptor to game_obj+0x660 ──
+     * movaps from [scene_desc] to [game_obj+0x660] (16 bytes) */
+    if (scene_desc != 0 && scene_desc < 0x4000000 && game_obj != 0) {
+        MEM32(game_obj + 0x660) = MEM32(scene_desc);
+        MEM32(game_obj + 0x664) = MEM32(scene_desc + 4);
+        MEM32(game_obj + 0x668) = MEM32(scene_desc + 8);
+        MEM32(game_obj + 0x66C) = MEM32(scene_desc + 12);
+        /* Advance animation counter: game_obj+0x664 += [0x3B1684] */
+        MEMF(game_obj + 0x664) = MEMF(game_obj + 0x664) + MEMF(0x3B1684);
+    }
+
+    /* ── Step 6: D3D render state flush — SKIP ── */
+
+    /* ── Step 7: Copy device+0xCA0 (64 bytes) to game_obj+0x540 ── */
+    if (dev != 0 && dev < 0x4000000 && game_obj != 0) {
+        memcpy((void*)XBOX_PTR(game_obj + 0x540),
+               (void*)XBOX_PTR(dev + 0xCA0), 64);
+    }
+
+    /* ── Step 7b: Set up render state fields ── */
+    if (game_obj != 0 && game_obj < 0x4000000) {
+        float f_3b168c = MEMF(0x3B168C);  /* 1.0f typically */
+        MEM32(game_obj + 0x998) = 0x80;
+        MEM32(game_obj + 0x99C) = 0x80;
+        MEM32(game_obj + 0x990) = 0;
+        MEM32(game_obj + 0x994) = 0;
+        MEMF(game_obj + 0x9A0) = f_3b168c;
+        MEMF(game_obj + 0x9A4) = f_3b168c;
+        MEM32(game_obj + 0x9C4) = 0x901;
+    }
+
+    /* ── Step 8: sub_00040CF0 (camera/projection) — SKIP ──
+     * Calls sub_0034CBF0 (D3D state) and builds rotation matrices.
+     * Depends on device context pointers that aren't valid. */
+
+    /* ── Step 9: Matrix ops — SKIP (sub_001AF280, sub_001CF153) ──
+     * These build the view/projection matrices from camera data.
+     * Without proper camera init, they'd produce garbage. */
+
+    /* ── Step 10: D3D clear ── */
+    PUSH32(esp, 0);            /* stencil */
+    PUSH32(esp, 0x3F800000);   /* depth = 1.0f */
+    PUSH32(esp, 0);            /* color = black */
+    PUSH32(esp, 0x83);         /* flags = color|depth|stencil */
+    PUSH32(esp, 0);            /* rect count */
+    PUSH32(esp, 0);            /* rects ptr */
+    PUSH32(esp, 0); sub_0034C2E0();
+
+    /* ── Step 11: Render dispatch — sub_001AD350 × 3 passes ── */
+    uint32_t render_base = 0x7397B0;  /* base_obj + 0x12ADB0 = 0x60EA00 + 0x12ADB0 */
+    PUSH32(esp, 0);
+    PUSH32(esp, render_base);
+    PUSH32(esp, 0); sub_001AD350();
+
+    PUSH32(esp, 1);
+    PUSH32(esp, render_base);
+    PUSH32(esp, 0); sub_001AD350();
+
+    PUSH32(esp, 2);
+    PUSH32(esp, render_base);
+    PUSH32(esp, 0); sub_001AD350();
+
+    if (log)
+        fprintf(stderr, "  [FEE0] #%u DONE\n", call_count);
+
+    /* ── Epilog: restore frame, ret 8 ── */
+    esp = frame_ebp;
+    POP32(esp, saved_ebp);
     esp += 12; return;  /* ret 8: pop ret + 2 params */
 }
 
@@ -4614,28 +4744,29 @@ void sub_001AE6F0(void)
                 MEM32(render_base), MEM32(render_base + 4), MEM32(render_base + 8));
     }
 
-    /* Set registers as original code expects */
+    /* ── Call manual sub_0003FEE0 override ──
+     * sub_0003FEE0 now has a manual override that skips D3D8LTCG state flush
+     * calls but still does matrix copy, D3D clear, and render dispatch
+     * (sub_001AD350 × 3 passes). */
     esi = 0x60E040;
     edi = 0x4D6170;
     ebx = 0;
+    MEM32(0x60E170) = ebx;
 
-    /* D3D clear */
+    /* sub_0003FEE0(game_obj=0x4D6170, scene_desc=zeroed) */
     {
-        IDirect3DDevice8 *dev = d3d8_GetDevice();
-        MEM8(0x4D6B30) = 0;
-        if (dev)
-            dev->lpVtbl->Clear(dev, 0, NULL, 0x07, 0x00000000, 1.0f, 0);
+        /* phase < 0: pass zeroed scene descriptor (safe path) */
+        uint32_t zero_desc = esp - 0x10;
+        MEM32(zero_desc) = 0;
+        MEM32(zero_desc + 4) = 0;
+        MEM32(zero_desc + 8) = 0;
+        MEM32(zero_desc + 12) = 0;
+        PUSH32(esp, zero_desc);
+        PUSH32(esp, 0x4D6170);
+        PUSH32(esp, 0); sub_0003FEE0();
     }
 
-    /* Session 42: sub_0003FEE0 STILL crashes even with xemu snapshot because
-     * the device context (16KB) contains hundreds of xemu heap pointers that
-     * can't be trivially fixed up. The gen code walks deep pointer chains.
-     *
-     * The xemu snapshot IS loaded at 0x0035D6A0 (original Xbox address) with
-     * PB/surface/viewport fixups applied. This provides proper scalar state
-     * (matrices, flags, dimensions) for other D3D functions that work.
-     *
-     * Menu rendering continues via captured push buffer replay. */
+    MEM32(0x60E170) = 0xFFFFFFFFu;
 
     if (log)
         fprintf(stderr, "  [FE-DISPATCH] sub_001AE6F0 #%u DONE\n", call_count);
