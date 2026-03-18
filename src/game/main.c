@@ -1569,13 +1569,24 @@ static BOOL init_subsystems(void)
                 MEM32(fake_surf + 0x200 + 0x0C) = 0x00060006;
                 MEM32(dev + 0x7A8) = fake_surf + 0x200;
 
-                /* Surface state fields — keep snapshot's D3D-section pointers
-                 * for +0x1A04 (0x35F0C4) and +0x1A08 (0x35F10C) but also
-                 * set up our fake surfaces as fallbacks */
-                MEM32(dev + 0x1A04) = fake_surf;
-                MEM32(dev + 0x1A08) = fake_surf + 0x100;
-                MEM32(dev + 0x1A14) = fake_surf;
-                MEM32(dev + 0x1A18) = fake_surf;
+                /* Surface state fields — USE snapshot's D3D-section pointers
+                 * 0x35F0C4 and 0x35F10C are in the D3D section (valid Xbox VAs).
+                 * The snapshot already loaded proper surface data there.
+                 * Initialize surface dimensions at those addresses too. */
+                {
+                    uint32_t snap_rt = 0x0035F0C4;  /* from xemu snapshot */
+                    uint32_t snap_ds = 0x0035F10C;  /* from xemu snapshot */
+                    /* Ensure surface dimensions are set */
+                    MEM32(snap_rt + 0x10) = 640;
+                    MEM32(snap_rt + 0x14) = 480;
+                    MEM32(snap_ds + 0x10) = 640;
+                    MEM32(snap_ds + 0x14) = 480;
+                    /* Point device to these D3D-section surfaces */
+                    MEM32(dev + 0x1A04) = snap_rt;
+                    MEM32(dev + 0x1A08) = snap_ds;
+                    MEM32(dev + 0x1A14) = snap_rt;
+                    MEM32(dev + 0x1A18) = fake_surf;  /* alternate = fake (safety) */
+                }
             }
         }
 

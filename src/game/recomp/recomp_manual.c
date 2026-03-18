@@ -1329,19 +1329,35 @@ void sub_00351770(void)
  */
 void sub_0034CBF0(void)
 {
-    uint32_t dev = MEM32(0x35FB48);
-    uint32_t rt_param = MEM32(esp + 4);   /* first param: new RT surface (or 0) */
-    uint32_t ds_param = MEM32(esp + 8);   /* second param: new DS surface (or 0) */
+    uint32_t dev_raw = MEM32(0x35FB48);
+    /* Convert mirror/native address to Xbox VA (mirrors repeat every 64MB) */
+    uint32_t dev = dev_raw;
+    if (dev >= 0x4000000) dev = dev % 0x4000000;
 
-    /* If RT param is 0, use current RT from device */
+    uint32_t rt_param = MEM32(esp + 4);
+    uint32_t ds_param = MEM32(esp + 8);
+
+    /* If RT param is 0, use current RT from device.
+     * Force xemu snapshot addresses if device got cleared. */
     uint32_t rt = rt_param;
-    if (rt == 0 && dev != 0 && dev < 0x4000000)
+    if (rt == 0 && dev != 0 && dev < 0x4000000) {
         rt = MEM32(dev + 0x1A04);
+        if (rt >= 0x4000000) rt = rt % 0x4000000;  /* mirror fix */
+        if (rt == 0) rt = 0x0035F0C4;  /* xemu snapshot RT surface */
+    }
 
-    /* Mark RT surface dirty (+0x80000) */
+    /* If DS param is 0, use current DS from device */
+    uint32_t ds = ds_param;
+    if (ds == 0 && dev != 0 && dev < 0x4000000) {
+        ds = MEM32(dev + 0x1A08);
+        if (ds >= 0x4000000) ds = ds % 0x4000000;  /* mirror fix */
+        if (ds == 0) ds = 0x0035F10C;  /* xemu snapshot DS surface */
+    }
+
+    /* Mark RT surface dirty (+0x80000) — matches gen code at loc_0034CC36 */
     if (rt != 0 && rt < 0x4000000) {
         MEM32(rt) = MEM32(rt) + 0x80000;
-        /* Also mark linked surface if present */
+        /* Also mark linked surface at +0x14 if present */
         uint32_t linked = MEM32(rt + 0x14);
         if (linked != 0 && linked < 0x4000000)
             MEM32(linked) = MEM32(linked) + 0x80000;
@@ -1351,17 +1367,17 @@ void sub_0034CBF0(void)
     if (dev != 0 && dev < 0x4000000)
         MEM32(dev + 0x1A04) = rt;
 
-    /* Mark DS surface dirty */
-    if (ds_param != 0 && ds_param < 0x4000000) {
-        MEM32(ds_param) = MEM32(ds_param) + 0x80000;
-        uint32_t linked_ds = MEM32(ds_param + 0x14);
+    /* Mark DS surface dirty — matches gen code at loc_0034CCBB */
+    if (ds != 0 && ds < 0x4000000) {
+        MEM32(ds) = MEM32(ds) + 0x80000;
+        uint32_t linked_ds = MEM32(ds + 0x14);
         if (linked_ds != 0 && linked_ds < 0x4000000)
             MEM32(linked_ds) = MEM32(linked_ds) + 0x80000;
     }
 
     /* Set new DS in device context */
     if (dev != 0 && dev < 0x4000000)
-        MEM32(dev + 0x1A08) = ds_param;
+        MEM32(dev + 0x1A08) = ds;
 
     /* Set global dirty flags — from xemu snapshot: 0x00FF1050
      * This tells sub_00355F50 which state to flush to push buffer.
@@ -1370,9 +1386,12 @@ void sub_0034CBF0(void)
 
     static uint32_t call_count = 0;
     call_count++;
-    if (call_count <= 5 || (call_count % 5000) == 0)
-        fprintf(stderr, "  [CBF0] #%u: rt=0x%X ds=0x%X dirty=0x%X\n",
-                call_count, rt, ds_param, MEM32(0x35FB50));
+    if (call_count <= 10 || (call_count % 5000) == 0)
+        fprintf(stderr, "  [CBF0] #%u: dev=0x%X rt=0x%X ds=0x%X 1A04=0x%X 1A08=0x%X dirty=0x%08X\n",
+                call_count, dev, rt, ds,
+                (dev != 0 && dev < 0x4000000) ? MEM32(dev + 0x1A04) : 0,
+                (dev != 0 && dev < 0x4000000) ? MEM32(dev + 0x1A08) : 0,
+                MEM32(0x35FB50));
 
     esp += 16; return; /* ret 12: pop ret + 2 params */
 }
