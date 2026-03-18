@@ -150,6 +150,8 @@ void sub_00249B9C(void);
 void sub_003518E0(void);
 void sub_00351770(void);
 void sub_00351A20(void);
+void sub_0034CBF0(void);
+void sub_0034CEF0(void);
 void sub_0034F5B0(void);
 void sub_003558A0(void);
 void sub_0034D410(void);
@@ -308,6 +310,8 @@ static const struct {
     { 0x003518E0u, (recomp_func_t)sub_003518E0 },
     { 0x00351770u, (recomp_func_t)sub_00351770 },
     { 0x00351A20u, (recomp_func_t)sub_00351A20 },
+    { 0x0034CBF0u, (recomp_func_t)sub_0034CBF0 },
+    { 0x0034CEF0u, (recomp_func_t)sub_0034CEF0 },
     { 0x0034F5B0u, (recomp_func_t)sub_0034F5B0 },
     { 0x003558A0u, (recomp_func_t)sub_003558A0 },
     { 0x0034D410u, (recomp_func_t)sub_0034D410 },
@@ -1305,6 +1309,76 @@ void sub_00351770(void)
 
 
 /**
+ * sub_0034CBF0 - D3D8LTCG render target setup + dirty flag init (OVERRIDE)
+ *
+ * Original: 0x0034CBF0 - 0x00360A54 (81508 bytes, 19561 insns)
+ * CC: cdecl, 2 params (RT surface ptr, DS surface ptr), ret 12
+ *
+ * Sets up render targets and marks them dirty so sub_00355F50 (the dirty
+ * flag processor, now generated) will flush state to the push buffer.
+ *
+ * Original does:
+ *   1. Read device+0x1A04/1A08 (current RT/DS)
+ *   2. Mark surfaces dirty: surface[0] += 0x80000
+ *   3. Swap render targets
+ *   4. Call sub_0034C800, sub_00352040, sub_0034CA10 (device ptr chains)
+ *   5. Set global dirty flags at MEM32(0x35FB50)
+ *   6. Fall through to render state flush (same code as sub_0034D530)
+ *
+ * Manual override: sets dirty flags without walking device pointer chains.
+ */
+void sub_0034CBF0(void)
+{
+    uint32_t dev = MEM32(0x35FB48);
+    uint32_t rt_param = MEM32(esp + 4);   /* first param: new RT surface (or 0) */
+    uint32_t ds_param = MEM32(esp + 8);   /* second param: new DS surface (or 0) */
+
+    /* If RT param is 0, use current RT from device */
+    uint32_t rt = rt_param;
+    if (rt == 0 && dev != 0 && dev < 0x4000000)
+        rt = MEM32(dev + 0x1A04);
+
+    /* Mark RT surface dirty (+0x80000) */
+    if (rt != 0 && rt < 0x4000000) {
+        MEM32(rt) = MEM32(rt) + 0x80000;
+        /* Also mark linked surface if present */
+        uint32_t linked = MEM32(rt + 0x14);
+        if (linked != 0 && linked < 0x4000000)
+            MEM32(linked) = MEM32(linked) + 0x80000;
+    }
+
+    /* Set new RT in device context */
+    if (dev != 0 && dev < 0x4000000)
+        MEM32(dev + 0x1A04) = rt;
+
+    /* Mark DS surface dirty */
+    if (ds_param != 0 && ds_param < 0x4000000) {
+        MEM32(ds_param) = MEM32(ds_param) + 0x80000;
+        uint32_t linked_ds = MEM32(ds_param + 0x14);
+        if (linked_ds != 0 && linked_ds < 0x4000000)
+            MEM32(linked_ds) = MEM32(linked_ds) + 0x80000;
+    }
+
+    /* Set new DS in device context */
+    if (dev != 0 && dev < 0x4000000)
+        MEM32(dev + 0x1A08) = ds_param;
+
+    /* Set global dirty flags — from xemu snapshot: 0x00FF1050
+     * This tells sub_00355F50 which state to flush to push buffer.
+     * Key bits: viewport, transforms, textures, render states */
+    MEM32(0x35FB50) = MEM32(0x35FB50) | 0x00FF1050;
+
+    static uint32_t call_count = 0;
+    call_count++;
+    if (call_count <= 5 || (call_count % 5000) == 0)
+        fprintf(stderr, "  [CBF0] #%u: rt=0x%X ds=0x%X dirty=0x%X\n",
+                call_count, rt, ds_param, MEM32(0x35FB50));
+
+    esp += 16; return; /* ret 12: pop ret + 2 params */
+}
+
+
+/**
  * D3D8LTCG render state flush — mid-function entry point stubs
  *
  * The D3D8LTCG library has ONE giant function (0x0034D410-0x00360A54, ~80K)
@@ -1319,6 +1393,12 @@ void sub_00351770(void)
  * In our environment, we handle push buffer output in sub_0034D530, so
  * these mid-entry stubs just return the current push buffer position.
  */
+void sub_0034CEF0(void)
+{
+    eax = MEM32(0x35D6A0);
+    esp += 4; return;
+}
+
 void sub_0034F5B0(void)
 {
     eax = MEM32(0x35D6A0);  /* current write pointer */
@@ -4752,6 +4832,12 @@ void sub_001AE6F0(void)
     edi = 0x4D6170;
     ebx = 0;
     MEM32(0x60E170) = ebx;
+
+    /* sub_0034CBF0 — set RT/DS dirty flags before sub_0003FEE0.
+     * Pass 0,0 like xemu does during menus (uses device+0x1A04/1A08). */
+    PUSH32(esp, 0);  /* DS param = 0 (use current) */
+    PUSH32(esp, 0);  /* RT param = 0 (use current) */
+    PUSH32(esp, 0); sub_0034CBF0();
 
     /* sub_0003FEE0(game_obj=0x4D6170, scene_desc=zeroed) */
     {
