@@ -310,8 +310,7 @@ static const struct {
     { 0x003518E0u, (recomp_func_t)sub_003518E0 },
     { 0x00351770u, (recomp_func_t)sub_00351770 },
     { 0x00351A20u, (recomp_func_t)sub_00351A20 },
-    { 0x0034CBF0u, (recomp_func_t)sub_0034CBF0 },
-    { 0x0034CEF0u, (recomp_func_t)sub_0034CEF0 },
+    /* sub_0034CBF0 + sub_0034CEF0 use gen code (PB cursor reset in sub_003518E0) */
     { 0x0034F5B0u, (recomp_func_t)sub_0034F5B0 },
     { 0x003558A0u, (recomp_func_t)sub_003558A0 },
     { 0x0034D410u, (recomp_func_t)sub_0034D410 },
@@ -1257,11 +1256,41 @@ void sub_00351A20(void)
  *
  * Calling convention: ret 8 (2 params on stack).
  */
+extern void parse_live_pushbuffer(void);
+
 void sub_003518E0(void)
 {
     g_pb_kick_count++;
-    eax = MEM32(0x35D6A0);  /* return current write pointer as GPU address */
-    esp += 12;    /* ret 8: pop return addr (4) + 2 params (8) */
+
+    /* Simulate GPU consuming all push buffer commands by resetting
+     * the write cursor back to the base. This prevents the gen code
+     * from spinning in a PB-full check (device[0] >= device[4]).
+     * The gen code checks device[0] < device[4] for space. */
+    uint32_t base = MEM32(0x35D69C);
+    uint32_t dev = MEM32(0x35FB48);
+    if (dev >= 0x4000000) dev = dev % 0x4000000;
+
+    /* Parse PB commands written since last reset BEFORE resetting */
+    uint32_t write_ptr = (dev != 0 && dev < 0x4000000) ? MEM32(dev) : MEM32(0x35D6A0);
+    if (write_ptr > base) {
+        uint32_t bytes = write_ptr - base;
+        static uint32_t total_pb_bytes = 0;
+        total_pb_bytes += bytes;
+        if (g_pb_kick_count <= 10 || (g_pb_kick_count % 1000) == 0)
+            fprintf(stderr, "  [PB-KICK] #%u: %u bytes, total=%u\n",
+                    g_pb_kick_count, bytes, total_pb_bytes);
+        /* Parse and translate to D3D11 */
+        parse_live_pushbuffer();
+    }
+
+    /* Reset cursors — simulate GPU consumed everything */
+    MEM32(0x35D6A0) = base;
+    if (dev != 0 && dev < 0x4000000) {
+        MEM32(dev + 0x00) = base;  /* device PB cursor = base */
+    }
+
+    eax = base;  /* return base as new position */
+    esp += 12;   /* ret 8 */
     return;
 }
 
@@ -1308,6 +1337,7 @@ void sub_00351770(void)
 }
 
 
+#if 0 /* gen sub_0034CBF0 re-enabled with PB cursor reset in sub_003518E0 */
 /**
  * sub_0034CBF0 - D3D8LTCG render target setup + dirty flag init (OVERRIDE)
  *
@@ -1395,6 +1425,7 @@ void sub_0034CBF0(void)
 
     esp += 16; return; /* ret 12: pop ret + 2 params */
 }
+#endif /* gen sub_0034CBF0 re-enabled */
 
 
 /**
@@ -1412,11 +1443,7 @@ void sub_0034CBF0(void)
  * In our environment, we handle push buffer output in sub_0034D530, so
  * these mid-entry stubs just return the current push buffer position.
  */
-void sub_0034CEF0(void)
-{
-    eax = MEM32(0x35D6A0);
-    esp += 4; return;
-}
+/* sub_0034CEF0 in gen code (re-enabled with sub_0034CBF0) */
 
 void sub_0034F5B0(void)
 {
