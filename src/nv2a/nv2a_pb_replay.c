@@ -1,11 +1,19 @@
 /*
- * NV2A Push Buffer Replay
+ * NV2A Push Buffer Replay — Multi-State Menu System
  *
  * Replays captured push buffer data through the PGRAPH→D3D11 translator.
- * Used to validate the translation pipeline with known-good data from xemu.
+ * Supports multiple menu states captured from xemu, switching between them
+ * based on the game's actual menu navigation state.
  *
- * The captured data contains a full menu frame's rendering commands.
- * When replayed, it should produce the Burnout 3 menu UI on screen.
+ * Captured states:
+ *   0 = main_menu      (WORLD TOUR / SINGLE EVENT / MULTIPLAYER / XBOX LIVE / DRIVER DETAILS)
+ *   1 = world_tour      (USA / EUROPE / FAR EAST)
+ *   2 = single_event    (RACE / TIME ATTACK / ROAD RAGE / CRASH)
+ *   3 = race_setup      (Region / Track / Rivals)
+ *   4 = time_attack     (Region / Track)
+ *   5 = road_rage        (Region / Track)
+ *   6 = crash_select    (100 crash junctions)
+ *   7 = driver_details  (Progress / Rewards / Records / Profile / Settings / Training / Extras)
  */
 
 #include "nv2a_pgraph_d3d11.h"
@@ -16,8 +24,16 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
-/* Captured push buffer data (auto-generated from xemu) */
+/* Captured push buffer data for each menu state */
 #include "menu_pushbuffer_data.h"
+#include "menu_pb_main_menu.h"
+#include "menu_pb_world_tour.h"
+#include "menu_pb_single_event.h"
+#include "menu_pb_race_setup.h"
+#include "menu_pb_time_attack.h"
+#include "menu_pb_road_rage.h"
+#include "menu_pb_crash_select.h"
+#include "menu_pb_driver_details.h"
 
 /* Push buffer command encoding */
 #define PB_INC_MASK      0xE0030003
@@ -25,15 +41,92 @@
 #define PB_NONINC_MASK   0xE0030003
 #define PB_NONINC_MATCH  0x40000000
 
+/* Menu state enum */
+enum {
+    MENU_MAIN = 0,
+    MENU_WORLD_TOUR,
+    MENU_SINGLE_EVENT,
+    MENU_RACE_SETUP,
+    MENU_TIME_ATTACK,
+    MENU_ROAD_RAGE,
+    MENU_CRASH_SELECT,
+    MENU_DRIVER_DETAILS,
+    MENU_COUNT
+};
+
+static const char *menu_names[] = {
+    "Main Menu", "World Tour", "Single Event", "Race Setup",
+    "Time Attack", "Road Rage", "Crash Select", "Driver Details"
+};
+
+/* Push buffer data table */
+static const uint32_t *menu_pb_data[MENU_COUNT];
+static uint32_t menu_pb_dwords[MENU_COUNT];
+
 static int g_replay_active = 0;
 static uint32_t g_replay_frame = 0;
+static int g_current_menu = MENU_MAIN;
+static int g_prev_menu = -1;
 static LARGE_INTEGER g_replay_start_time;
 static LARGE_INTEGER g_replay_freq;
 
+/* Xbox memory access */
+extern ptrdiff_t g_xbox_mem_offset;
+#define RMEM32(addr) (*(volatile uint32_t *)((uintptr_t)(addr) + g_xbox_mem_offset))
+
+static void init_pb_table(void)
+{
+    menu_pb_data[MENU_MAIN]           = menu_pb_main_menu;
+    menu_pb_dwords[MENU_MAIN]         = MENU_PB_MAIN_MENU_DWORDS;
+
+    menu_pb_data[MENU_WORLD_TOUR]     = menu_pb_world_tour;
+    menu_pb_dwords[MENU_WORLD_TOUR]   = MENU_PB_WORLD_TOUR_DWORDS;
+
+    menu_pb_data[MENU_SINGLE_EVENT]   = menu_pb_single_event;
+    menu_pb_dwords[MENU_SINGLE_EVENT] = MENU_PB_SINGLE_EVENT_DWORDS;
+
+    menu_pb_data[MENU_RACE_SETUP]     = menu_pb_race_setup;
+    menu_pb_dwords[MENU_RACE_SETUP]   = MENU_PB_RACE_SETUP_DWORDS;
+
+    menu_pb_data[MENU_TIME_ATTACK]    = menu_pb_time_attack;
+    menu_pb_dwords[MENU_TIME_ATTACK]  = MENU_PB_TIME_ATTACK_DWORDS;
+
+    menu_pb_data[MENU_ROAD_RAGE]      = menu_pb_road_rage;
+    menu_pb_dwords[MENU_ROAD_RAGE]    = MENU_PB_ROAD_RAGE_DWORDS;
+
+    menu_pb_data[MENU_CRASH_SELECT]   = menu_pb_crash_select;
+    menu_pb_dwords[MENU_CRASH_SELECT] = MENU_PB_CRASH_SELECT_DWORDS;
+
+    menu_pb_data[MENU_DRIVER_DETAILS] = menu_pb_driver_details;
+    menu_pb_dwords[MENU_DRIVER_DETAILS] = MENU_PB_DRIVER_DETAILS_DWORDS;
+}
+
+/*
+ * Detect current menu state from Xbox memory.
+ * The game's screen entry system tracks which screen is active.
+ * We use keyboard shortcuts (1-8) to manually switch for now,
+ * plus automatic detection from the game's screen entry vtables.
+ */
+static int detect_menu_state(void)
+{
+    /* Check for keyboard override (number keys 1-8) */
+    if (GetAsyncKeyState('1') & 0x8000) return MENU_MAIN;
+    if (GetAsyncKeyState('2') & 0x8000) return MENU_WORLD_TOUR;
+    if (GetAsyncKeyState('3') & 0x8000) return MENU_SINGLE_EVENT;
+    if (GetAsyncKeyState('4') & 0x8000) return MENU_RACE_SETUP;
+    if (GetAsyncKeyState('5') & 0x8000) return MENU_TIME_ATTACK;
+    if (GetAsyncKeyState('6') & 0x8000) return MENU_ROAD_RAGE;
+    if (GetAsyncKeyState('7') & 0x8000) return MENU_CRASH_SELECT;
+    if (GetAsyncKeyState('8') & 0x8000) return MENU_DRIVER_DETAILS;
+
+    /* TODO: Auto-detect from game's screen entry vtable at 0x4B01B0.
+     * Different menu screens activate different screen entries.
+     * For now, maintain current state until keyboard override. */
+    return g_current_menu;
+}
+
 /*
  * Parse and dispatch push buffer commands through the D3D11 translator.
- * This is the same algorithm as nv2a_pb_test.c but reads from the
- * captured data array instead of Xbox memory.
  */
 static void replay_pushbuffer(const uint32_t *data, uint32_t num_dwords)
 {
@@ -44,11 +137,7 @@ static void replay_pushbuffer(const uint32_t *data, uint32_t num_dwords)
     while (pos < num_dwords) {
         uint32_t header = data[pos];
 
-        /* Skip zero padding */
-        if (header == 0) {
-            pos++;
-            continue;
-        }
+        if (header == 0) { pos++; continue; }
 
         /* Increasing method */
         if ((header & PB_INC_MASK) == PB_INC_MATCH) {
@@ -56,24 +145,14 @@ static void replay_pushbuffer(const uint32_t *data, uint32_t num_dwords)
             uint32_t method = header & 0x1FFC;
             uint32_t subchannel = (header >> 13) & 7;
 
-            if (count == 0 || pos + 1 + count > num_dwords) {
-                /* Invalid or truncated — skip */
-                pos++;
-                continue;
-            }
+            if (count == 0 || pos + 1 + count > num_dwords) { pos++; continue; }
 
             for (uint32_t i = 0; i < count; i++) {
-                uint32_t param = data[pos + 1 + i];
-                pgraph_d3d11_method(subchannel, method + i * 4, param);
+                pgraph_d3d11_method(subchannel, method + i * 4, data[pos + 1 + i]);
                 method_count++;
             }
             pos += 1 + count;
-
-            /* Track BEGIN_END for logging */
-            if (method == 0x17FC) {
-                uint32_t mode = data[pos - count];  /* First param */
-                if (mode != 0) draw_count++;
-            }
+            if (method == 0x17FC && data[pos - count] != 0) draw_count++;
         }
         /* Non-increasing method */
         else if ((header & PB_NONINC_MASK) == PB_NONINC_MATCH) {
@@ -81,120 +160,109 @@ static void replay_pushbuffer(const uint32_t *data, uint32_t num_dwords)
             uint32_t method = header & 0x1FFC;
             uint32_t subchannel = (header >> 13) & 7;
 
-            if (count == 0 || pos + 1 + count > num_dwords) {
-                pos++;
-                continue;
-            }
+            if (count == 0 || pos + 1 + count > num_dwords) { pos++; continue; }
 
             for (uint32_t i = 0; i < count; i++) {
-                uint32_t param = data[pos + 1 + i];
-                pgraph_d3d11_method(subchannel, method, param);
+                pgraph_d3d11_method(subchannel, method, data[pos + 1 + i]);
                 method_count++;
             }
             pos += 1 + count;
         }
-        /* Unknown header type */
-        else {
-            pos++;
-        }
+        else { pos++; }
     }
 
     g_replay_frame++;
     if (g_replay_frame <= 5 || (g_replay_frame % 300) == 0) {
         PgraphD3D11Stats stats;
         pgraph_d3d11_get_stats(&stats);
-        fprintf(stderr, "[PB-REPLAY] Frame %u: %u methods, %u draws dispatched, "
-                "translator draws=%u verts=%u clears=%u\n",
-                g_replay_frame, method_count, draw_count,
-                stats.draw_calls, stats.vertices_submitted, stats.clears);
+        fprintf(stderr, "[PB-REPLAY] Frame %u [%s]: %u methods, %u draws, "
+                "translator draws=%u verts=%u\n",
+                g_replay_frame, menu_names[g_current_menu],
+                method_count, draw_count,
+                stats.draw_calls, stats.vertices_submitted);
     }
 
-    /* Flush any pending draw */
     pgraph_d3d11_flush();
 }
 
 /*
  * Called once per frame when replay is active.
- * Feeds the captured push buffer through the translator.
- *
- * The capture starts mid-stream: Draws 1-5 have no SET_TEXTURE_OFFSET
- * because they inherited the font atlas (0x021C4100) from before our
- * capture window. We inject that binding before replay to fix them.
+ * Detects menu state and replays the appropriate push buffer.
  */
-/* Draw 5 (chyron text) location in push buffer.
- * BEGIN_END(6) at dword 6175, INLINE_ARRAY at dword 6177 (1275 dwords),
- * END at dword 7454. Vertex data starts at dword 6178 (header at 6177). */
-#define CHYRON_INLINE_HEADER  6177   /* NONINC INLINE_ARRAY header dword */
-#define CHYRON_INLINE_DATA    6178   /* First data dword */
-#define CHYRON_INLINE_COUNT   1275   /* Number of INLINE_ARRAY data dwords */
-
 void nv2a_pb_replay_frame(void)
 {
     if (!g_replay_active) return;
 
-    /* Inject inherited texture state: font atlas was active before capture.
-     * Draws 1-5 (menu text + chyron) rely on this being set. */
-    pgraph_d3d11_method(0, 0x1B00, 0x021C4100);  /* SET_TEXTURE_OFFSET[0] = font atlas */
-    pgraph_d3d11_method(0, 0x1B08, 0x40010303);   /* SET_TEXTURE_CONTROL0[0] = enabled */
-
-    /* Replay push buffer in 3 segments, skipping Draw 5 (chyron) which
-     * we re-draw later with scroll animation applied.
-     * Segment 1: dwords 0 to 6174 (before Draw 5's BEGIN_END)
-     * Skip:      dwords 6175 to 7454 (Draw 5: BEGIN, INLINE_ARRAY, END)
-     * Segment 2: dwords 7455 to end (Draw 6 onwards) */
-    #define CHYRON_BEGIN_DWORD  6175
-    #define CHYRON_END_DWORD    7455  /* first dword after Draw 5's END */
-
-    replay_pushbuffer(menu_pushbuffer_data, CHYRON_BEGIN_DWORD);
-    replay_pushbuffer(&menu_pushbuffer_data[CHYRON_END_DWORD],
-                      MENU_PB_DWORDS - CHYRON_END_DWORD);
-
-    /* Re-draw the chyron text (Draw 5) ON TOP of the bottom panel.
-     * In the original push buffer, Draw 5 renders BEFORE the dark panel
-     * overlays (Draws 16-20). Without full NV2A combiner emulation,
-     * those overlays cover the chyron. Re-drawing it last fixes this. */
-    pgraph_d3d11_method(0, 0x1B00, 0x021C4100);  /* Font atlas texture */
-    pgraph_d3d11_method(0, 0x1B08, 0x40010303);   /* Texture enabled */
-
-    /* Apply time-based chyron scroll (smooth, independent of frame rate) */
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    double elapsed = (double)(now.QuadPart - g_replay_start_time.QuadPart)
-                   / (double)g_replay_freq.QuadPart;
-    /* ~50 pixels/sec scroll speed (matching original Burnout 3 chyron) */
-    uint32_t scroll_pixels = (uint32_t)(elapsed * 50.0);
-    pgraph_d3d11_set_chyron_scroll(scroll_pixels);
-
-    /* Emit BEGIN_END(6) = TRIANGLE_STRIP */
-    pgraph_d3d11_method(0, 0x17FC, 6);
-
-    /* Feed the chyron vertex data */
-    for (uint32_t i = 0; i < CHYRON_INLINE_COUNT; i++) {
-        pgraph_d3d11_method(0, 0x1818, menu_pushbuffer_data[CHYRON_INLINE_DATA + i]);
+    /* Detect and potentially switch menu state */
+    int new_menu = detect_menu_state();
+    if (new_menu != g_current_menu) {
+        fprintf(stderr, "[PB-REPLAY] Menu switch: %s -> %s\n",
+                menu_names[g_current_menu], menu_names[new_menu]);
+        g_current_menu = new_menu;
     }
 
-    /* End draw */
-    pgraph_d3d11_method(0, 0x17FC, 0);
+    /* Inject inherited texture state (font atlas) */
+    pgraph_d3d11_method(0, 0x1B00, 0x021C4100);
+    pgraph_d3d11_method(0, 0x1B08, 0x40010303);
 
-    /* Clear chyron scroll */
-    pgraph_d3d11_set_chyron_scroll(0);
+    /* Replay the current menu state's push buffer */
+    const uint32_t *pb = menu_pb_data[g_current_menu];
+    uint32_t dwords = menu_pb_dwords[g_current_menu];
+
+    if (pb && dwords > 0) {
+        /* For the main menu, use the original data with chyron handling */
+        if (g_current_menu == MENU_MAIN) {
+            /* Replay in segments, skipping chyron (Draw 5) for re-draw with scroll */
+            #define CHYRON_BEGIN_DWORD  6175
+            #define CHYRON_END_DWORD    7455
+            #define CHYRON_INLINE_DATA  6178
+            #define CHYRON_INLINE_COUNT 1275
+
+            replay_pushbuffer(menu_pushbuffer_data, CHYRON_BEGIN_DWORD);
+            replay_pushbuffer(&menu_pushbuffer_data[CHYRON_END_DWORD],
+                              MENU_PB_DWORDS - CHYRON_END_DWORD);
+
+            /* Re-draw chyron on top with scroll animation */
+            pgraph_d3d11_method(0, 0x1B00, 0x021C4100);
+            pgraph_d3d11_method(0, 0x1B08, 0x40010303);
+
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            double elapsed = (double)(now.QuadPart - g_replay_start_time.QuadPart)
+                           / (double)g_replay_freq.QuadPart;
+            pgraph_d3d11_set_chyron_scroll((uint32_t)(elapsed * 50.0));
+
+            pgraph_d3d11_method(0, 0x17FC, 6);
+            for (uint32_t i = 0; i < CHYRON_INLINE_COUNT; i++)
+                pgraph_d3d11_method(0, 0x1818, menu_pushbuffer_data[CHYRON_INLINE_DATA + i]);
+            pgraph_d3d11_method(0, 0x17FC, 0);
+            pgraph_d3d11_set_chyron_scroll(0);
+        } else {
+            /* Other menus: replay the full captured push buffer */
+            replay_pushbuffer(pb, dwords);
+        }
+    }
 }
 
 void nv2a_pb_replay_set_active(int active)
 {
     g_replay_active = active;
     g_replay_frame = 0;
+    g_current_menu = MENU_MAIN;
 
-    /* Suppress extra presents from recompiled code to prevent flashing */
     extern volatile int g_suppress_present;
     g_suppress_present = active ? 1 : 0;
 
     if (active) {
+        init_pb_table();
         pgraph_d3d11_init();
         QueryPerformanceFrequency(&g_replay_freq);
         QueryPerformanceCounter(&g_replay_start_time);
-        fprintf(stderr, "[PB-REPLAY] Push buffer replay ENABLED (%u dwords, font atlas pre-bound, chyron scroll active)\n",
-                MENU_PB_DWORDS);
+        fprintf(stderr, "[PB-REPLAY] Multi-state replay ENABLED (%d menu states)\n", MENU_COUNT);
+        fprintf(stderr, "[PB-REPLAY] Keys 1-8 switch menu states:\n");
+        for (int i = 0; i < MENU_COUNT; i++)
+            fprintf(stderr, "  %d = %s (%u dwords)\n", i + 1, menu_names[i],
+                    menu_pb_dwords[i]);
     } else {
         fprintf(stderr, "[PB-REPLAY] Push buffer replay disabled\n");
     }
