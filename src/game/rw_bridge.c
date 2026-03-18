@@ -255,8 +255,9 @@ int rw_bridge_camera_render(uint32_t camera_va)
     g_bridge_frame_count++;
 
     /* Check if we're in menu state — route to frontend menu renderer.
-     * Menu detection: camera pointer at 0x4D5370 == 0x4D4008 (menus). */
-    if (fe_menu_is_active()) {
+     * Skip menu rendering if a race is active (gameplay mode). */
+    extern int fe_menu_is_racing(void);
+    if (fe_menu_is_active() && !fe_menu_is_racing()) {
         /* Frontend menu: push buffer replay replaces the placeholder.
          * Clear to dark blue so we can see the NV2A translated geometry. */
         extern int nv2a_pb_replay_is_active(void);
