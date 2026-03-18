@@ -90,7 +90,7 @@ static const char *g_single_menu_labels[FE_SINGLE_ITEMS] = {
 };
 
 static int g_fe_screen = FE_SCREEN_MAIN;  /* Skip title, start on main menu */
-static int g_fe_cursor = 0;
+int g_fe_cursor = 0;  /* exported for PB replay cursor overlay */
 static float g_fe_timer = 0.0f;
 static float g_fe_flash = 0.0f;   /* "Press Start" blink timer */
 static int g_fe_initialized = 0;
