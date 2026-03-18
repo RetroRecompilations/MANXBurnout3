@@ -306,6 +306,13 @@ Game boots, loads, runs gameplay loop. **Two rendering modes** toggled with V ke
 6. **recomp_0006.c**: #if 0 around sub_001FE1E0, sub_00221F20
 7. **recomp_0007.c**: #if 0 around sub_00244C51, sub_00249B7C, sub_00249B9C
 8. **recomp_0022.c**: #if 0 around sub_00351770, sub_003518E0, sub_0034D530, **sub_0034D410, sub_0034F5B0, sub_003558A0** (Session 42)
+12. **recomp_stubs.c**: sub_00355F50 stub removed (now generated as recomp_355f50.c)
+13. **recomp_355f50.c**: NEW FILE — generated D3D8LTCG dirty flag processor (8005 lines)
+    - Added 0x355F50 to tools/disasm/output/functions.json first
+    - Generated: `py -3 -m tools.recomp "Burnout 3 Takedown/default.xbe" -f 0x355F50 > src/game/recomp/gen/recomp_355f50.c`
+    - Added headers: `#define RECOMP_GENERATED_CODE`, `#include "recomp_funcs.h"`, etc.
+    - Must `cmake -S . -B build` to pick up new file (GLOB pattern)
+14. **recomp_0000.c**: #if 0 around sub_0003FEE0 (Session 42)
 9. **recomp_stubs.c**: #if 0 around sub_00351A20
 10. **recomp_dispatch.c**: add sub_001D1818/sub_001D2793 entries, size=22097
 11. **recomp_funcs.h**: add sub_001D1818/sub_001D2793 declarations
