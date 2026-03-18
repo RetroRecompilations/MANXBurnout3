@@ -2449,6 +2449,9 @@ void sub_0034D530(void)
 {
     g_d3d_render_count++;
 
+    /* Force correct device pointer (gen code writes mirror variants) */
+    MEM32(0x35FB48) = 0x0035D6A0;
+
     uint32_t pb_base = MEM32(0x35D69C);
     uint32_t dev = MEM32(0x35FB48);
 
@@ -4835,6 +4838,11 @@ void sub_001AE6F0(void)
     int32_t  phase    = (int32_t)MEM32(esp + 8);
     uint32_t render_base = base_obj + 0x12ADB0;
     int log = (call_count <= 20 || (call_count % 5000) == 0);
+
+    /* Force device context pointer to correct value every frame.
+     * Gen code writes mirror variant (0x35FBA8) during boot, shifting
+     * all device field accesses by 0x2508. Reset to 0x35D6A0. */
+    MEM32(0x35FB48) = 0x0035D6A0;
 
     if (log) {
         fprintf(stderr, "  [FE-DISPATCH] sub_001AE6F0 #%u: base=0x%X phase=%d\n",
