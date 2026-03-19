@@ -238,9 +238,54 @@ static int read_rw_camera_state(void)
     float cz = BMEMF(RW_CAM_WORLD_Z);
     float fov = BMEMF(RW_CAM_FOV);
 
-    /* Validate: non-zero position indicates camera was set up */
-    if (cx == 0.0f && cy == 0.0f && cz == 0.0f)
+    /* If RW camera has no position but we're in gameplay mode,
+     * derive camera from the physics body position.
+     * Physics body at 0x5FFF00: +0x10=pos_x, +0x14=pos_y, +0x18=heading */
+    if (cx == 0.0f && cy == 0.0f && cz == 0.0f) {
+        uint32_t game_st = BMEM32(0x4D53B8);
+        if (cam_ptr == 0x4D45D0 || game_st == 4) {
+            /* Read physics body via same path as TICK log */
+            uint32_t vel_ptr = BMEM32(0x557880 + 0x1B4);
+            float phys_x = 0, phys_y = 0;
+            if (vel_ptr > 0x100 && vel_ptr < 0x3FFFFFF) {
+                phys_x = BMEMF(vel_ptr + 0x10);
+                phys_y = BMEMF(vel_ptr + 0x14);
+            } else {
+                /* Fallback: direct address */
+                phys_x = BMEMF(0x5FFF10);
+                phys_y = BMEMF(0x5FFF14);
+            }
+            float hdg = (vel_ptr > 0x100 && vel_ptr < 0x3FFFFFF)
+                        ? BMEMF(vel_ptr + 0x18) : BMEMF(0x5FFF18);
+            float spd = (vel_ptr > 0x100 && vel_ptr < 0x3FFFFFF)
+                        ? BMEMF(vel_ptr + 0x1C) : BMEMF(0x5FFF1C);
+
+            /* Place camera behind car based on heading */
+            float cam_dist = 20.0f + spd * 0.3f;
+            cx = phys_x - sinf(hdg) * cam_dist;
+            cy = 8.0f;  /* fixed height above ground */
+            cz = phys_y - cosf(hdg) * cam_dist;
+            fov = 60.0f;
+
+            if (cx != 0.0f || cz != 0.0f) {
+                g_cam_pos[0] = cx;
+                g_cam_pos[1] = cy;
+                g_cam_pos[2] = cz;
+                g_cam_fov = fov;
+                g_cam_valid = 1;
+
+                static int logged_phy = 0;
+                if (!logged_phy || (g_bridge_frame_count % 500) == 0) {
+                    fprintf(stderr, "[RW-BRIDGE] Camera (physics): pos=(%.1f, %.1f, %.1f) "
+                            "car=(%.1f,%.1f) hdg=%.1f° spd=%.1f\n",
+                            cx, cy, cz, phys_x, phys_y, hdg * 57.2958f, spd);
+                    logged_phy = 1;
+                }
+                return 1;
+            }
+        }
         return 0;
+    }
 
     /* Validate FOV range */
     if (fov < 1.0f || fov > 179.0f)
@@ -266,30 +311,32 @@ int rw_bridge_get_camera_view(float *out_matrix)
 {
     if (!g_cam_valid) return 0;
 
-    /* Build a simple look-at view matrix from camera position.
-     * The car world matrix at 0x4D6850 gives us the forward direction. */
-    float car_mat[16];
-    for (int i = 0; i < 16; i++)
-        car_mat[i] = BMEMF(RW_CAR_MATRIX + i * 4);
-
-    /* Camera position */
+    /* Build a simple look-at view matrix from camera position. */
     float eye[3] = { g_cam_pos[0], g_cam_pos[1], g_cam_pos[2] };
 
-    /* Look at the car (offset from car matrix translation row) */
-    float car_x = car_mat[12];
-    float car_y = car_mat[13];
-    float car_z = car_mat[14];
+    /* Try car world matrix at 0x4D6850 first */
+    float car_x = BMEMF(RW_CAR_MATRIX + 12 * 4);
+    float car_y = BMEMF(RW_CAR_MATRIX + 13 * 4);
+    float car_z = BMEMF(RW_CAR_MATRIX + 14 * 4);
 
-    /* If car position is valid, look at it; otherwise look forward */
     float target[3];
     if (car_x != 0.0f || car_y != 0.0f || car_z != 0.0f) {
         target[0] = car_x;
         target[1] = car_y;
         target[2] = car_z;
     } else {
-        target[0] = eye[0];
-        target[1] = eye[1];
-        target[2] = eye[2] + 100.0f;
+        /* Fallback: use physics body position as look-at target */
+        float phys_x = BMEMF(0x5FFF10);
+        float phys_y = BMEMF(0x5FFF14);
+        if (phys_x != 0.0f || phys_y != 0.0f) {
+            target[0] = phys_x;
+            target[1] = 2.0f;
+            target[2] = phys_y;
+        } else {
+            target[0] = eye[0];
+            target[1] = eye[1];
+            target[2] = eye[2] + 100.0f;
+        }
     }
 
     mat4_lookat(out_matrix,

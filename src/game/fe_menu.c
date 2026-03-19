@@ -656,10 +656,8 @@ static void fe_start_race(int screen)
         FMEM32(0x4D5370) = 0x4D45D0;  /* camera → gameplay */
         FMEM32(0x411B20) = 1;         /* race active */
 
-        /* Reset physics body for crash launch */
-        FMEM32(0x5FFF10) = 0;         /* pos X = 0 */
-        FMEM32(0x5FFF14) = 0;         /* pos Y = 0 */
-        FMEM32(0x5FFF18) = 0;         /* heading = 0 (north) */
+        /* Don't reset physics position — track spawn already set it.
+         * Just zero speed so the car starts from rest. */
         FMEM32(0x5FFF1C) = 0;         /* speed = 0 */
 
         fprintf(stderr, "[FE-MENU] Crash mode: state=4 pending, cam=gameplay, race=active\n");

@@ -1665,6 +1665,15 @@ void rw_gameplay_render(void)
         fprintf(stderr, "[FLY] Init at center=(%.0f, %.0f, %.0f)\n", fly_x, fly_y, fly_z);
     }
 
+    /* When a race/crash mode is active from the menu, force drive mode */
+    {
+        extern int fe_menu_is_racing(void);
+        if (fe_menu_is_racing() && !drive_mode) {
+            drive_mode = 1;
+            fprintf(stderr, "[FLY] Forced drive mode (race active)\n");
+        }
+    }
+
     /* F key: toggle between fly and drive mode.
      * In fly mode, F drops the car at current position.
      * In drive mode, F returns to fly mode. */

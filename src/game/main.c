@@ -2266,7 +2266,8 @@ void game_frame_pump(void)
     /* ── Frontend menu update (when in menu state) ── */
     {
         float frame_dt = (float)(elapsed_ms / 1000.0);
-        if (fe_menu_is_active()) {
+        extern int fe_menu_is_racing(void);
+        if (fe_menu_is_active() || fe_menu_is_racing()) {
             fe_menu_update(frame_dt);
         }
     }
