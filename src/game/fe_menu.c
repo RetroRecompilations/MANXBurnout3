@@ -341,6 +341,10 @@ void fe_menu_init(void)
 
 int fe_menu_is_active(void)
 {
+    /* If we triggered a race/crash from the menu, we're NOT in menu mode
+     * even if the state machine hasn't transitioned yet. */
+    if (g_race_active) return 0;
+
     /* Game state 5 = menus/frontend (more reliable than cam_ptr which
      * gets overwritten with native/mirror addresses by gen code) */
     uint32_t game_state = FMEM32(ADDR_GAME_STATE);
@@ -426,11 +430,23 @@ void fe_menu_update(float dt)
         }
         break;
 
+    case FE_SCREEN_CRASH_SELECT:
+        /* Crash select: Enter launches crash mode */
+        if (enter_edge) {
+            fprintf(stderr, "[FE-MENU] Launching Crash Mode!\n");
+            fe_start_race(FE_SCREEN_CRASH_SELECT);
+        }
+        if (esc_edge) {
+            g_fe_screen = FE_SCREEN_SINGLE;
+            g_fe_cursor = 3;
+            fprintf(stderr, "[FE-MENU] Back -> screen %d\n", g_fe_screen);
+        }
+        break;
+
     case FE_SCREEN_WORLD_TOUR:
     case FE_SCREEN_RACE_SETUP:
     case FE_SCREEN_TIME_ATTACK:
     case FE_SCREEN_ROAD_RAGE:
-    case FE_SCREEN_CRASH_SELECT:
     case FE_SCREEN_DRIVER_DETAILS:
         /* Sub-screens: ESC goes back to parent */
         if (esc_edge) {
@@ -591,17 +607,17 @@ static void fe_start_race(int screen)
     extern void nv2a_pb_replay_set_active(int active);
     nv2a_pb_replay_set_active(0);
 
-    /* Load a track (pick first available based on game mode) */
+    /* Load a track for gameplay rendering */
     extern int rw_load_track(const char *path);
     extern int rw_has_track(void);
 
-    /* Try loading a default track if none loaded */
     if (!rw_has_track()) {
-        /* Try common track paths */
+        /* For crash mode, load from a crash junction track directory.
+         * For race modes, load from regular track directories. */
         const char *tracks[] = {
-            "Burnout 3 Takedown\\Tracks\\US\\C1_V1\\streamed.dat",
+            "Burnout 3 Takedown\\Tracks\\AS\\C1_V1\\streamed.dat",
             "Burnout 3 Takedown\\Tracks\\EU\\C1_V1\\streamed.dat",
-            "Burnout 3 Takedown\\Tracks\\US\\C2_V1\\streamed.dat",
+            "Burnout 3 Takedown\\Tracks\\US\\C1_V1\\streamed.dat",
             NULL
         };
         for (int i = 0; tracks[i]; i++) {
@@ -618,13 +634,47 @@ static void fe_start_race(int screen)
     g_race_active = 1;
     g_fe_screen = FE_SCREEN_MAIN;  /* Reset menu state for when we return */
 
-    fprintf(stderr, "[FE-MENU] Race started! ESC to return to menus.\n");
-    fprintf(stderr, "[FE-MENU] Controls: WASD=drive, Shift=boost\n");
+    /* ── Set crash mode state in Xbox memory ── */
+    if (screen == FE_SCREEN_CRASH_SELECT) {
+        /* Write pending state = 4 (crash mode) to trigger state machine.
+         *
+         * State machine flow:
+         *   current state 5 → detect pending != current → set current = 4
+         *   → case 3 (state-1) → calls sub_001AA100 (phase state machine)
+         *   → phases 1-9 → returns 1 → transitions to state 5 (gameplay)
+         *
+         * Key addresses:
+         *   0x4D53B4 = pending state (ebp + 0x2E214)
+         *   0x4D53B8 = current state (ebp + 0x2E218)
+         *   0x4D53BC = mode flag (1=racing, checked by sub_00016EF0)
+         *   0x4D5370 = camera ptr (0x4D45D0 = gameplay)
+         *   0x411B20 = race active flag
+         */
+        FMEM32(0x4D53B4) = 4;         /* pending state → crash init */
+        FMEM32(0x4A4B90) = 1;         /* "loaded" flag (enables state transitions) */
+        FMEM32(0x4D53BC) = 1;         /* mode flag: racing/crash active */
+        FMEM32(0x4D5370) = 0x4D45D0;  /* camera → gameplay */
+        FMEM32(0x411B20) = 1;         /* race active */
+
+        /* Reset physics body for crash launch */
+        FMEM32(0x5FFF10) = 0;         /* pos X = 0 */
+        FMEM32(0x5FFF14) = 0;         /* pos Y = 0 */
+        FMEM32(0x5FFF18) = 0;         /* heading = 0 (north) */
+        FMEM32(0x5FFF1C) = 0;         /* speed = 0 */
+
+        fprintf(stderr, "[FE-MENU] Crash mode: state=4 pending, cam=gameplay, race=active\n");
+        fprintf(stderr, "[FE-MENU] CRASH MODE! Drive into traffic. ESC to return.\n");
+    }
+
+    fprintf(stderr, "[FE-MENU] Controls: WASD=drive, Shift=boost, ESC=quit\n");
 
     /* Update window title */
     HWND hwnd = FindWindowA(NULL, "Burnout 3: Takedown - Static Recompilation");
     if (!hwnd) hwnd = GetActiveWindow();
-    if (hwnd) SetWindowTextA(hwnd, "Burnout 3 — RACING");
+    if (hwnd) SetWindowTextA(hwnd,
+        screen == FE_SCREEN_CRASH_SELECT
+            ? "Burnout 3 — CRASH MODE"
+            : "Burnout 3 — RACING");
 }
 
 int fe_menu_is_racing(void)
@@ -641,9 +691,22 @@ void fe_menu_stop_race(void)
     extern void nv2a_pb_replay_set_active(int active);
     nv2a_pb_replay_set_active(1);
 
+    /* Restore menu state in Xbox memory */
+    FMEM32(0x4D53B4) = 5;         /* pending state → menus */
+    FMEM32(0x4D53B8) = 5;         /* current state → menus */
+    FMEM32(0x4D53BC) = 0;         /* mode flag: menus */
+    FMEM32(0x4D5370) = 0x4D4008;  /* camera → menus */
+    FMEM32(0x411B20) = 0;         /* race inactive */
+
     g_fe_screen = FE_SCREEN_MAIN;
     g_fe_cursor = 0;
     fprintf(stderr, "[FE-MENU] Returned to menus\n");
+
+    /* Update window title */
+    HWND hwnd = FindWindowA(NULL, "Burnout 3 — CRASH MODE");
+    if (!hwnd) hwnd = FindWindowA(NULL, "Burnout 3 — RACING");
+    if (!hwnd) hwnd = GetActiveWindow();
+    if (hwnd) SetWindowTextA(hwnd, "Burnout 3: Takedown - Static Recompilation");
 }
 
 /*
