@@ -1470,24 +1470,25 @@ void sub_0034D410(void)
  * Original: 0x0003FEE0 - 0x000402C0 (992 bytes, 234 insns)
  * CC: stdcall, 2 params (game_obj at [ebp+8], scene_desc at [ebp+C])
  *
- * This is the COMPLETE frame render function — it does:
- *   1. D3D state flush (sub_0034F5B0) — SKIP (stubbed)
- *   2. PB space check / kick (sub_003518E0) — SKIP (stubbed)
- *   3. PB begin (sub_003558A0) — SKIP (stubbed)
- *   4. Matrix copy: sub_0003FE10 (game_obj+0x500 → game_obj+0x6E0)
- *   5. Scene descriptor copy to game_obj+0x660
- *   6. D3D render state (sub_0034D410) — SKIP (stubbed)
- *   7. Copy device+0xCA0 to game_obj+0x540 (state block)
- *   8. sub_00040CF0 (camera setup) — SKIP (walks device ptrs)
- *   9. Matrix ops: sub_001AF280, sub_001CF153, sub_00040310
- *  10. D3D clear: sub_0034C2E0 (our override)
- *  11. Render dispatch: sub_001AD350 × 3 passes
- *  12. Post-render cleanup
+ * Uses typed structs from rw_structs.h / rw_d3d_device.h for offset mapping:
+ *   game_obj  → RwGameRenderContext (0x4D6170)
+ *   dev       → XboxD3DDevice (0x35D6A0)
  *
- * Manual override: performs safe matrix/state copies, calls D3D clear
- * and render dispatch, skips D3D8LTCG state flush operations.
+ * Pipeline steps:
+ *   1-3. D3D state flush — SKIP (stubs handle sub_0034F5B0/sub_003558A0)
+ *   4.   Matrix copy: sub_0003FE10 (src_matrices → dst_matrices)
+ *   5.   Scene descriptor → scene_desc[4]
+ *   6.   D3D render state — SKIP
+ *   7.   device.render_state_matrix → ctx.device_state
+ *   8.   sub_00040CF0 (rotation matrix builder) — RE-ENABLED with init'd state
+ *   9.   Matrix ops (sub_001AF280, sub_001CF153, sub_00040310) — SKIP (need
+ *        proper camera data from sub_00040CF0 output first)
+ *  10.   D3D clear via sub_0034C2E0
+ *  11.   Render dispatch: sub_001AD350 × 3 passes
+ *  12.   Post-render cleanup
  */
-void sub_0003FE10(void);  /* matrix copy helper */
+void sub_0003FE10(void);  /* matrix copy helper: edx=src(+0x500), eax=dst(+0x6E0) */
+void sub_00040CF0(void);  /* rotation/camera matrix builder (re-enabled) */
 void sub_0003FEE0(void)
 {
     static uint32_t call_count = 0;
@@ -1499,67 +1500,88 @@ void sub_0003FEE0(void)
     PUSH32(esp, saved_ebp);
     uint32_t frame_ebp = esp;
 
-    /* Read params */
-    uint32_t game_obj   = MEM32(frame_ebp + 8);   /* param 1: game render object (0x4D6170) */
-    uint32_t scene_desc = MEM32(frame_ebp + 0xC);  /* param 2: scene descriptor (or zeroed) */
-
-    uint32_t dev = MEM32(0x35FB48);  /* device context at 0x0035D6A0 */
+    /* Read params — typed via RwGameRenderContext / XboxD3DDevice */
+    uint32_t game_obj   = MEM32(frame_ebp + 8);   /* → RwGameRenderContext at 0x4D6170 */
+    uint32_t scene_desc = MEM32(frame_ebp + 0xC);  /* scene descriptor (or zeroed) */
+    uint32_t dev = MEM32(0x35FB48);                /* → XboxD3DDevice at 0x35D6A0 */
 
     if (log)
-        fprintf(stderr, "  [FEE0] #%u: game_obj=0x%X scene=0x%X dev=0x%X\n",
+        fprintf(stderr, "  [FEE0] #%u: ctx=0x%X scene=0x%X dev=0x%X\n",
                 call_count, game_obj, scene_desc, dev);
 
-    /* ── Step 1-3: D3D state flush — SKIP (stubs handle these) ── */
+    /* ── Step 1-3: D3D state flush — SKIP (stubs return PB position) ── */
 
-    /* ── Step 4: Matrix copy via sub_0003FE10 ──
-     * Copies 4 matrices (256 bytes) from game_obj+0x500 to game_obj+0x6E0.
-     * sub_0003FE10 reads edx=src, eax=dst (via register params from caller). */
+    /* ── Step 4: sub_0003FE10 — copy src_matrices → dst_matrices ──
+     * RwGameRenderContext: +0x500 (src_matrices[4]) → +0x6E0 (dst_matrices[4])
+     * sub_0003FE10 reads edx=src, eax=dst (register calling convention). */
     if (game_obj != 0 && game_obj < 0x4000000) {
-        edx = game_obj + 0x500;
-        eax = game_obj + 0x6E0;
+        edx = game_obj + 0x500;  /* offsetof(RwGameRenderContext, src_matrices) */
+        eax = game_obj + 0x6E0;  /* offsetof(RwGameRenderContext, dst_matrices) */
         PUSH32(esp, 0); sub_0003FE10();
     }
 
-    /* ── Step 5: Copy scene descriptor to game_obj+0x660 ──
-     * movaps from [scene_desc] to [game_obj+0x660] (16 bytes) */
+    /* ── Step 5: Copy scene descriptor → ctx.scene_desc[4] ──
+     * movaps 16 bytes, then advance animation counter at +0x664. */
     if (scene_desc != 0 && scene_desc < 0x4000000 && game_obj != 0) {
+        /* RwGameRenderContext::scene_desc at +0x660 */
         MEM32(game_obj + 0x660) = MEM32(scene_desc);
         MEM32(game_obj + 0x664) = MEM32(scene_desc + 4);
         MEM32(game_obj + 0x668) = MEM32(scene_desc + 8);
         MEM32(game_obj + 0x66C) = MEM32(scene_desc + 12);
-        /* Advance animation counter: game_obj+0x664 += [0x3B1684] */
+        /* scene_desc[1] += anim_step (XBOX_ANIM_STEP_VA = 0x3B1684) */
         MEMF(game_obj + 0x664) = MEMF(game_obj + 0x664) + MEMF(0x3B1684);
     }
 
     /* ── Step 6: D3D render state flush — SKIP ── */
 
-    /* ── Step 7: Copy device+0xCA0 (64 bytes) to game_obj+0x540 ── */
+    /* ── Step 7: Copy device.render_state_matrix → ctx.device_state ──
+     * XboxD3DDevice::render_state_matrix (+0xCA0) → RwGameRenderContext::device_state (+0x540)
+     * Gen code: "rep movsd ecx=0x10" = 64 bytes */
     if (dev != 0 && dev < 0x4000000 && game_obj != 0) {
-        memcpy((void*)XBOX_PTR(game_obj + 0x540),
-               (void*)XBOX_PTR(dev + 0xCA0), 64);
+        memcpy((void*)XBOX_PTR(game_obj + 0x540),  /* ctx.device_state */
+               (void*)XBOX_PTR(dev + 0xCA0),       /* dev.render_state_matrix */
+               64);
     }
 
-    /* ── Step 7b: Set up render state fields ── */
+    /* ── Step 7b: Set render viewport / scale / flags ──
+     * RwGameRenderContext fields from gen code analysis */
     if (game_obj != 0 && game_obj < 0x4000000) {
-        float f_3b168c = MEMF(0x3B168C);  /* 1.0f typically */
-        MEM32(game_obj + 0x998) = 0x80;
-        MEM32(game_obj + 0x99C) = 0x80;
-        MEM32(game_obj + 0x990) = 0;
-        MEM32(game_obj + 0x994) = 0;
-        MEMF(game_obj + 0x9A0) = f_3b168c;
-        MEMF(game_obj + 0x9A4) = f_3b168c;
-        MEM32(game_obj + 0x9C4) = 0x901;
+        float f_scale = MEMF(0x3B168C);  /* XBOX_SCALE_CONST_VA = 1.0f */
+        MEM32(game_obj + 0x998) = 0x80;  /* ctx.viewport_w */
+        MEM32(game_obj + 0x99C) = 0x80;  /* ctx.viewport_h */
+        MEM32(game_obj + 0x990) = 0;     /* ctx.viewport_x */
+        MEM32(game_obj + 0x994) = 0;     /* ctx.viewport_y */
+        MEMF(game_obj + 0x9A0) = f_scale; /* ctx.scale_x */
+        MEMF(game_obj + 0x9A4) = f_scale; /* ctx.scale_y */
+        MEM32(game_obj + 0x9C4) = 0x901; /* ctx.render_flags */
     }
 
-    /* ── Step 8: sub_00040CF0 (camera/projection) — SKIP ──
-     * Calls sub_0034CBF0 (D3D state) and builds rotation matrices.
-     * Depends on device context pointers that aren't valid. */
+    /* ── Step 8: sub_00040CF0 — rotation/camera matrix builder ──
+     * Now safe to call: rw_state_init() populated identity matrices
+     * in device.transform_cache, device.render_state_matrix, and
+     * all game render context matrix slots.
+     *
+     * Gen code context:
+     *   ecx = esp+0x1C (ptr to ctx.scene_desc = game_obj+0x660)
+     *   edx = esp+0x20 (ptr to ctx.work_matrix_3 = game_obj+0x680 area)
+     *   eax = esp+0x18 (loop counter, starts at 0)
+     *   Stack params: scene_desc ptr, 0x680 ptr */
+    if (game_obj != 0 && game_obj < 0x4000000) {
+        ecx = game_obj + 0x660;  /* scene_desc ptr */
+        edx = game_obj + 0x680;  /* work_matrix_3 */
+        eax = 0;                  /* loop counter */
+        PUSH32(esp, game_obj + 0x660);
+        PUSH32(esp, game_obj + 0x680);
+        PUSH32(esp, 0); sub_00040CF0();
+    }
 
-    /* ── Step 9: Matrix ops — SKIP (sub_001AF280, sub_001CF153) ──
-     * These build the view/projection matrices from camera data.
-     * Without proper camera init, they'd produce garbage. */
+    /* ── Step 9: Matrix ops — SKIP for now ──
+     * sub_001AF280 (projection builder) needs camera+frustum data
+     * sub_001CF153 (matrix multiply) needs valid input from sub_001AF280
+     * sub_00040310 (matrix→render state) needs sub_001CF153 output
+     * TODO: re-enable once sub_00040CF0 output is validated */
 
-    /* ── Step 10: D3D clear ── */
+    /* ── Step 10: D3D clear via sub_0034C2E0 ── */
     PUSH32(esp, 0);            /* stencil */
     PUSH32(esp, 0x3F800000);   /* depth = 1.0f */
     PUSH32(esp, 0);            /* color = black */
@@ -1583,7 +1605,7 @@ void sub_0003FEE0(void)
     PUSH32(esp, 0); sub_001AD350();
 
     if (log)
-        fprintf(stderr, "  [FEE0] #%u DONE\n", call_count);
+        fprintf(stderr, "  [FEE0] #%u DONE (sub_00040CF0 enabled)\n", call_count);
 
     /* ── Epilog: restore frame, ret 8 ── */
     esp = frame_ebp;

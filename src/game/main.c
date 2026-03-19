@@ -1408,6 +1408,12 @@ static BOOL init_subsystems(void)
         return FALSE;
     }
 
+    /* Initialize RW state with valid defaults (must be after memory layout) */
+    {
+        extern void rw_state_init(void);
+        rw_state_init();
+    }
+
     /* Verify .text section data integrity */
     fprintf(stderr, "  .text verify: JT[0x16CC8]=0x%08X (expect 0x000166D1)\n", MEM32(0x16CC8));
 

@@ -18,6 +18,8 @@
  */
 
 #include "rw_bridge.h"
+#include "rw_structs.h"
+#include "rw_d3d_device.h"
 #include "rw_renderer.h"
 #include "rw_math.h"
 #include "fe_menu.h"
@@ -63,6 +65,146 @@ static int g_cam_valid = 0;
 #define IM2D_MAX_VERTS 4096
 static RwIm2DVertex g_im2d_queue[IM2D_MAX_VERTS];
 static int g_im2d_queue_count = 0;
+
+/* ═══════════════════════════════════════════════════════════════
+ *  RW state initialization
+ *  Populates RW camera, device context, and game render context
+ *  with valid defaults so gen code won't crash on uninitialized
+ *  pointer chains when sub_0003FEE0 operations are re-enabled.
+ * ═══════════════════════════════════════════════════════════════ */
+
+static void write_identity_matrix(uint32_t xbox_va)
+{
+    static const float identity[16] = {
+        1.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 1.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 1.0f
+    };
+    memcpy((void*)((uintptr_t)xbox_va + g_xbox_mem_offset), identity, 64);
+}
+
+void rw_state_init(void)
+{
+    fprintf(stderr, "\n=== RW State Init (typed structs) ===\n");
+
+    /* ── 1. Menu camera at 0x4D4008 ──
+     * Set viewWindow, clip planes, projection type, identity matrices.
+     * The base RwCamera struct is 0x218 bytes; plugin data follows. */
+    {
+        uint32_t cam_va = XBOX_MENU_CAMERA_VA;
+        uintptr_t cam = (uintptr_t)cam_va + g_xbox_mem_offset;
+        RwCamera *c = (RwCamera *)cam;
+
+        /* Object header: type = rwCAMERA */
+        c->objwf.object.type = rwCAMERA;
+        c->objwf.object.subType = 0;
+        c->objwf.object.flags = 0;
+        c->objwf.object.privateFlags = 0;
+
+        /* View parameters for 640×480 (4:3 aspect) */
+        c->viewWindow.x = 1.0f;
+        c->viewWindow.y = 0.75f;  /* 480/640 */
+        c->recipViewWindow.x = 1.0f;
+        c->recipViewWindow.y = 1.0f / 0.75f;
+        c->viewOffset.x = 0.0f;
+        c->viewOffset.y = 0.0f;
+
+        /* Clip planes */
+        c->nearPlane = 1.0f;
+        c->farPlane = 1000.0f;
+        c->fogPlane = 1000.0f;
+
+        /* Perspective projection */
+        c->projectionType = 1;  /* rwPERSPECTIVE */
+
+        /* Identity view matrix */
+        write_identity_matrix(cam_va + offsetof(RwCamera, viewMatrix));
+
+        /* Z-buffer transform */
+        c->zScale = 1.0f;
+        c->zShift = 0.0f;
+
+        /* Identity device view/projection matrices */
+        write_identity_matrix(cam_va + offsetof(RwCamera, devView));
+        write_identity_matrix(cam_va + offsetof(RwCamera, devProj));
+
+        /* Raster pointers: leave as 0 (NULL) for now — our D3D8 layer
+         * handles render targets directly */
+        c->frameBuffer = 0;
+        c->zBuffer = 0;
+
+        fprintf(stderr, "  Camera 0x%X: viewWindow=(%.2f,%.2f) near=%.1f far=%.1f proj=%d\n",
+                cam_va, c->viewWindow.x, c->viewWindow.y,
+                c->nearPlane, c->farPlane, c->projectionType);
+    }
+
+    /* ── 2. D3D device context at 0x35D6A0 ──
+     * Set render_state_matrix to identity, zero timer accumulators,
+     * set transform_cache to identity. */
+    {
+        uint32_t dev_va = XBOX_D3D_DEVICE_VA;
+        uintptr_t dev = (uintptr_t)dev_va + g_xbox_mem_offset;
+        XboxD3DDevice *d = (XboxD3DDevice *)dev;
+
+        /* Identity matrices in transform cache and render state */
+        write_identity_matrix(dev_va + offsetof(XboxD3DDevice, transform_cache));
+        write_identity_matrix(dev_va + offsetof(XboxD3DDevice, render_state_matrix));
+
+        /* Zero timer accumulators (prevents garbage delta at first frame) */
+        d->timer_accum_0 = 0.0f;
+        d->timer_accum_1 = 0.0f;
+
+        /* Ensure device pointer is set */
+        BMEM32(XBOX_D3D_DEVICE_PTR_VA) = dev_va;
+
+        fprintf(stderr, "  Device 0x%X: identity matrices at +0xC60/+0xCA0, timers zeroed\n",
+                dev_va);
+    }
+
+    /* ── 3. Game render context at 0x4D6170 ──
+     * Initialize all matrix slots to identity, set viewport/scale defaults. */
+    {
+        uint32_t ctx_va = XBOX_GAME_RENDER_CTX_VA;
+        uintptr_t ctx = (uintptr_t)ctx_va + g_xbox_mem_offset;
+        RwGameRenderContext *r = (RwGameRenderContext *)ctx;
+
+        /* Identity for matrix slots at +0x500 and +0x540 */
+        write_identity_matrix(ctx_va + offsetof(RwGameRenderContext, src_matrix_0));
+        write_identity_matrix(ctx_va + offsetof(RwGameRenderContext, device_state));
+
+        /* Identity for work matrices */
+        write_identity_matrix(ctx_va + offsetof(RwGameRenderContext, work_matrix_0));
+        write_identity_matrix(ctx_va + offsetof(RwGameRenderContext, work_matrix_1));
+        write_identity_matrix(ctx_va + offsetof(RwGameRenderContext, work_matrix_2));
+        write_identity_matrix(ctx_va + offsetof(RwGameRenderContext, work_matrix_3));
+
+        /* Identity for all 4 destination matrices (+0x6E0..+0x7DF) */
+        for (int i = 0; i < 4; i++)
+            write_identity_matrix(ctx_va + 0x6E0 + i * 64);
+
+        /* Scene descriptor zeroed */
+        memset(r->scene_desc, 0, sizeof(r->scene_desc));
+
+        /* Viewport / render state defaults (from sub_0003FEE0 gen code) */
+        r->viewport_x = 0;
+        r->viewport_y = 0;
+        r->viewport_w = 0x80;     /* 128 */
+        r->viewport_h = 0x80;     /* 128 */
+        r->scale_x = 1.0f;
+        r->scale_y = 1.0f;
+        r->render_flags = 0x901;
+
+        /* Identity for extended matrix blocks at +0xA10 and +0xA50 */
+        write_identity_matrix(ctx_va + 0xA10);
+        write_identity_matrix(ctx_va + 0xA50);
+
+        fprintf(stderr, "  RenderCtx 0x%X: identity matrices, viewport=%dx%d, flags=0x%X\n",
+                ctx_va, r->viewport_w, r->viewport_h, r->render_flags);
+    }
+
+    fprintf(stderr, "=== RW State Init complete ===\n\n");
+}
 
 /* ── Frame lifecycle ────────────────────────────────────────── */
 

@@ -21,6 +21,13 @@
 extern "C" {
 #endif
 
+/* ── RW state initialization ──────────────────────────────── */
+
+/** Initialize RW camera, device context, and game render context
+ *  with valid default state so gen code doesn't crash on
+ *  uninitialized pointer chains. Call after xbox_MemoryLayoutInit(). */
+void rw_state_init(void);
+
 /* ── Frame lifecycle ───────────────────────────────────────── */
 
 /** Called from sub_00351090: render the 3D scene through our D3D8 device.
