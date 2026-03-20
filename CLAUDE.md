@@ -34,10 +34,35 @@ The goal is to translate the original x86 Xbox code into a native Windows execut
 - Addresses are always shown as hex with 0x prefix (e.g., 0x001D2807)
 - Xbox kernel function names use their original Xbox names with `xbox_` prefix when reimplemented
 
-## Current Work State (Session 42)
+## Current Work State (Session 43)
 
-### Status: Menu rendering at 60fps, manual sub_0003FEE0 override WORKING
-Game boots, reaches state 5 (menus), and NV2A push buffer data captured from xemu renders through D3D11. Full Burnout 3 main menu with textures, chyron scroll, and interactive selection at 60fps. Manual sub_0003FEE0 override enabled with proper D3D clear + render dispatch.
+### Status: PLAYABLE — driving on real track geometry at 32fps
+Game boots to menus, R key launches race, player drives on real Burnout 3 track geometry rendered through recompiled gen code pipeline. Gen code render chain (sub_00351490→sub_00351770_gen→sub_00350C10) active. Gameplay state machine transitions 5→4→5 working. Track geometry drawn via D3D8 DrawPrimitiveUP with pre-transformed vertices. Chase camera follows physics body. Pre-race cinematic plays (flyover camera cuts). 6000 verts/frame, 7 batched draws, 32fps.
+
+### Session 43 Changes (2026-03-20)
+- **Gen code render chain un-stubbed**: sub_00351490 (begin camera), sub_00351770_gen (62K scene render), sub_00350C10 (end camera) all running
+- **D3D8LTCG device context fully fixed**:
+  - GPU read pointer trick: device+0x30 → device+0x2C (eliminates PB spin loops)
+  - PB ring management: +0x24/+0x28/+0x2C/+0x30/+0x34/+0x38/+0x44/+0x48 all patched post-snapshot
+  - RT surfaces at +0x1974/+0x1978 initialized non-NULL
+  - Camera active flag (device+8 bit 14) forced per-frame
+- **24 D3D8LTCG stubs fixed**: Proper Xbox stack cleanup calling conventions (esp += 4/8/12)
+- **Gameplay state machine**: R key launches race via fe_start_race()
+  - State transitions: menu(5) → race init(4) → gameplay(5)
+  - Phase state machine (sub_001AA100): phases 1→3→4→5→6→7→9→0x13
+  - Phase 9 timeout after 30 tries (render list builder can't complete without RW track loading)
+  - g_race_init_done signal prevents state oscillation
+- **Track geometry rendering**: Direct D3D8 DrawPrimitiveUP with batched pre-transformed vertices
+  - 6000 verts/frame from 49 track chunks, 7 draw calls
+  - View-projection transform, distance culling (500 unit radius)
+  - Triangle strip → triangle list conversion
+- **Chase camera**: Physics body-based fallback with 75° FOV, heading-relative positioning
+- **Float ICALL guard**: Rejects IEEE 754 values (exponent 50-200) as vtable entries
+- **Input system**: fe_menu_is_racing() fallback for gameplay detection
+- **Race launch flow**: R key → fe_start_race → state=4 → phase 1-9 → timeout → state=5 → gameplay
+- **g_force_respawn**: Resets physics init flag when launching race (prevents boot-time flag blocking)
+- **D3D8LTCG device context reference doc**: `docs/d3d8ltcg_device_context.md` (reusable)
+- **Log noise reduced**: Mirror failures (3+50K), SKIP-READ (10+100K)
 
 ### Session 42 Changes (2026-03-17)
 - **Live render pipeline investigation**: Attempted to enable original sub_001AE6F0 call chain
