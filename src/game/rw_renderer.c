@@ -1467,9 +1467,26 @@ int rw_load_track(const char *path)
         g_scene.camera.zfar = 5000.0f;
         g_scene.camera.znear = 1.0f;
 
-        /* Set spawn position globals for physics (read by recomp_manual.c) */
-        g_track_spawn_x = g_track_data.spawn[0];
-        g_track_spawn_z = g_track_data.spawn[2];
+        /* Set spawn position from road spine. Use waypoint ~20% along the
+         * road to avoid the first few sections which may be decorative/overhead.
+         * Pick a waypoint with upward-facing road geometry nearby. */
+        if (g_track_data.spine_count > 5) {
+            int sp = g_track_data.spine_count / 5;  /* ~20% along road */
+            g_track_spawn_x = g_track_data.spine[sp].x;
+            g_track_spawn_z = g_track_data.spine[sp].z;
+            g_track_spawn_hdg = atan2f(g_track_data.spine[sp].dx, g_track_data.spine[sp].dz);
+            fprintf(stderr, "  [TRACK] Spawn: spine[%d/%d] pos=(%.1f, %.1f) hdg=%.1f°\n",
+                    sp, g_track_data.spine_count,
+                    g_track_spawn_x, g_track_spawn_z,
+                    g_track_spawn_hdg * 57.2958f);
+        } else if (g_track_data.spine_count > 0) {
+            g_track_spawn_x = g_track_data.spine[0].x;
+            g_track_spawn_z = g_track_data.spine[0].z;
+            g_track_spawn_hdg = atan2f(g_track_data.spine[0].dx, g_track_data.spine[0].dz);
+        } else {
+            g_track_spawn_x = g_track_data.spawn[0];
+            g_track_spawn_z = g_track_data.spawn[2];
+        }
         g_track_mode = 1;
 
         /* Find actual road surface Y at spawn XZ by scanning upward-facing vertices */

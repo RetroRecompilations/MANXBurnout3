@@ -2772,10 +2772,18 @@ void sub_000110E0(void)
         uint32_t phys_ptr = MEM32(0x557880 + 0x1B4);
         if (phys_ptr > 0x100 && phys_ptr < 0x3FFFFFF) {
             /* Initialize physics on first state-4 entry, and respawn
-             * when track changes (spawn coords updated by renderer). */
+             * when track changes (spawn coords updated by renderer).
+             * g_force_respawn is set by fe_start_race to re-init after boot. */
             static int _state4_init = 0;
             static float _last_spawn_x = 0, _last_spawn_z = 0;
             {
+                extern int g_force_respawn;
+                if (g_force_respawn) {
+                    _state4_init = 0;
+                    _last_spawn_x = 0;
+                    _last_spawn_z = 0;
+                    g_force_respawn = 0;
+                }
                 int needs_init = !_state4_init;
                 if (g_track_mode) {
                     if (g_track_spawn_x != _last_spawn_x || g_track_spawn_z != _last_spawn_z)

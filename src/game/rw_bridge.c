@@ -258,7 +258,8 @@ static int read_rw_camera_state(void)
      * Physics body at 0x5FFF00: +0x10=pos_x, +0x14=pos_y, +0x18=heading */
     if (cx == 0.0f && cy == 0.0f && cz == 0.0f) {
         uint32_t game_st = BMEM32(0x4D53B8);
-        if (cam_ptr == 0x4D45D0 || game_st == 4) {
+        extern int fe_menu_is_racing(void);
+        if (cam_ptr == 0x4D45D0 || game_st == 4 || fe_menu_is_racing()) {
             /* Read physics body via same path as TICK log */
             uint32_t vel_ptr = BMEM32(0x557880 + 0x1B4);
             float phys_x = 0, phys_y = 0;
@@ -275,12 +276,14 @@ static int read_rw_camera_state(void)
             float spd = (vel_ptr > 0x100 && vel_ptr < 0x3FFFFFF)
                         ? BMEMF(vel_ptr + 0x1C) : BMEMF(0x5FFF1C);
 
-            /* Place camera behind car based on heading */
-            float cam_dist = 20.0f + spd * 0.3f;
+            /* Place camera behind car based on heading.
+             * Physics uses XZ plane (phys_x=X, phys_y=Z in world).
+             * Camera Y is elevated above the car position. */
+            float cam_dist = 15.0f + fabsf(spd) * 0.2f;
             cx = phys_x - sinf(hdg) * cam_dist;
-            cy = 8.0f;  /* fixed height above ground */
+            cy = 5.0f;   /* height above car (relative, not world) */
             cz = phys_y - cosf(hdg) * cam_dist;
-            fov = 60.0f;
+            fov = 75.0f;  /* wider FOV for racing */
 
             if (cx != 0.0f || cz != 0.0f) {
                 g_cam_pos[0] = cx;
@@ -340,13 +343,14 @@ int rw_bridge_get_camera_view(float *out_matrix)
         target[1] = car_y;
         target[2] = car_z;
     } else {
-        /* Fallback: use physics body position as look-at target */
+        /* Fallback: use physics body position as look-at target.
+         * Physics: +0x10=X, +0x14=Z (world XZ plane). Y=0 (ground). */
         float phys_x = BMEMF(0x5FFF10);
-        float phys_y = BMEMF(0x5FFF14);
-        if (phys_x != 0.0f || phys_y != 0.0f) {
+        float phys_z = BMEMF(0x5FFF14);
+        if (phys_x != 0.0f || phys_z != 0.0f) {
             target[0] = phys_x;
-            target[1] = 2.0f;
-            target[2] = phys_y;
+            target[1] = 0.0f;   /* ground level */
+            target[2] = phys_z;
         } else {
             target[0] = eye[0];
             target[1] = eye[1];

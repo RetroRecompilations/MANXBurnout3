@@ -94,6 +94,7 @@ static int g_fe_screen = FE_SCREEN_MAIN;  /* Skip title, start on main menu */
 int g_fe_cursor = 0;  /* exported for PB replay cursor overlay */
 static int g_race_active = 0;
 int g_race_init_done = 0;  /* non-static: set by sub_001AA100 when phase 9 completes */
+int g_force_respawn = 0;   /* non-static: triggers physics re-init in sub_000110E0 */
 static void fe_start_race(int screen);
 static float g_fe_timer = 0.0f;
 static float g_fe_flash = 0.0f;   /* "Press Start" blink timer */
@@ -689,6 +690,7 @@ static void fe_start_race(int screen)
 
     g_race_active = 1;
     g_race_init_done = 0;  /* Reset so state forcing begins fresh */
+    g_force_respawn = 1;   /* Force physics position re-init */
     g_fe_screen = FE_SCREEN_MAIN;  /* Reset menu state for when we return */
 
     /* ── Trigger gameplay state machine transition ──
