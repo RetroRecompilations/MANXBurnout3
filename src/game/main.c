@@ -690,7 +690,7 @@ static LONG WINAPI crash_veh(PEXCEPTION_POINTERS info)
                         } else {
                             static int mirror_fail_count = 0;
                             mirror_fail_count++;
-                            if (mirror_fail_count <= 5 || (mirror_fail_count % 1000) == 0) {
+                            if (mirror_fail_count <= 3 || (mirror_fail_count % 50000) == 0) {
                                 fprintf(stderr, "  [MIRROR-FAIL] view %d at %p "
                                         "(Xbox VA 0x%08X, error %lu) [#%d]\n",
                                         mirror_idx, (void*)view_base,
@@ -722,7 +722,7 @@ static LONG WINAPI crash_veh(PEXCEPTION_POINTERS info)
             if (fault_skip_count < MAX_FAULT_SKIPS) {
                 if (veh_skip_faulting_read(info->ContextRecord)) {
                     fault_skip_count++;
-                    if (fault_skip_count <= 50 || (fault_skip_count % 10000) == 0) {
+                    if (fault_skip_count <= 10 || (fault_skip_count % 100000) == 0) {
                         HMODULE fmod = NULL;
                         GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
                                           (LPCSTR)info->ExceptionRecord->ExceptionAddress, &fmod);
@@ -1610,6 +1610,33 @@ static BOOL init_subsystems(void)
         MEM32(dev + 0x7CC) = 0;
         MEM32(dev + 0x1AD4) = 0;
 
+        /* ── PB ring management fixups (post-snapshot) ──
+         * The xemu snapshot has xemu heap pointers (0x82xxxxxx) in the PB
+         * ring management fields. These must point to our PB allocation.
+         *
+         * Critical: device+0x30 is a POINTER to the GPU read position.
+         * D3D8LTCG code spin-waits reading MEM32(*dev+0x30) until GPU
+         * catches up. We point +0x30 to +0x2C (write counter) so
+         * GPU_read == write → no pending data → no spin loop. */
+        MEM32(dev + 0x24) = pb_start;       /* PB ring start */
+        MEM32(dev + 0x28) = pb_end;         /* PB ring end */
+        MEM32(dev + 0x2C) = 0;              /* PB write sequence counter */
+        MEM32(dev + 0x30) = dev + 0x2C;     /* GPU read ptr → write counter (always caught up) */
+        MEM32(dev + 0x34) = 0;              /* fence write index */
+        MEM32(dev + 0x38) = 3;              /* fence mask (4 entries) */
+        MEM32(dev + 0x3C) = 0;              /* fence state */
+        MEM32(dev + 0x44) = pb_end - pb_start; /* PB ring size */
+        MEM32(dev + 0x48) = dev + 0x3000;   /* fence array → safe area in device */
+        MEM32(dev + 0x19FC) = 0;            /* pre-render callback = NULL */
+        MEM32(dev + 0x1DD0) = 0;            /* clear flag */
+
+        /* Double-buffered render targets (must be non-NULL for scene render) */
+        MEM32(dev + 0x1974) = 0x3A1F;       /* RT surface 0 (from xemu) */
+        MEM32(dev + 0x1978) = 0x3A25;       /* RT surface 1 (from xemu) */
+
+        fprintf(stderr, "  D3D8 PB ring: GPU_read→dev+0x2C, fence→dev+0x3000, "
+                "RT=0x3A1F/0x3A25\n");
+
         fprintf(stderr, "  D3D8 device context: at Xbox VA 0x%08X (PB 0x%08X-0x%08X)\n",
                 dev, pb_start, pb_end);
 
@@ -2263,6 +2290,19 @@ void game_frame_pump(void)
         }
     }
 
+    /* ── R key: instant race launch (works from any state) ── */
+    {
+        extern void fe_menu_force_race(void);
+        extern int fe_menu_is_racing(void);
+        static int r_key_prev = 0;
+        int r_key_now = (GetAsyncKeyState('R') & 0x8000) ? 1 : 0;
+        if (r_key_now && !r_key_prev && !fe_menu_is_racing()) {
+            fprintf(stderr, "  [KEY] R pressed — launching race!\n");
+            fe_menu_force_race();
+        }
+        r_key_prev = r_key_now;
+    }
+
     /* ── Frontend menu update (when in menu state) ── */
     {
         float frame_dt = (float)(elapsed_ms / 1000.0);
@@ -2279,12 +2319,15 @@ void game_frame_pump(void)
         #define XINP_MEMF(a)  (*(volatile float*)((uintptr_t)(a) + g_xbox_mem_offset))
         #define XINP_MEM8(a)  (*(volatile uint8_t*)((uintptr_t)(a) + g_xbox_mem_offset))
 
-        /* Only inject input during gameplay. xemu Session 31: B8 stays at 5
-         * during regular races (only crash mode sets B8=4). The real gameplay
-         * indicator is camera ptr: 0x4D45D0 = gameplay, 0x4D4008 = menus. */
+        /* Input injection during gameplay. Multiple detection methods:
+         * - game_st == 4: crash mode (from xemu session 31)
+         * - cam_ptr == 0x4D45D0: gameplay camera active
+         * - fe_menu_is_racing(): race launched from menu (R key or Enter) */
         uint32_t game_st = XINP_MEM32(0x4D53B8);
         uint32_t cam_ptr = XINP_MEM32(0x4D5370);
-        if (game_st == 4 || cam_ptr == 0x4D45D0) {
+        extern int fe_menu_is_racing(void);
+        int in_gameplay = (game_st == 4 || cam_ptr == 0x4D45D0 || fe_menu_is_racing());
+        if (in_gameplay) {
             int32_t throttle = 0;  /* positive = gas */
             int32_t steering = 0;  /* positive = right */
 
@@ -2360,6 +2403,32 @@ void game_frame_pump(void)
 
             /* V key: (reserved, 3D mode is always on now) */
             {
+            }
+
+            /* G key: toggle gen render chain (sub_00351490/sub_00351770_gen) */
+            {
+                extern int g_gen_render_chain_enabled;
+                static int g_key_prev = 0;
+                int g_key_now = (GetAsyncKeyState('G') & 0x8000) ? 1 : 0;
+                if (g_key_now && !g_key_prev) {
+                    g_gen_render_chain_enabled = !g_gen_render_chain_enabled;
+                    fprintf(stderr, "  [RENDER] Gen render chain %s\n",
+                            g_gen_render_chain_enabled ? "ENABLED" : "DISABLED");
+                }
+                g_key_prev = g_key_now;
+            }
+
+            /* R key: instant race launch (bypasses menu navigation) */
+            {
+                extern void fe_menu_force_race(void);
+                extern int fe_menu_is_racing(void);
+                static int r_key_prev = 0;
+                int r_key_now = (GetAsyncKeyState('R') & 0x8000) ? 1 : 0;
+                if (r_key_now && !r_key_prev && !fe_menu_is_racing()) {
+                    fprintf(stderr, "  [KEY] R pressed — launching race!\n");
+                    fe_menu_force_race();
+                }
+                r_key_prev = r_key_now;
             }
 
             /* T key: cycle to next track (in 3D mode) */

@@ -92,6 +92,10 @@ int rw_bridge_get_camera_view(float *out_matrix);
  *  out_matrix must point to 16 floats. Returns 1 if valid. */
 int rw_bridge_get_camera_proj(float *out_matrix);
 
+/** Inject track geometry into NV2A push buffer as INLINE_ARRAY commands.
+ *  Returns number of vertices written (0 if no track loaded). */
+int rw_bridge_inject_track_to_pb(void);
+
 #ifdef __cplusplus
 }
 #endif

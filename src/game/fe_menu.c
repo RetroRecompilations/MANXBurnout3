@@ -24,6 +24,7 @@
 /* ── Xbox memory access ──────────────────────────────────────── */
 extern ptrdiff_t g_xbox_mem_offset;
 #define FMEM32(addr) (*(volatile uint32_t *)((uintptr_t)(addr) + g_xbox_mem_offset))
+#define FMEM8(addr)  (*(volatile uint8_t  *)((uintptr_t)(addr) + g_xbox_mem_offset))
 
 /* ── Game state addresses ────────────────────────────────────── */
 #define ADDR_CAM_PTR     0x4D5370   /* Active camera pointer */
@@ -92,6 +93,7 @@ static const char *g_single_menu_labels[FE_SINGLE_ITEMS] = {
 static int g_fe_screen = FE_SCREEN_MAIN;  /* Skip title, start on main menu */
 int g_fe_cursor = 0;  /* exported for PB replay cursor overlay */
 static int g_race_active = 0;
+int g_race_init_done = 0;  /* non-static: set by sub_001AA100 when phase 9 completes */
 static void fe_start_race(int screen);
 static float g_fe_timer = 0.0f;
 static float g_fe_flash = 0.0f;   /* "Press Start" blink timer */
@@ -356,15 +358,73 @@ void fe_menu_update(float dt)
     g_fe_timer += dt;
     g_fe_flash += dt;
 
-    /* If racing, check for Escape to return to menus */
+    /* If racing, force state machine values every frame.
+     * The gen code in sub_000165F0 checks MEM8(0x4D53BC) (mode flag) and
+     * MEM8(0x4A4B90) (loaded flag) before allowing state transitions.
+     * Something in the state-5 gen code path clears these, so we must
+     * re-assert them every frame until the transition to state 4 takes. */
     if (g_race_active) {
+        uint32_t cur_state = FMEM32(ADDR_GAME_STATE);
+
+        /* Force state 4 transition ONCE, then let the state machine run.
+         * Track whether we've already triggered the 4→5 transition.
+         * (g_race_init_done is file-scope, reset in fe_menu_stop_race) */
+        static int force_attempts_local_local = 0;
+
+        if (!g_race_init_done) {
+            force_attempts_local_local++;
+            if (cur_state == 5) {
+                /* Haven't entered state 4 yet — force transition */
+                FMEM8(0x4D53BC) = 1;         /* mode flag: racing */
+                FMEM8(0x4A4B90) = 1;         /* loaded flag */
+                FMEM32(0x4D53B4) = 4;        /* pending state → race init */
+                FMEM32(0x4D53B8) = 4;        /* current state → race init (FORCE) */
+                FMEM32(0x4D5370) = 0x4D45D0; /* camera → gameplay */
+
+                static int force_count = 0;
+                force_count++;
+                if (force_count <= 5 || (force_count % 300) == 0)
+                    fprintf(stderr, "  [FE-RACE] Forcing state=4 #%d\n", force_count);
+            } else if (cur_state == 4) {
+                /* In state 4 — race init in progress, let gen code run */
+                static int init_logged = 0;
+                if (!init_logged) {
+                    fprintf(stderr, "  [FE-RACE] State transitioned to 4 (race init)!\n");
+                    init_logged = 1;
+                }
+            }
+        }
+
+        /* Detect 4→5 transition: race init complete, now in gameplay.
+         * Wait for the state machine to ACTUALLY go through state 4 first —
+         * check that phase was reset to 1 and progressed back to 0x13. */
+        static int force_attempts_local = 0;
+        if (cur_state == 5 && !g_race_init_done && force_attempts_local > 20) {
+            uint32_t cam = FMEM32(0x4D5370);
+            uint32_t phase = FMEM32(0x752D84);
+            if (phase >= 0x13) {
+                g_race_init_done = 1;
+                force_attempts_local = 0;
+                /* Keep gameplay state active */
+                FMEM32(0x4D5370) = 0x4D45D0; /* camera → gameplay */
+                fprintf(stderr, "  [FE-RACE] Race init COMPLETE! State 5 (gameplay), "
+                        "cam=0x%08X phase=0x%X\n", cam, phase);
+            }
+        }
+
+        /* Keep camera in gameplay mode while racing */
+        if (g_race_init_done) {
+            FMEM32(0x4D5370) = 0x4D45D0;
+        }
+
+        /* ESC returns to menus */
         static int esc_prev_race = 0;
         int esc_now_race = (GetAsyncKeyState(VK_ESCAPE) & 0x8000);
         if (esc_now_race && !esc_prev_race) {
-            fe_menu_stop_race();  /* public function defined below */
+            fe_menu_stop_race();
         }
         esc_prev_race = esc_now_race;
-        return;  /* Don't process menu input during gameplay */
+        return;
     }
 
     /* Edge-detected input — arrow keys + WASD + Enter/Esc */
@@ -447,24 +507,31 @@ void fe_menu_update(float dt)
     case FE_SCREEN_RACE_SETUP:
     case FE_SCREEN_TIME_ATTACK:
     case FE_SCREEN_ROAD_RAGE:
-    case FE_SCREEN_DRIVER_DETAILS:
-        /* Sub-screens: ESC goes back to parent */
+        /* Race mode sub-screens: Enter launches race, ESC goes back */
+        if (enter_edge) {
+            fprintf(stderr, "[FE-MENU] Launching race from screen %d!\n", g_fe_screen);
+            fe_start_race(g_fe_screen);
+        }
         if (esc_edge) {
             if (g_fe_screen == FE_SCREEN_WORLD_TOUR) {
                 g_fe_screen = FE_SCREEN_MAIN;
                 g_fe_cursor = 0;
-            } else if (g_fe_screen == FE_SCREEN_DRIVER_DETAILS) {
-                g_fe_screen = FE_SCREEN_MAIN;
-                g_fe_cursor = 4;
             } else {
-                /* Race/Time Attack/Road Rage/Crash -> Single Event */
                 int back_cursor = 0;
                 if (g_fe_screen == FE_SCREEN_TIME_ATTACK)  back_cursor = 1;
                 if (g_fe_screen == FE_SCREEN_ROAD_RAGE)    back_cursor = 2;
-                if (g_fe_screen == FE_SCREEN_CRASH_SELECT) back_cursor = 3;
                 g_fe_screen = FE_SCREEN_SINGLE;
                 g_fe_cursor = back_cursor;
             }
+            fprintf(stderr, "[FE-MENU] Back -> screen %d\n", g_fe_screen);
+        }
+        break;
+
+    case FE_SCREEN_DRIVER_DETAILS:
+        /* Non-race sub-screen: ESC goes back to main */
+        if (esc_edge) {
+            g_fe_screen = FE_SCREEN_MAIN;
+            g_fe_cursor = 4;
             fprintf(stderr, "[FE-MENU] Back -> screen %d\n", g_fe_screen);
         }
         break;
@@ -632,39 +699,70 @@ static void fe_start_race(int screen)
     }
 
     g_race_active = 1;
+    g_race_init_done = 0;  /* Reset so state forcing begins fresh */
     g_fe_screen = FE_SCREEN_MAIN;  /* Reset menu state for when we return */
 
-    /* ── Set crash mode state in Xbox memory ── */
-    if (screen == FE_SCREEN_CRASH_SELECT) {
-        /* Write pending state = 4 (crash mode) to trigger state machine.
-         *
-         * State machine flow:
-         *   current state 5 → detect pending != current → set current = 4
-         *   → case 3 (state-1) → calls sub_001AA100 (phase state machine)
-         *   → phases 1-9 → returns 1 → transitions to state 5 (gameplay)
-         *
-         * Key addresses:
-         *   0x4D53B4 = pending state (ebp + 0x2E214)
-         *   0x4D53B8 = current state (ebp + 0x2E218)
-         *   0x4D53BC = mode flag (1=racing, checked by sub_00016EF0)
-         *   0x4D5370 = camera ptr (0x4D45D0 = gameplay)
-         *   0x411B20 = race active flag
-         */
-        FMEM32(0x4D53B4) = 4;         /* pending state → crash init */
-        FMEM32(0x4A4B90) = 1;         /* "loaded" flag (enables state transitions) */
-        FMEM32(0x4D53BC) = 1;         /* mode flag: racing/crash active */
-        FMEM32(0x4D5370) = 0x4D45D0;  /* camera → gameplay */
-        FMEM32(0x411B20) = 1;         /* race active */
+    /* ── Trigger gameplay state machine transition ──
+     *
+     * State machine flow (sub_000165F0):
+     *   current state 5 → detect pending != current → set current = 4
+     *   → case 3 (state-1=3) → calls sub_001AA100 (phase state machine)
+     *   → phases 1-9 → returns 1 → transitions to state 5 (gameplay)
+     *
+     * Key addresses:
+     *   0x4D53B4 = pending state (ebp + 0x2E214)
+     *   0x4D53B8 = current state (ebp + 0x2E218)
+     *   0x4D53BC = mode flag (1=racing, checked by sub_00016EF0)
+     *   0x4D5370 = camera ptr (0x4D45D0 = gameplay)
+     *   0x411B20 = race active flag
+     *   0x411BE0 = race type (0=race, 1=time attack, 2=road rage, 3=crash)
+     */
+    FMEM32(0x4D53B4) = 4;         /* pending state → race/crash init */
+    FMEM32(0x4A4B90) = 1;         /* "loaded" flag (enables state transitions) */
+    FMEM32(0x4D53BC) = 1;         /* mode flag: racing active */
+    FMEM32(0x4D5370) = 0x4D45D0;  /* camera → gameplay */
+    FMEM32(0x411B20) = 1;         /* race active */
+    FMEM32(0x5FFF1C) = 0;         /* speed = 0 (start from rest) */
 
-        /* Don't reset physics position — track spawn already set it.
-         * Just zero speed so the car starts from rest. */
-        FMEM32(0x5FFF1C) = 0;         /* speed = 0 */
+    /* Reset sub_001AA100 phase state machine to phase 1.
+     * After boot, the phase is at 0x13 (19, complete). Without resetting,
+     * case 3 calls 1AA100 which returns 1 immediately → state bounces
+     * back to 5 before any initialization can happen.
+     * Phase address = game_base (0x60EA00) + 0x144384 = 0x752D84 */
+    FMEM32(0x752D84) = 1;         /* reset 1AA100 phase → 1 (scene init) */
+    /* Also reset the render list state that phase 9 populates */
+    FMEM32(0x60EA00 + 0x12ADB0 + 0x08) = 0;  /* render list state → 0 */
 
-        fprintf(stderr, "[FE-MENU] Crash mode: state=4 pending, cam=gameplay, race=active\n");
-        fprintf(stderr, "[FE-MENU] CRASH MODE! Drive into traffic. ESC to return.\n");
+    /* Set race type based on menu selection */
+    switch (screen) {
+    case FE_SCREEN_CRASH_SELECT:
+        FMEM32(0x411BE0) = 3;     /* crash junction */
+        fprintf(stderr, "[FE-MENU] CRASH MODE! Drive into traffic.\n");
+        break;
+    case FE_SCREEN_RACE_SETUP:
+        FMEM32(0x411BE0) = 0;     /* standard race */
+        fprintf(stderr, "[FE-MENU] RACE MODE! 3 laps.\n");
+        break;
+    case FE_SCREEN_TIME_ATTACK:
+        FMEM32(0x411BE0) = 1;     /* time attack / burning lap */
+        fprintf(stderr, "[FE-MENU] TIME ATTACK!\n");
+        break;
+    case FE_SCREEN_ROAD_RAGE:
+        FMEM32(0x411BE0) = 2;     /* road rage */
+        fprintf(stderr, "[FE-MENU] ROAD RAGE! Take down opponents.\n");
+        break;
+    case FE_SCREEN_WORLD_TOUR:
+        FMEM32(0x411BE0) = 0;     /* world tour = standard race sequence */
+        fprintf(stderr, "[FE-MENU] WORLD TOUR!\n");
+        break;
+    default:
+        FMEM32(0x411BE0) = 0;
+        break;
     }
 
-    fprintf(stderr, "[FE-MENU] Controls: WASD=drive, Shift=boost, ESC=quit\n");
+    fprintf(stderr, "[FE-MENU] State: pending=4, cam=gameplay, race_type=%d\n",
+            (int)FMEM32(0x411BE0));
+    fprintf(stderr, "[FE-MENU] Controls: WASD=drive, Shift=boost, ESC=return to menu\n");
 
     /* Update window title */
     HWND hwnd = FindWindowA(NULL, "Burnout 3: Takedown - Static Recompilation");
@@ -680,10 +778,17 @@ int fe_menu_is_racing(void)
     return g_race_active;
 }
 
+void fe_menu_force_race(void)
+{
+    fprintf(stderr, "[FE-MENU] Force race launch (R key)!\n");
+    fe_start_race(FE_SCREEN_RACE_SETUP);
+}
+
 void fe_menu_stop_race(void)
 {
     if (!g_race_active) return;
     g_race_active = 0;
+    g_race_init_done = 0;
 
     /* Re-enable PB replay */
     extern void nv2a_pb_replay_set_active(int active);

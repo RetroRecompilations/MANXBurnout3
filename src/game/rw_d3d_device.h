@@ -57,9 +57,18 @@ typedef struct XboxD3DDevice {
     float timer_accum_0;        /* +0xEF8 */
     float timer_accum_1;        /* +0xEFC */
 
-    uint8_t  _pad2[0xB04];     /* +0xF00..+0x1A03 */
+    uint8_t  _pad2[0xA74];     /* +0xF00..+0x1973 */
 
-    /* ── Render target surfaces ──
+    /* ── Double-buffered render target surfaces ──
+     * sub_00351090 gen code alternates: device + (frame_counter & 1)*4 + 0x1974.
+     * If NULL, the scene render (sub_00351770) is skipped entirely.
+     * From xemu snapshot: small Xbox VAs (0x3A1F, 0x3A25). */
+    uint32_t rt_surface_0;      /* +0x1974 — render target surface (frame 0) */
+    uint32_t rt_surface_1;      /* +0x1978 — render target surface (frame 1) */
+
+    uint8_t  _pad2b[0x88];     /* +0x197C..+0x1A03 */
+
+    /* ── Render target surfaces (swap state) ──
      * sub_0034CBF0 swaps these for render target changes.
      * device+0x1A04 and +0x1A08 are surface pointers. */
     uint32_t render_target_surface; /* +0x1A04 — Xbox VA → D3DSurface */
@@ -79,6 +88,10 @@ _Static_assert(offsetof(XboxD3DDevice, timer_accum_0) == 0xEF8,
                "XboxD3DDevice::timer_accum_0 at +0xEF8");
 _Static_assert(offsetof(XboxD3DDevice, timer_accum_1) == 0xEFC,
                "XboxD3DDevice::timer_accum_1 at +0xEFC");
+_Static_assert(offsetof(XboxD3DDevice, rt_surface_0) == 0x1974,
+               "XboxD3DDevice::rt_surface_0 at +0x1974");
+_Static_assert(offsetof(XboxD3DDevice, rt_surface_1) == 0x1978,
+               "XboxD3DDevice::rt_surface_1 at +0x1978");
 _Static_assert(offsetof(XboxD3DDevice, render_target_surface) == 0x1A04,
                "XboxD3DDevice::render_target_surface at +0x1A04");
 _Static_assert(offsetof(XboxD3DDevice, depth_stencil_surface) == 0x1A08,

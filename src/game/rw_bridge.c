@@ -155,11 +155,26 @@ void rw_state_init(void)
         d->timer_accum_0 = 0.0f;
         d->timer_accum_1 = 0.0f;
 
+        /* Double-buffered render targets: must be non-NULL or sub_00351090
+         * gen code skips the scene render entirely.
+         * Values from xemu snapshot during menu rendering. */
+        d->rt_surface_0 = 0x3A1F;  /* fake non-NULL surface (from xemu) */
+        d->rt_surface_1 = 0x3A25;  /* fake non-NULL surface (from xemu) */
+
+        /* NOTE: Camera active flag (device+8 bit 14) is set per-frame in
+         * sub_00351090 because the xemu device snapshot overwrites device+8
+         * after this init runs. */
+
+        /* NOTE: PB ring fixups (device+0x30, +0x24, +0x48, etc.) are done in
+         * main.c AFTER the xemu device snapshot loads — see "PB ring management
+         * fixups (post-snapshot)" section. Doing it here would be overwritten. */
+
         /* Ensure device pointer is set */
         BMEM32(XBOX_D3D_DEVICE_PTR_VA) = dev_va;
 
-        fprintf(stderr, "  Device 0x%X: identity matrices at +0xC60/+0xCA0, timers zeroed\n",
-                dev_va);
+        fprintf(stderr, "  Device 0x%X: identity matrices at +0xC60/+0xCA0, "
+                "timers zeroed, RT surfaces=0x%X/0x%X\n",
+                dev_va, d->rt_surface_0, d->rt_surface_1);
     }
 
     /* ── 3. Game render context at 0x4D6170 ──
@@ -689,4 +704,156 @@ int rw_bridge_im3d_render(int prim_type, const RwIm3DVertex *verts,
     }
 
     return 1;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * Track Geometry → NV2A Push Buffer Injection
+ *
+ * Writes track vertex data as NV2A INLINE_ARRAY commands directly
+ * into the D3D8LTCG push buffer. The existing parse_live_pushbuffer()
+ * picks these up and routes through pgraph_d3d11 → D3D11.
+ *
+ * Vertex format: 5 dwords per vertex (X_screen, Y_screen, U, V, Color)
+ * matching the NV2A translator's expected INLINE_ARRAY format.
+ * ═══════════════════════════════════════════════════════════════ */
+
+#include "track_loader.h"
+
+/* NV2A PB command helpers */
+#define NV2A_METHOD_INC(count, method, subchan) \
+    (((count) << 18) | ((method) & 0x1FFC) | ((subchan) << 13))
+#define NV2A_METHOD_NI(count, method, subchan) \
+    (0x40000000 | ((count) << 18) | ((method) & 0x1FFC) | ((subchan) << 13))
+#define NV2A_BEGIN_END   0x17FC
+#define NV2A_INLINE_ARRAY 0x1818
+#define NV2A_DRAW_MODE_TRILIST 5
+
+/* Float-to-uint32 bit cast */
+static inline uint32_t f2u(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
+
+/* Simple 4x4 matrix × vec4 (column-major, matching mat4_multiply) */
+static void bridge_transform_point(const float *m, float x, float y, float z,
+                                    float *ox, float *oy, float *oz, float *ow)
+{
+    *ox = m[0]*x + m[4]*y + m[8]*z  + m[12];
+    *oy = m[1]*x + m[5]*y + m[9]*z  + m[13];
+    *oz = m[2]*x + m[6]*y + m[10]*z + m[14];
+    *ow = m[3]*x + m[7]*y + m[11]*z + m[15];
+}
+
+int rw_bridge_inject_track_to_pb(void)
+{
+    /* Access the track data loaded by rw_renderer */
+    extern int g_track_loaded;
+    extern TrackData g_track_data;
+    if (!g_track_loaded || g_track_data.chunk_count == 0)
+        return 0;
+
+    /* Get PB write cursor */
+    uint32_t pb_base = BMEM32(0x35D69C);
+    uint32_t pb_write = BMEM32(0x35D6A0);
+    uint32_t pb_end = pb_base + 0x400000;
+
+    /* Build camera view-projection matrix */
+    float view[16], proj[16], vp[16];
+    if (!rw_bridge_get_camera_view(view) || !rw_bridge_get_camera_proj(proj))
+        return 0;
+    mat4_multiply(vp, proj, view);
+
+    int total_verts_written = 0;
+    const int MAX_VERTS_PER_FRAME = 3000;
+
+    /* Player position for distance culling */
+    float player_x = BMEMF(0x5FFF10);
+    float player_z = BMEMF(0x5FFF14);
+    float cull_dist_sq = 400.0f * 400.0f;
+
+    for (int ci = 0; ci < g_track_data.chunk_count && total_verts_written < MAX_VERTS_PER_FRAME; ci++) {
+        TrackChunk *chunk = &g_track_data.chunks[ci];
+        if (!chunk->vertices || chunk->vertex_count < 3 || !chunk->indices)
+            continue;
+
+        /* Distance cull */
+        float dx = chunk->center[0] - player_x;
+        float dz = chunk->center[2] - player_z;
+        if (dx*dx + dz*dz > cull_dist_sq)
+            continue;
+
+        /* Process triangle strip indices → individual triangles in PB */
+        for (uint32_t i = 0; i + 2 < chunk->index_count && total_verts_written < MAX_VERTS_PER_FRAME; i++) {
+            uint16_t i0 = chunk->indices[i];
+            uint16_t i1 = chunk->indices[i + 1];
+            uint16_t i2 = chunk->indices[i + 2];
+
+            /* Skip degenerate triangles */
+            if (i0 == i1 || i1 == i2 || i0 == i2) continue;
+            if (i0 >= chunk->vertex_count || i1 >= chunk->vertex_count || i2 >= chunk->vertex_count) continue;
+
+            /* Flip winding for odd triangles in strip */
+            if (i & 1) { uint16_t t = i1; i1 = i2; i2 = t; }
+
+            /* Transform 3 vertices to screen space */
+            uint16_t idx[3] = { i0, i1, i2 };
+            float sx[3], sy[3], su[3], sv[3];
+            uint32_t sc[3];
+            int visible = 1;
+
+            for (int v = 0; v < 3; v++) {
+                TrackVertex *tv = &chunk->vertices[idx[v]];
+                float cx, cy, cz, cw;
+                bridge_transform_point(vp, tv->x, tv->y, tv->z, &cx, &cy, &cz, &cw);
+                if (cw < 0.1f) { visible = 0; break; }
+                float inv_w = 1.0f / cw;
+                sx[v] = (cx * inv_w * 0.5f + 0.5f) * 640.0f;
+                sy[v] = (1.0f - (cy * inv_w * 0.5f + 0.5f)) * 480.0f;
+                su[v] = tv->u;
+                sv[v] = tv->v;
+                sc[v] = tv->color ? tv->color : 0xFF808080;
+            }
+            if (!visible) continue;
+
+            /* Check PB space: 2 + 1 + 15 + 2 = 20 dwords */
+            if (pb_write + 20 * 4 >= pb_end - 256) break;
+
+            /* BEGIN(TRILIST) */
+            BMEM32(pb_write) = NV2A_METHOD_INC(1, NV2A_BEGIN_END, 0);
+            BMEM32(pb_write + 4) = NV2A_DRAW_MODE_TRILIST;
+            pb_write += 8;
+
+            /* INLINE_ARRAY: 15 dwords (3 verts × 5) non-increasing */
+            BMEM32(pb_write) = NV2A_METHOD_NI(15, NV2A_INLINE_ARRAY, 0);
+            pb_write += 4;
+
+            for (int v = 0; v < 3; v++) {
+                BMEM32(pb_write + 0)  = f2u(sx[v]);
+                BMEM32(pb_write + 4)  = f2u(sy[v]);
+                BMEM32(pb_write + 8)  = f2u(su[v]);
+                BMEM32(pb_write + 12) = f2u(sv[v]);
+                BMEM32(pb_write + 16) = sc[v];
+                pb_write += 20;
+            }
+
+            /* END */
+            BMEM32(pb_write) = NV2A_METHOD_INC(1, NV2A_BEGIN_END, 0);
+            BMEM32(pb_write + 4) = 0;
+            pb_write += 8;
+
+            total_verts_written += 3;
+        }
+    }
+
+    /* Update PB write cursor */
+    BMEM32(0x35D6A0) = pb_write;
+    uint32_t dev_va = BMEM32(0x35FB48);
+    if (dev_va >= 0x10000 && dev_va < 0x4000000)
+        BMEM32(dev_va + 0x00) = pb_write;
+
+    static uint32_t inject_count = 0;
+    inject_count++;
+    if (inject_count <= 3 || (inject_count % 300) == 0)
+        fprintf(stderr, "  [PB-INJECT] #%u: %d verts from %d chunks, pb_used=%u\n",
+                inject_count, total_verts_written,
+                g_track_data.chunk_count, pb_write - pb_base);
+
+    return total_verts_written;
 }

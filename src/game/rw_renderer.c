@@ -150,14 +150,14 @@ static RW_Mesh *g_player_mesh = NULL;
 static RW_Mesh *g_traffic_meshes[MAX_TRAFFIC_MESHES];
 static int g_traffic_mesh_count = 0;
 
-/* Track geometry */
+/* Track geometry (non-static: accessed by rw_bridge.c for PB injection) */
 #define MAX_TRACK_CHUNKS 2000
-static TrackData g_track_data;
+TrackData g_track_data;
 static RW_Mesh *g_track_meshes[MAX_TRACK_CHUNKS];
 static BGV_Vertex *g_track_bgv_verts[MAX_TRACK_CHUNKS];  /* CPU-side data (kept alive for mesh) */
 static uint16_t *g_track_bgv_idxs[MAX_TRACK_CHUNKS];
 static int g_track_mesh_count = 0;
-static int g_track_loaded = 0;
+int g_track_loaded = 0;
 static int g_track_visible = 1;
 static StaticTexDict g_static_textures;
 

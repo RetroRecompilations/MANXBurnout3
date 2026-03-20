@@ -2103,83 +2103,135 @@ void sub_001E7B10(void)
  * Original: 0x00351090 - 0x00351173 (227 bytes)
  * Source: RenderWare camera update / scene render orchestrator
  *
- * Original flow:
- *   1. esi = [0x35FB48] (RW current camera)
- *   2. Pre-render hook (sub_00359740) if state flags set
- *   3. If camera active (flags bit 14):
- *      a. sub_00351490(0) - begin camera update
- *      b. sub_00351770(render_list) - RENDER THE SCENE (62K NV2A function)
- *      c. sub_00350C10(swap_flag) - end camera update + show raster
- *   4. Increment frame counter at camera+0x2478
- *   5. Post-render hook if needed
- *
- * Our override: skip the NV2A rendering (sub_00351490/sub_00351770/sub_00350C10)
- * but maintain the state the game expects (frame counter, flags).
- * The actual D3D11 rendering happens in game_frame_pump() via sub_000110E0.
+ * Gen code flow (from recomp_0022.c loc_003510BF..loc_003510F5):
+ *   1. esi = [0x35FB48] (device context at 0x35D6A0)
+ *   2. Pre-render hook (sub_00359740) if device+0x8D8 set
+ *   3. If camera active (device+8 bit 14 = 0x4000):
+ *      a. sub_00351490(0) - begin camera (NV2A state setup)
+ *      b. Check device + (frame_counter-1 & 1)*4 + 0x1974 (RT surface)
+ *      c. If non-NULL: sub_00351770_gen(1) - RENDER THE SCENE (62K)
+ *      d. Increment frame counter at device+0x2478
+ *   4. sub_00350C10(swap_flag) - end camera / show raster
+ *   5. Bridge present for D3D11 output
  *
  * Convention: cdecl, 1 param on stack (swap_flag), ret 4
  */
 extern ptrdiff_t g_xbox_mem_offset;
+extern void sub_00351770_gen(void);
+
+/* Gate for enabling the gen code render chain.
+ * 0 = safe mode (bridge only, no gen calls)
+ * 1 = call sub_00351490/sub_00351770_gen/sub_00350C10
+ * Auto-enables after 60 frames of warmup. Toggle with G key. */
+int g_gen_render_chain_enabled = 0;
 
 void sub_00351090(void)
 {
-    uint32_t camera_xbox_va;
+    uint32_t dev_va;
     uint32_t swap_flag;
     static uint32_t call_count = 0;
 
     call_count++;
 
-    /* Read RW global camera pointer from [0x35FB48].
-     * This may be a native pointer (from heap alloc) rather than an Xbox VA.
-     * If it's > 0x4000000 (64MB), it's likely a native address that needs
-     * to be converted to Xbox VA by subtracting g_xbox_mem_offset. */
-    camera_xbox_va = MEM32(0x35FB48);
+    /* Auto-enable gen render chain after warmup */
+    if (call_count == 60 && !g_gen_render_chain_enabled) {
+        g_gen_render_chain_enabled = 1;
+        fprintf(stderr, "  [RW-CAM] Auto-enabling gen render chain at frame %u\n", call_count);
+    }
 
+    /* Read device pointer from [0x35FB48], convert mirror addresses */
+    dev_va = MEM32(0x35FB48);
     swap_flag = MEM32(esp + 4);
 
-    /* Check if camera pointer is a native address and convert.
-     * Native addresses in memory mirrors need modulo 0x4000000 (64MB)
-     * to unwrap back to Xbox VA space. */
-    if (camera_xbox_va > 0x4000000 && g_xbox_mem_offset > 0) {
+    if (dev_va > 0x4000000 && g_xbox_mem_offset > 0) {
         uint32_t _off32 = (uint32_t)g_xbox_mem_offset;
-        if (camera_xbox_va >= _off32) {
-            uint32_t maybe_xbox_va = (camera_xbox_va - _off32) % 0x04000000u;
-            if (maybe_xbox_va >= 0x10000 && maybe_xbox_va < 0x4000000) {
-                camera_xbox_va = maybe_xbox_va;
-            }
+        if (dev_va >= _off32) {
+            uint32_t maybe = (dev_va - _off32) % 0x04000000u;
+            if (maybe >= 0x10000 && maybe < 0x4000000)
+                dev_va = maybe;
         }
     }
+
+    /* Default swap_flag to 5 if 0 (matches gen code loc_003510BA) */
+    uint32_t ebx_flag = swap_flag ? swap_flag : 5;
 
     if (call_count <= 5 || (call_count % 500) == 0) {
-        fprintf(stderr, "  [RW-CAM] sub_00351090 #%u: raw=0x%08X xbox_va=0x%08X swap=%u",
-                call_count, MEM32(0x35FB48), camera_xbox_va, swap_flag);
-        if (camera_xbox_va > 0x10000 && camera_xbox_va < 0x4000000) {
-            uint32_t flags = MEM32(camera_xbox_va + 8);
-            uint32_t frame = MEM32(camera_xbox_va + 0x2478);
-            fprintf(stderr, " flags=0x%08X frame=%u", flags, frame);
-        }
-        fprintf(stderr, "\n");
+        uint32_t flags = (dev_va > 0x10000 && dev_va < 0x4000000) ? MEM32(dev_va + 8) : 0;
+        uint32_t frame = (dev_va > 0x10000 && dev_va < 0x4000000) ? MEM32(dev_va + 0x2478) : 0;
+        uint32_t rt0 = (dev_va > 0x10000 && dev_va < 0x4000000) ? MEM32(dev_va + 0x1974) : 0;
+        uint32_t rt1 = (dev_va > 0x10000 && dev_va < 0x4000000) ? MEM32(dev_va + 0x1978) : 0;
+        fprintf(stderr, "  [RW-CAM] sub_00351090 #%u: dev=0x%08X flags=0x%X frame=%u "
+                "swap=%u RT=0x%X/0x%X gen=%d\n",
+                call_count, dev_va, flags, frame, ebx_flag, rt0, rt1,
+                g_gen_render_chain_enabled);
     }
 
-    /* Maintain camera state: increment frame counter if camera is valid */
-    if (camera_xbox_va > 0x10000 && camera_xbox_va < 0x4000000) {
-        uint32_t flags = MEM32(camera_xbox_va + 8);
+    if (dev_va < 0x10000 || dev_va >= 0x4000000)
+        goto done;
 
-        /* Check camera active flag (bit 14 = 0x4000) */
-        if (flags & 0x4000) {
-            MEM32(camera_xbox_va + 0x2478) = MEM32(camera_xbox_va + 0x2478) + 1;
+    /* Force camera active flag (bit 14 = 0x4000) at device+8.
+     * The xemu device snapshot overwrites this after rw_state_init,
+     * and the snapshot value (0xF81000 = PB base) doesn't have bit 14 set.
+     * Gen code checks: if (TEST_Z(HI8(MEM32(esi+8)), 0x40)) skip render. */
+    MEM32(dev_va + 8) = MEM32(dev_va + 8) | 0x4000;
+
+    /* Also ensure render target surfaces stay non-NULL (other gen code may clear them) */
+    if (MEM32(dev_va + 0x1974) == 0) MEM32(dev_va + 0x1974) = 0x3A1F;
+    if (MEM32(dev_va + 0x1978) == 0) MEM32(dev_va + 0x1978) = 0x3A25;
+
+    if (g_gen_render_chain_enabled && (ebx_flag & 3)) {
+        /* ═══ GEN CODE RENDER CHAIN ═══
+         * Calls the real D3D8LTCG pipeline. Requires fully initialized device
+         * context — sub_00351490 walks deep pointer chains in the device state.
+         * Currently gated behind g_gen_render_chain_enabled (G key toggle). */
+
+        /* Step A: sub_00351490(0) — begin camera (NV2A state setup) */
+        PUSH32(esp, 0);
+        PUSH32(esp, 0); sub_00351490();
+
+        /* Step B: Check render target surface (double-buffered) */
+        {
+            uint32_t frame_counter = MEM32(dev_va + 0x2478);
+            uint32_t rt_idx = (frame_counter - 1) & 1;
+            uint32_t rt_surface = MEM32(dev_va + rt_idx * 4 + 0x1974);
+
+            if (rt_surface != 0) {
+                /* Step C: sub_00351770_gen(1) — SCENE RENDER (62K) */
+                eax = 1;
+                PUSH32(esp, 1);
+                PUSH32(esp, 0); sub_00351770_gen();
+
+                if (call_count <= 5 || (call_count % 500) == 0)
+                    fprintf(stderr, "  [RW-CAM] sub_00351770_gen returned, eax=0x%X\n", eax);
+            }
         }
+
+        /* Step D: Increment frame counter */
+        MEM32(dev_va + 0x2478) = MEM32(dev_va + 0x2478) + 1;
+
+        /* Step E: sub_00350C10(swap_flag) — end camera */
+        PUSH32(esp, ebx_flag);
+        PUSH32(esp, 0); sub_00350C10();
+    } else {
+        /* ═══ SAFE MODE (default) ═══
+         * Just maintain frame counter. Bridge handles D3D11 rendering. */
+        MEM32(dev_va + 0x2478) = MEM32(dev_va + 0x2478) + 1;
     }
 
-    /* === RW→D3D11 BRIDGE: Actually render the scene ===
-     * Instead of just incrementing the frame counter, call the bridge
-     * to render through our D3D8→D3D11 layer. The bridge reads camera
-     * state from Xbox memory and renders track/vehicles/scene. */
-    rw_bridge_camera_render(camera_xbox_va);
+    /* Inject track geometry into NV2A push buffer (when gen chain active).
+     * This writes pre-transformed vertices as INLINE_ARRAY commands that
+     * parse_live_pushbuffer() picks up and renders through D3D11. */
+    if (g_gen_render_chain_enabled) {
+        extern int rw_bridge_inject_track_to_pb(void);
+        rw_bridge_inject_track_to_pb();
+    }
 
-    /* Original uses RET 4 (callee cleans 1 param) */
-    eax = (camera_xbox_va > 0x10000 && camera_xbox_va < 0x4000000)
-          ? MEM32(camera_xbox_va + 0x2478) : 0;
+    /* Bridge render: handles D3D11 present (menu PB replay, gameplay, etc.) */
+    rw_bridge_camera_render(dev_va);
+
+done:
+    eax = (dev_va > 0x10000 && dev_va < 0x4000000)
+          ? MEM32(dev_va + 0x2478) : 0;
     esp += 4; /* pop return address */
     esp += 4; /* clean 1 param (ret 4) */
     return;
@@ -4713,33 +4765,56 @@ void sub_001AA100(void)
          * sub_0019AE10 has its own internal state machine at render_base+0x08.
          * State 0 = uninitialized (returns 0 immediately).
          * State 1 = begin loading screen resources.
-         * Must set to 1 to kick off initialization. */
+         * Must set to 1 to kick off initialization.
+         *
+         * TIMEOUT: If sub_0019AE10 doesn't complete after 30 calls,
+         * skip to phase 0x13 anyway. Track resources (sub_00062BD0)
+         * are stubbed, so the render list builder can't finish.
+         * We render track geometry via PB injection instead. */
+        static uint32_t phase9_tries = 0;
+        phase9_tries++;
+
         uint32_t render_base = bp + 0x12ADB0;
         uint32_t rlist_state = MEM32(render_base + 0x08);
         if (rlist_state == 0 || rlist_state > 0x18) {
-            fprintf(stderr, "  [1AA100] Phase 9: render_list state=0x%X (bad), setting to 1\n",
-                    rlist_state);
             MEM32(render_base + 0x08) = 1;
-            /* Also clear other render list fields to avoid garbage */
             MEM8(render_base) = 0;
             MEM32(render_base + 0x04) = 0;
             MEM32(render_base + 0x0C) = 0;
         }
-        if (call_count <= 50 || (call_count % 100) == 0) {
-            fprintf(stderr, "  [1AA100] Phase 9: sub_0019AE10(0x%08X) rlist_state=%u\n",
-                    render_base, MEM32(render_base + 0x08));
+        if (call_count <= 50 || (call_count % 1000) == 0) {
+            fprintf(stderr, "  [1AA100] Phase 9: sub_0019AE10(0x%08X) rlist_state=%u try=%u\n",
+                    render_base, MEM32(render_base + 0x08), phase9_tries);
         }
+
+        /* Try sub_0019AE10 */
         PUSH32(esp, render_base);
         PUSH32(esp, 0); sub_0019AE10();
-        fprintf(stderr, "  [1AA100] Phase 9: sub_0019AE10 returned %u\n", eax & 0xFF);
-        if ((eax & 0xFF) == 0) {
-            goto ret0;
+
+        if ((eax & 0xFF) != 0) {
+            phase9_tries = 0;
+            MEM32(bp + 0x144384) = 0x13;
+            fprintf(stderr, "  [1AA100] Phase 9 → 0x13: render list built!\n");
+            goto phase_body;
         }
-        MEM32(bp + 0x144384) = 0x13; /* skip to per-frame body */
-        fprintf(stderr, "  [1AA100] Phase 9 → 0x13: render list built!\n");
-        fprintf(stderr, "  [1AA100]   render_list: [+0]=0x%08X [+4]=0x%08X [+8]=0x%08X\n",
-                MEM32(render_base), MEM32(render_base + 4), MEM32(render_base + 8));
-        goto phase_body;
+
+        /* Timeout: skip to gameplay after 30 attempts */
+        if (phase9_tries >= 30) {
+            phase9_tries = 0;
+            MEM32(bp + 0x144384) = 0x13;
+            /* Mark render list as "complete" so state machine proceeds */
+            MEM32(render_base + 0x08) = 0x17;
+            /* Signal race init completion to fe_menu so it stops forcing state=4 */
+            {
+                extern int g_race_init_done;
+                g_race_init_done = 1;
+                fprintf(stderr, "  [1AA100] Phase 9 TIMEOUT → 0x13 (gameplay). "
+                        "g_race_init_done=1\n");
+            }
+            goto phase_body;
+        }
+
+        goto ret0;
     }
 
     case 0x0A: case 0x0B: case 0x0C: case 0x0D:

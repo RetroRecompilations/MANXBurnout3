@@ -329,6 +329,16 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
     g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
     g_icall_trace_idx++; \
     g_icall_count++; \
+    /* Reject IEEE 754 floats misread as function pointers. \
+     * Common garbage: 0x3F800000 (1.0), 0x3C23D70A (0.01), 0x40000000 (2.0). \
+     * Native Xbox VAs are 0x10011000-0x14000000 (exp ~32-40 after offset). \
+     * Use exponent >= 50 to avoid false positives on native mirror addresses. \
+     * Covers float range ~1e-22 to ~1e38 = all typical game data floats. */ \
+    { uint32_t _exp = (_va >> 23) & 0xFF; \
+      if (_exp >= 50 && _exp <= 200) { \
+        g_esp = (saved_esp); eax = 0; break; \
+      } \
+    } \
     if (_va >= 0x00400000 && _va < 0xFE000000) { \
         uint32_t _off32 = (uint32_t)g_xbox_mem_offset; \
         int _resolved = 0; \
