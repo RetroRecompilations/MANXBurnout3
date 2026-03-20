@@ -761,12 +761,45 @@ int rw_bridge_inject_track_to_pb(void)
     mat4_multiply(vp, proj, view);
 
     int total_verts_written = 0;
-    const int MAX_VERTS_PER_FRAME = 3000;
+    int total_draws = 0;
+    const int MAX_VERTS_PER_FRAME = 6000;
+
+    /* Batch buffer: collect transformed verts, flush as single INLINE_ARRAY.
+     * NV2A INLINE_ARRAY count field is 11 bits → max 2047 dwords per command.
+     * At 5 dwords/vert, max 409 verts per INLINE_ARRAY. Use 400 for safety. */
+    #define BATCH_MAX_VERTS 400
+    #define BATCH_DWORDS_PER_VERT 5
+    uint32_t batch[BATCH_MAX_VERTS * BATCH_DWORDS_PER_VERT];
+    int batch_count = 0;
 
     /* Player position for distance culling */
     float player_x = BMEMF(0x5FFF10);
     float player_z = BMEMF(0x5FFF14);
-    float cull_dist_sq = 400.0f * 400.0f;
+    float cull_dist_sq = 500.0f * 500.0f;
+
+    /* Flush batch to PB as a single draw call */
+    #define FLUSH_BATCH() do { \
+        if (batch_count >= 3) { \
+            uint32_t ndw = batch_count * BATCH_DWORDS_PER_VERT; \
+            /* Need: 2 (BEGIN) + 1 (header) + ndw (data) + 2 (END) = ndw+5 dwords */ \
+            if (pb_write + (ndw + 5) * 4 < pb_end - 256) { \
+                BMEM32(pb_write) = NV2A_METHOD_INC(1, NV2A_BEGIN_END, 0); \
+                BMEM32(pb_write + 4) = NV2A_DRAW_MODE_TRILIST; \
+                pb_write += 8; \
+                BMEM32(pb_write) = NV2A_METHOD_NI(ndw, NV2A_INLINE_ARRAY, 0); \
+                pb_write += 4; \
+                for (uint32_t _bi = 0; _bi < ndw; _bi++) { \
+                    BMEM32(pb_write) = batch[_bi]; \
+                    pb_write += 4; \
+                } \
+                BMEM32(pb_write) = NV2A_METHOD_INC(1, NV2A_BEGIN_END, 0); \
+                BMEM32(pb_write + 4) = 0; \
+                pb_write += 8; \
+                total_draws++; \
+            } \
+        } \
+        batch_count = 0; \
+    } while(0)
 
     for (int ci = 0; ci < g_track_data.chunk_count && total_verts_written < MAX_VERTS_PER_FRAME; ci++) {
         TrackChunk *chunk = &g_track_data.chunks[ci];
@@ -779,17 +812,14 @@ int rw_bridge_inject_track_to_pb(void)
         if (dx*dx + dz*dz > cull_dist_sq)
             continue;
 
-        /* Process triangle strip indices → individual triangles in PB */
+        /* Process triangle strip → triangle list, batching verts */
         for (uint32_t i = 0; i + 2 < chunk->index_count && total_verts_written < MAX_VERTS_PER_FRAME; i++) {
             uint16_t i0 = chunk->indices[i];
             uint16_t i1 = chunk->indices[i + 1];
             uint16_t i2 = chunk->indices[i + 2];
 
-            /* Skip degenerate triangles */
             if (i0 == i1 || i1 == i2 || i0 == i2) continue;
             if (i0 >= chunk->vertex_count || i1 >= chunk->vertex_count || i2 >= chunk->vertex_count) continue;
-
-            /* Flip winding for odd triangles in strip */
             if (i & 1) { uint16_t t = i1; i1 = i2; i2 = t; }
 
             /* Transform 3 vertices to screen space */
@@ -812,35 +842,33 @@ int rw_bridge_inject_track_to_pb(void)
             }
             if (!visible) continue;
 
-            /* Check PB space: 2 + 1 + 15 + 2 = 20 dwords */
-            if (pb_write + 20 * 4 >= pb_end - 256) break;
-
-            /* BEGIN(TRILIST) */
-            BMEM32(pb_write) = NV2A_METHOD_INC(1, NV2A_BEGIN_END, 0);
-            BMEM32(pb_write + 4) = NV2A_DRAW_MODE_TRILIST;
-            pb_write += 8;
-
-            /* INLINE_ARRAY: 15 dwords (3 verts × 5) non-increasing */
-            BMEM32(pb_write) = NV2A_METHOD_NI(15, NV2A_INLINE_ARRAY, 0);
-            pb_write += 4;
-
+            /* Add 3 verts to batch */
             for (int v = 0; v < 3; v++) {
-                BMEM32(pb_write + 0)  = f2u(sx[v]);
-                BMEM32(pb_write + 4)  = f2u(sy[v]);
-                BMEM32(pb_write + 8)  = f2u(su[v]);
-                BMEM32(pb_write + 12) = f2u(sv[v]);
-                BMEM32(pb_write + 16) = sc[v];
-                pb_write += 20;
+                int off = batch_count * BATCH_DWORDS_PER_VERT;
+                batch[off + 0] = f2u(sx[v]);
+                batch[off + 1] = f2u(sy[v]);
+                batch[off + 2] = f2u(su[v]);
+                batch[off + 3] = f2u(sv[v]);
+                batch[off + 4] = sc[v];
+                batch_count++;
             }
-
-            /* END */
-            BMEM32(pb_write) = NV2A_METHOD_INC(1, NV2A_BEGIN_END, 0);
-            BMEM32(pb_write + 4) = 0;
-            pb_write += 8;
-
             total_verts_written += 3;
+
+            /* Flush when batch is full */
+            if (batch_count >= BATCH_MAX_VERTS - 3) {
+                FLUSH_BATCH();
+            }
         }
+
+        /* Flush remaining verts from this chunk */
+        FLUSH_BATCH();
     }
+
+    /* Final flush */
+    FLUSH_BATCH();
+    #undef FLUSH_BATCH
+    #undef BATCH_MAX_VERTS
+    #undef BATCH_DWORDS_PER_VERT
 
     /* Update PB write cursor */
     BMEM32(0x35D6A0) = pb_write;
@@ -851,8 +879,8 @@ int rw_bridge_inject_track_to_pb(void)
     static uint32_t inject_count = 0;
     inject_count++;
     if (inject_count <= 3 || (inject_count % 300) == 0)
-        fprintf(stderr, "  [PB-INJECT] #%u: %d verts from %d chunks, pb_used=%u\n",
-                inject_count, total_verts_written,
+        fprintf(stderr, "  [PB-INJECT] #%u: %d verts, %d draws, %d chunks, pb=%u bytes\n",
+                inject_count, total_verts_written, total_draws,
                 g_track_data.chunk_count, pb_write - pb_base);
 
     return total_verts_written;

@@ -366,53 +366,19 @@ void fe_menu_update(float dt)
     if (g_race_active) {
         uint32_t cur_state = FMEM32(ADDR_GAME_STATE);
 
-        /* Force state 4 transition ONCE, then let the state machine run.
-         * Track whether we've already triggered the 4→5 transition.
-         * (g_race_init_done is file-scope, reset in fe_menu_stop_race) */
-        static int force_attempts_local_local = 0;
-
+        /* Simple state forcing: write state=4 ONCE per frame until the gen
+         * code's sub_001AA100 completes (sets g_race_init_done=1 via phase 9
+         * timeout). After that, just keep camera in gameplay mode. */
         if (!g_race_init_done) {
-            force_attempts_local_local++;
-            if (cur_state == 5) {
-                /* Haven't entered state 4 yet — force transition */
-                FMEM8(0x4D53BC) = 1;         /* mode flag: racing */
-                FMEM8(0x4A4B90) = 1;         /* loaded flag */
-                FMEM32(0x4D53B4) = 4;        /* pending state → race init */
-                FMEM32(0x4D53B8) = 4;        /* current state → race init (FORCE) */
-                FMEM32(0x4D5370) = 0x4D45D0; /* camera → gameplay */
-
-                static int force_count = 0;
-                force_count++;
-                if (force_count <= 5 || (force_count % 300) == 0)
-                    fprintf(stderr, "  [FE-RACE] Forcing state=4 #%d\n", force_count);
-            } else if (cur_state == 4) {
-                /* In state 4 — race init in progress, let gen code run */
-                static int init_logged = 0;
-                if (!init_logged) {
-                    fprintf(stderr, "  [FE-RACE] State transitioned to 4 (race init)!\n");
-                    init_logged = 1;
-                }
-            }
+            /* Force state=4 to trigger case 3 → sub_001AA100 */
+            FMEM8(0x4D53BC) = 1;             /* mode flag: racing */
+            FMEM8(0x4A4B90) = 1;             /* loaded flag */
+            FMEM32(0x4D53B4) = 4;            /* pending state */
+            FMEM32(0x4D53B8) = 4;            /* current state (force) */
+            FMEM32(0x4D5370) = 0x4D45D0;     /* camera → gameplay */
         }
 
-        /* Detect 4→5 transition: race init complete, now in gameplay.
-         * Wait for the state machine to ACTUALLY go through state 4 first —
-         * check that phase was reset to 1 and progressed back to 0x13. */
-        static int force_attempts_local = 0;
-        if (cur_state == 5 && !g_race_init_done && force_attempts_local > 20) {
-            uint32_t cam = FMEM32(0x4D5370);
-            uint32_t phase = FMEM32(0x752D84);
-            if (phase >= 0x13) {
-                g_race_init_done = 1;
-                force_attempts_local = 0;
-                /* Keep gameplay state active */
-                FMEM32(0x4D5370) = 0x4D45D0; /* camera → gameplay */
-                fprintf(stderr, "  [FE-RACE] Race init COMPLETE! State 5 (gameplay), "
-                        "cam=0x%08X phase=0x%X\n", cam, phase);
-            }
-        }
-
-        /* Keep camera in gameplay mode while racing */
+        /* After init complete, just maintain gameplay camera */
         if (g_race_init_done) {
             FMEM32(0x4D5370) = 0x4D45D0;
         }
