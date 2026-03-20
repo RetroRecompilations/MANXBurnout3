@@ -537,12 +537,28 @@ int rw_bridge_camera_render(uint32_t camera_va)
         rw_bridge_camera_begin(camera_va);
     }
 
+    /* Render track geometry via direct D3D8 DrawPrimitiveUP.
+     * Pre-transforms track verts to screen space and draws in batches. */
+    {
+        extern int g_gen_render_chain_enabled;
+        if (g_gen_render_chain_enabled) {
+            rw_bridge_inject_track_to_pb();
+        }
+    }
+
     /* Render the 3D scene through our existing renderer.
      * rw_gameplay_render() handles track geometry, vehicles, sky, etc. */
     rw_gameplay_render();
 
     /* End the scene — bridge owns the full BeginScene/EndScene lifecycle */
     rw_bridge_camera_end(camera_va);
+
+    /* Present the frame — gameplay path must Present (menu path does its own) */
+    dev->lpVtbl->Present(dev, NULL, NULL, NULL, NULL);
+    {
+        extern volatile uint32_t g_present_count;
+        g_present_count++;
+    }
 
     g_bridge_rendered = 1;
 
@@ -749,10 +765,8 @@ int rw_bridge_inject_track_to_pb(void)
     if (!g_track_loaded || g_track_data.chunk_count == 0)
         return 0;
 
-    /* Get PB write cursor */
-    uint32_t pb_base = BMEM32(0x35D69C);
-    uint32_t pb_write = BMEM32(0x35D6A0);
-    uint32_t pb_end = pb_base + 0x400000;
+    IDirect3DDevice8 *dev = xbox_GetD3DDevice();
+    if (!dev) return 0;
 
     /* Build camera view-projection matrix */
     float view[16], proj[16], vp[16];
@@ -764,12 +778,10 @@ int rw_bridge_inject_track_to_pb(void)
     int total_draws = 0;
     const int MAX_VERTS_PER_FRAME = 6000;
 
-    /* Batch buffer: collect transformed verts, flush as single INLINE_ARRAY.
-     * NV2A INLINE_ARRAY count field is 11 bits → max 2047 dwords per command.
-     * At 5 dwords/vert, max 409 verts per INLINE_ARRAY. Use 400 for safety. */
-    #define BATCH_MAX_VERTS 400
-    #define BATCH_DWORDS_PER_VERT 5
-    uint32_t batch[BATCH_MAX_VERTS * BATCH_DWORDS_PER_VERT];
+    /* Batch buffer: collect pre-transformed verts, flush via DrawPrimitiveUP.
+     * Format: RwIm2DVertex (28 bytes: XYZRHW + Diffuse + TEX1). */
+    #define BATCH_MAX_VERTS 900
+    RwIm2DVertex batch[BATCH_MAX_VERTS];
     int batch_count = 0;
 
     /* Player position for distance culling */
@@ -777,26 +789,21 @@ int rw_bridge_inject_track_to_pb(void)
     float player_z = BMEMF(0x5FFF14);
     float cull_dist_sq = 500.0f * 500.0f;
 
-    /* Flush batch to PB as a single draw call */
+    /* Set up 2D rendering state for pre-transformed vertices */
+    dev->lpVtbl->SetRenderState(dev, D3DRS_ZENABLE, TRUE);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_ZWRITEENABLE, TRUE);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_LIGHTING, FALSE);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_CULLMODE, D3DCULL_NONE);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_ALPHABLENDENABLE, FALSE);
+    dev->lpVtbl->SetVertexShader(dev, D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+    dev->lpVtbl->SetTexture(dev, 0, NULL);
+
+    /* Flush batch via DrawPrimitiveUP */
     #define FLUSH_BATCH() do { \
         if (batch_count >= 3) { \
-            uint32_t ndw = batch_count * BATCH_DWORDS_PER_VERT; \
-            /* Need: 2 (BEGIN) + 1 (header) + ndw (data) + 2 (END) = ndw+5 dwords */ \
-            if (pb_write + (ndw + 5) * 4 < pb_end - 256) { \
-                BMEM32(pb_write) = NV2A_METHOD_INC(1, NV2A_BEGIN_END, 0); \
-                BMEM32(pb_write + 4) = NV2A_DRAW_MODE_TRILIST; \
-                pb_write += 8; \
-                BMEM32(pb_write) = NV2A_METHOD_NI(ndw, NV2A_INLINE_ARRAY, 0); \
-                pb_write += 4; \
-                for (uint32_t _bi = 0; _bi < ndw; _bi++) { \
-                    BMEM32(pb_write) = batch[_bi]; \
-                    pb_write += 4; \
-                } \
-                BMEM32(pb_write) = NV2A_METHOD_INC(1, NV2A_BEGIN_END, 0); \
-                BMEM32(pb_write + 4) = 0; \
-                pb_write += 8; \
-                total_draws++; \
-            } \
+            dev->lpVtbl->DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, \
+                batch_count / 3, batch, sizeof(RwIm2DVertex)); \
+            total_draws++; \
         } \
         batch_count = 0; \
     } while(0)
@@ -812,7 +819,7 @@ int rw_bridge_inject_track_to_pb(void)
         if (dx*dx + dz*dz > cull_dist_sq)
             continue;
 
-        /* Process triangle strip → triangle list, batching verts */
+        /* Process triangle strip → triangle list */
         for (uint32_t i = 0; i + 2 < chunk->index_count && total_verts_written < MAX_VERTS_PER_FRAME; i++) {
             uint16_t i0 = chunk->indices[i];
             uint16_t i1 = chunk->indices[i + 1];
@@ -822,11 +829,9 @@ int rw_bridge_inject_track_to_pb(void)
             if (i0 >= chunk->vertex_count || i1 >= chunk->vertex_count || i2 >= chunk->vertex_count) continue;
             if (i & 1) { uint16_t t = i1; i1 = i2; i2 = t; }
 
-            /* Transform 3 vertices to screen space */
             uint16_t idx[3] = { i0, i1, i2 };
-            float sx[3], sy[3], su[3], sv[3];
-            uint32_t sc[3];
             int visible = 1;
+            RwIm2DVertex tri[3];
 
             for (int v = 0; v < 3; v++) {
                 TrackVertex *tv = &chunk->vertices[idx[v]];
@@ -834,54 +839,41 @@ int rw_bridge_inject_track_to_pb(void)
                 bridge_transform_point(vp, tv->x, tv->y, tv->z, &cx, &cy, &cz, &cw);
                 if (cw < 0.1f) { visible = 0; break; }
                 float inv_w = 1.0f / cw;
-                sx[v] = (cx * inv_w * 0.5f + 0.5f) * 640.0f;
-                sy[v] = (1.0f - (cy * inv_w * 0.5f + 0.5f)) * 480.0f;
-                su[v] = tv->u;
-                sv[v] = tv->v;
-                sc[v] = tv->color ? tv->color : 0xFF808080;
+                float ndcz = cz * inv_w;
+                tri[v].x   = (cx * inv_w * 0.5f + 0.5f) * 640.0f;
+                tri[v].y   = (1.0f - (cy * inv_w * 0.5f + 0.5f)) * 480.0f;
+                tri[v].z   = ndcz * 0.5f + 0.5f;  /* depth [0,1] */
+                tri[v].rhw = inv_w;
+                tri[v].color = tv->color ? tv->color : 0xFF808080;
+                tri[v].u   = tv->u;
+                tri[v].v   = tv->v;
             }
             if (!visible) continue;
 
-            /* Add 3 verts to batch */
-            for (int v = 0; v < 3; v++) {
-                int off = batch_count * BATCH_DWORDS_PER_VERT;
-                batch[off + 0] = f2u(sx[v]);
-                batch[off + 1] = f2u(sy[v]);
-                batch[off + 2] = f2u(su[v]);
-                batch[off + 3] = f2u(sv[v]);
-                batch[off + 4] = sc[v];
-                batch_count++;
-            }
+            /* Add to batch */
+            batch[batch_count++] = tri[0];
+            batch[batch_count++] = tri[1];
+            batch[batch_count++] = tri[2];
             total_verts_written += 3;
 
-            /* Flush when batch is full */
             if (batch_count >= BATCH_MAX_VERTS - 3) {
                 FLUSH_BATCH();
             }
         }
 
-        /* Flush remaining verts from this chunk */
         FLUSH_BATCH();
     }
 
-    /* Final flush */
     FLUSH_BATCH();
     #undef FLUSH_BATCH
     #undef BATCH_MAX_VERTS
-    #undef BATCH_DWORDS_PER_VERT
-
-    /* Update PB write cursor */
-    BMEM32(0x35D6A0) = pb_write;
-    uint32_t dev_va = BMEM32(0x35FB48);
-    if (dev_va >= 0x10000 && dev_va < 0x4000000)
-        BMEM32(dev_va + 0x00) = pb_write;
 
     static uint32_t inject_count = 0;
     inject_count++;
     if (inject_count <= 3 || (inject_count % 300) == 0)
-        fprintf(stderr, "  [PB-INJECT] #%u: %d verts, %d draws, %d chunks, pb=%u bytes\n",
+        fprintf(stderr, "  [TRACK-DRAW] #%u: %d verts, %d draws, %d chunks\n",
                 inject_count, total_verts_written, total_draws,
-                g_track_data.chunk_count, pb_write - pb_base);
+                g_track_data.chunk_count);
 
     return total_verts_written;
 }

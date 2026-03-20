@@ -2218,19 +2218,9 @@ void sub_00351090(void)
         MEM32(dev_va + 0x2478) = MEM32(dev_va + 0x2478) + 1;
     }
 
-    /* Inject track geometry into NV2A push buffer (when gen chain active).
-     * Skip during state 4 (race init) to avoid massive draw call buildup
-     * while sub_001AA100 is running phase 9 attempts. */
-    if (g_gen_render_chain_enabled) {
-        uint32_t cur_game_state = (dev_va > 0x10000 && dev_va < 0x4000000)
-                                  ? MEM32(0x4D53B8) : 5;
-        if (cur_game_state != 4) {
-            extern int rw_bridge_inject_track_to_pb(void);
-            rw_bridge_inject_track_to_pb();
-        }
-    }
-
-    /* Bridge render: handles D3D11 present (menu PB replay, gameplay, etc.) */
+    /* Bridge render: handles D3D11 present (menu PB replay, gameplay, etc.)
+     * Track geometry injection now happens inside the bridge's gameplay path
+     * (within the BeginScene/EndScene bracket) via D3D8 DrawPrimitiveUP. */
     rw_bridge_camera_render(dev_va);
 
 done:

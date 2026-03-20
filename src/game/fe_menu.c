@@ -378,9 +378,32 @@ void fe_menu_update(float dt)
             FMEM32(0x4D5370) = 0x4D45D0;     /* camera → gameplay */
         }
 
-        /* After init complete, just maintain gameplay camera */
+        /* After init complete, maintain gameplay state and force race start.
+         * The game runs a pre-race cinematic (flyover camera), then a countdown.
+         * We skip the cinematic and force the race into "racing" state. */
         if (g_race_init_done) {
-            FMEM32(0x4D5370) = 0x4D45D0;
+            static int race_frames = 0;
+            race_frames++;
+
+            FMEM32(0x4D5370) = 0x4D45D0;     /* camera → gameplay */
+
+            /* After 60 frames (~1 sec), force race to active/driving state.
+             * Skip the cinematic intro and countdown sequence.
+             * Race control block at 0x411B00 (0x100 bytes):
+             *   0x411B20 = active flag
+             *   0x411BDC = current lap
+             *   0x411BE0 = race type
+             *   0x411BE8 = total laps
+             *   0x411BF8 = countdown timer (0 = GO) */
+            if (race_frames == 60) {
+                FMEM32(0x411B20) = 1;          /* race active */
+                FMEM32(0x411BDC) = 1;          /* lap 1 */
+                FMEM32(0x411BE8) = 3;          /* 3 laps total */
+                *(volatile float*)((uintptr_t)0x411BF8 + g_xbox_mem_offset) = 0.0f;  /* countdown = 0 (GO!) */
+                /* Force camera to chase cam (gameplay camera, not cinematic) */
+                FMEM32(0x4D5370) = 0x4D45D0;
+                fprintf(stderr, "  [FE-RACE] Forced race start! Skipped cinematic.\n");
+            }
         }
 
         /* ESC returns to menus */
