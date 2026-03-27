@@ -2253,6 +2253,90 @@ void sub_00351090(void)
     if (MEM32(dev_va + 0x1974) == 0) MEM32(dev_va + 0x1974) = 0x3A1F;
     if (MEM32(dev_va + 0x1978) == 0) MEM32(dev_va + 0x1978) = 0x3A25;
 
+    /* ═══ POPULATE CAMERA FRAME FROM PHYSICS (GAMEPLAY) ═══
+     * When in gameplay and the camera frame LTM has no position, we compute
+     * a chase camera from the physics body and write it to the frame.
+     * This feeds into the device matrix update below and the bridge camera. */
+    {
+        uint32_t cam_va = MEM32(0x4D5370);
+        /* Only populate when the gameplay camera is active — NOT during init
+         * (state 4) or menus, to avoid corrupting the menu camera's frame */
+        int in_gameplay = (cam_va == 0x4D45D0);
+
+        if (in_gameplay && cam_va > 0x10000 && cam_va < 0x4000000) {
+            uint32_t frame_raw = MEM32(cam_va + 4);
+            float *ltm = NULL;
+            if (frame_raw > 0x10000 && frame_raw < 0x4000000) {
+                ltm = (float*)XBOX_PTR(frame_raw + 0x58);
+            } else if (frame_raw > 0x10000000) {
+                uint32_t phys = (frame_raw - (uint32_t)g_xbox_mem_offset) % 0x04000000u;
+                if (phys > 0x10000 && phys < 0x4000000)
+                    ltm = (float*)XBOX_PTR(phys + 0x58);
+            }
+
+            /* If frame has no position, populate from physics body */
+            if (ltm) {
+                float pos_mag2 = ltm[12]*ltm[12] + ltm[13]*ltm[13] + ltm[14]*ltm[14];
+                if (pos_mag2 < 1.0f) {
+                    /* Read physics body */
+                    uint32_t vel_ptr = MEM32(0x557880 + 0x1B4);
+                    float phys_x = 0, phys_z = 0, hdg = 0, spd = 0;
+                    if (vel_ptr > 0x100 && vel_ptr < 0x3FFFFFF) {
+                        phys_x = MEMF(vel_ptr + 0x10);
+                        phys_z = MEMF(vel_ptr + 0x14);
+                        hdg = MEMF(vel_ptr + 0x18);
+                        spd = MEMF(vel_ptr + 0x1C);
+                    } else {
+                        phys_x = MEMF(0x5FFF10);
+                        phys_z = MEMF(0x5FFF14);
+                        hdg = MEMF(0x5FFF18);
+                        spd = MEMF(0x5FFF1C);
+                    }
+
+                    if (phys_x != 0.0f || phys_z != 0.0f) {
+                        /* Compute chase camera position */
+                        float cam_dist = 15.0f + fabsf(spd) * 0.2f;
+                        float sh = sinf(hdg), ch = cosf(hdg);
+                        float cx = phys_x - sh * cam_dist;
+                        float cy = 5.0f;
+                        float cz = phys_z - ch * cam_dist;
+
+                        /* Write position to frame LTM */
+                        ltm[12] = cx;
+                        ltm[13] = cy;
+                        ltm[14] = cz;
+
+                        /* Write chase camera orientation to frame LTM.
+                         * Forward direction = heading vector toward car.
+                         * RW uses right-handed: right=X, up=Y, at=Z (forward). */
+                        float fx = sh, fz = ch;  /* forward = toward car (heading dir) */
+                        /* right = cross(up, forward) = cross((0,1,0), (fx,0,fz)) = (fz,0,-fx) */
+                        ltm[0] = fz;  ltm[1] = 0;     ltm[2] = -fx;  ltm[3] = 0;  /* right */
+                        ltm[4] = 0;   ltm[5] = 1.0f;  ltm[6] = 0;    ltm[7] = 0;  /* up */
+                        ltm[8] = fx;  ltm[9] = 0;     ltm[10] = fz;  ltm[11] = 0; /* at (forward) */
+                        ltm[15] = 0;
+
+                        /* Also set viewWindow if camera doesn't have one */
+                        if (MEMF(cam_va + 0x8C) < 0.001f) {
+                            MEMF(cam_va + 0x8C) = 1.0f;    /* viewWindow.x */
+                            MEMF(cam_va + 0x90) = 0.75f;   /* viewWindow.y */
+                            MEMF(cam_va + 0x80) = 0.1f;    /* near clip */
+                            MEMF(cam_va + 0x84) = 5000.0f; /* far clip */
+                        }
+
+                        static int logged_pop = 0;
+                        if (!logged_pop || (call_count % 500) == 0) {
+                            fprintf(stderr, "  [RW-CAM] Populated frame LTM from physics: "
+                                    "pos=(%.1f,%.1f,%.1f) hdg=%.1f° spd=%.1f\n",
+                                    cx, cy, cz, hdg * 57.2958f, spd);
+                            logged_pop = 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /* ═══ UPDATE DEVICE MATRICES FROM CAMERA FRAME ═══
      * Since RwCameraBeginUpdate is never called by the D3D8LTCG pipeline,
      * we populate the device view/projection matrices ourselves from the
