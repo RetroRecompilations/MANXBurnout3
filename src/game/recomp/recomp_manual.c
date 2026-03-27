@@ -261,6 +261,9 @@ void sub_0001BE60(void);
 /* Audio streaming setup (stubbed - audio init was skipped) */
 void sub_00135240(void);
 
+/* RW stream reader (override - marks stream complete without vtable walks) */
+void sub_001B33A0(void);
+
 /* Track environment loader (stubbed - RW stream reader hangs) */
 void sub_00062BD0(void);
 
@@ -428,6 +431,8 @@ static const struct {
     { 0x000171A0u, (recomp_func_t)sub_000171A0 },
     /* Game mode state machine (force state 4→5 transition) */
     { 0x001AA100u, (recomp_func_t)sub_001AA100 },
+    /* RW stream reader (override - marks complete without vtable walks) */
+    { 0x001B33A0u, (recomp_func_t)sub_001B33A0 },
 };
 #define NUM_MANUAL_FUNCS (sizeof(g_manual_funcs) / sizeof(g_manual_funcs[0]))
 
@@ -2234,12 +2239,92 @@ done:
 /*
  * sub_001D9510 - RW camera create (rw_core, src/bacamera.c)
  *
- * Creates a camera raster object by calling into Xbox D3D device via
- * ICALL(MEM32(0x7593E4)), which returns a pointer to GPU-allocated raster
- * memory in the 0x92-0x93 range. Without real Xbox D3D, these reads fault
- * 10 million times per frame. Stub returns 0 (no camera created).
+ * Original: 0x001D9510 - 0x001D9640 (304 bytes, 76 insns)
+ *
+ * Creates an RW camera object. The original calls ICALL(MEM32(0x7593E4))
+ * to allocate a GPU raster, then initializes camera struct fields:
+ *   +0x00: type (4 = camera)
+ *   +0x10/0x18/0x1C: vtable entries (camera methods)
+ *   +0x14: flags (1)
+ *   +0x60/0x64: parent pointers (null)
+ *   +0x68-0x74: clip planes (from 0x3B168C constant)
+ *   +0x78-0x7C: zero
+ *   +0x80: near clip (from 0x36C2D4)
+ *   +0x84: far clip (from 0x36C418)
+ *   +0x88: fog distance (from 0x3B1694)
+ *   +0x8C-0x90: computed view window params
+ *   +0x2C: zero
+ *
+ * Our override: allocate camera struct in Xbox heap, set all fields matching
+ * the gen code, skip the raster alloc (raster not needed for our D3D11 path).
  */
-void sub_001D9510(void) { eax = 0; esp += 4; return; }
+void sub_001D9510(void)
+{
+    /* Allocate camera struct in Xbox heap (~256 bytes, zero-initialized) */
+    uint32_t cam_va = xbox_HeapAlloc(0x100, 1);
+    if (cam_va == 0) {
+        fprintf(stderr, "  [RW-CAM] sub_001D9510: heap alloc failed\n");
+        eax = 0;
+        esp += 4; return;
+    }
+
+    /* Initialize camera struct matching gen code (recomp_0005.c:11776-11826) */
+    float clip_val = MEMF(0x3B168C);   /* Default clip value */
+    MEMF(cam_va + 0x6C) = clip_val;
+    MEMF(cam_va + 0x68) = clip_val;
+    MEMF(cam_va + 0x74) = clip_val;
+    MEMF(cam_va + 0x70) = clip_val;
+    MEMF(cam_va + 0x7C) = 0.0f;
+    MEMF(cam_va + 0x78) = 0.0f;
+    MEMF(cam_va + 0x80) = MEMF(0x36C2D4);  /* near clip */
+    MEMF(cam_va + 0x84) = MEMF(0x36C418);  /* far clip */
+    MEMF(cam_va + 0x88) = MEMF(0x3B1694);  /* fog distance */
+
+    MEM8(cam_va) = 4;        /* type = camera */
+    MEM8(cam_va + 1) = 0;
+    MEM8(cam_va + 2) = 0;
+    MEM8(cam_va + 3) = 0;
+    MEM32(cam_va + 4) = 0;
+
+    /* RW camera vtable entries (Xbox VAs of recompiled functions) */
+    MEM32(cam_va + 0x10) = 0x1D9130;   /* camera begin update */
+    MEM32(cam_va + 0x18) = 0x1D91B0;   /* camera end update */
+    MEM32(cam_va + 0x1C) = 0x1D9180;   /* camera clear */
+    MEM32(cam_va + 0x14) = 1;          /* flags */
+    MEM32(cam_va + 0x60) = 0;          /* parent */
+    MEM32(cam_va + 0x64) = 0;          /* parent frame */
+    MEM32(cam_va + 0x2C) = 0;
+
+    /* Compute view window params (from gen code lines 11801-11818) */
+    {
+        float vw_min = MEMF(0x7592B8);
+        float vw_max = MEMF(0x7592BC);
+        float half_range = (vw_max - vw_min) * MEMF(0x3B188C);
+        float reciprocal = (vw_max - vw_min) - half_range * 2.0f;
+        float vw_lo = half_range + vw_min;
+        float vw_hi = vw_max - half_range;
+        float vw_param = (vw_hi - vw_lo) * MEMF(0x36C414);
+        float vw_final = ((vw_hi + vw_lo) - vw_param * MEMF(0x36C410)) * MEMF(0x3B1684);
+        MEMF(cam_va + 0x8C) = vw_param;
+        MEMF(cam_va + 0x90) = vw_final;
+    }
+
+    /* Call sub_001E1AF0 (RW frame attach) to link camera to scene graph */
+    esi = cam_va;  /* Save for return */
+    PUSH32(esp, cam_va);
+    PUSH32(esp, 0x3C0810);  /* RW global frame list */
+    PUSH32(esp, 0); sub_001E1AF0();
+    esp += 8;
+
+    static int cam_count = 0;
+    cam_count++;
+    if (cam_count <= 5)
+        fprintf(stderr, "  [RW-CAM] sub_001D9510: created camera at 0x%08X (near=%.2f far=%.1f)\n",
+                cam_va, MEMF(cam_va + 0x80), MEMF(cam_va + 0x84));
+
+    eax = cam_va;
+    esp += 4; return;
+}
 
 /**
  * sub_001D7D50 - Xbox render state setter entry point (STUB)
@@ -3576,6 +3661,54 @@ void sub_00135240(void)
     fprintf(stderr, "  [STUB] sub_00135240 (audio streaming setup) - skipped\n");
     SET_LO8(eax, 1);
     esp += 4; return; /* ret */
+}
+
+/**
+ * sub_001B33A0 - RW stream reader (OVERRIDE)
+ *
+ * Original: 0x001B33A0 - 0x001B3410 (112 bytes, 56 insns)
+ * Category: rw_core
+ * CC: stdcall, 0 params (uses esi = stream object)
+ *
+ * Iterates over items in an RW stream object at ESI:
+ *   ESI+0x00: vtable pointer (or data array base)
+ *   ESI+0x08: state flag (output: 3 = success)
+ *   ESI+0x0C: item count
+ *
+ * The original function calls vtable methods for each item which walk
+ * GPU-allocated memory (0x92-0x93 range). Our override marks the stream
+ * as complete without walking those vtables.
+ *
+ * This allows the track environment loader (sub_00062BD0) and other
+ * RW streaming consumers to progress past the "read stream" phase.
+ */
+void sub_001B33A0(void)
+{
+    static int _1B33A0_count = 0;
+    _1B33A0_count++;
+
+    /* Validate esi points to a valid stream object */
+    if (esi < 0x10000 || esi > 0x4000000) {
+        if (_1B33A0_count <= 5)
+            fprintf(stderr, "  [RW-STREAM] sub_001B33A0: invalid esi=0x%08X, skipping\n", esi);
+        eax = 0;
+        esp += 4; esp += 12; return;
+    }
+
+    uint32_t count = MEM32(esi + 0xC);
+    uint32_t state = MEM32(esi + 8);
+
+    if (_1B33A0_count <= 10 || (_1B33A0_count % 500) == 0)
+        fprintf(stderr, "  [RW-STREAM] sub_001B33A0 #%d: esi=0x%08X count=%u state=%u → complete\n",
+                _1B33A0_count, esi, count, state);
+
+    /* Mark stream as successfully completed (state = 3) */
+    MEM32(esi + 8) = 3;
+
+    eax = 0;
+    esp += 4;  /* pop return address */
+    esp += 12; /* ret 12: clean 3 params from stack */
+    return;
 }
 
 /**
