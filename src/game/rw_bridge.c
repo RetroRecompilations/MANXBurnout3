@@ -738,6 +738,7 @@ int rw_bridge_im3d_render(int prim_type, const RwIm3DVertex *verts,
  * ═══════════════════════════════════════════════════════════════ */
 
 #include "track_loader.h"
+#include "static_textures.h"
 
 /* NV2A PB command helpers */
 #define NV2A_METHOD_INC(count, method, subchan) \
@@ -772,6 +773,9 @@ int rw_bridge_inject_track_to_pb(void)
     IDirect3DDevice8 *dev = xbox_GetD3DDevice();
     if (!dev) return 0;
 
+    /* Get static textures for the current track */
+    StaticTexDict *stex = rw_get_static_textures();
+
     /* Build camera view-projection matrix */
     float view[16], proj[16], vp[16];
     if (!rw_bridge_get_camera_view(view) || !rw_bridge_get_camera_proj(proj))
@@ -780,7 +784,7 @@ int rw_bridge_inject_track_to_pb(void)
 
     int total_verts_written = 0;
     int total_draws = 0;
-    const int MAX_VERTS_PER_FRAME = 6000;
+    const int MAX_VERTS_PER_FRAME = 12000;
 
     /* Batch buffer: collect pre-transformed verts, flush via DrawPrimitiveUP.
      * Format: RwIm2DVertex (28 bytes: XYZRHW + Diffuse + TEX1). */
@@ -793,16 +797,34 @@ int rw_bridge_inject_track_to_pb(void)
     float player_z = BMEMF(0x5FFF14);
     float cull_dist_sq = 500.0f * 500.0f;
 
-    /* Set up 2D rendering state for pre-transformed vertices */
+    /* Currently bound texture (track texture changes per object) */
+    IDirect3DTexture8 *cur_tex = NULL;
+
+    /* Set up rendering state for pre-transformed vertices */
     dev->lpVtbl->SetRenderState(dev, D3DRS_ZENABLE, TRUE);
     dev->lpVtbl->SetRenderState(dev, D3DRS_ZWRITEENABLE, TRUE);
     dev->lpVtbl->SetRenderState(dev, D3DRS_LIGHTING, FALSE);
     dev->lpVtbl->SetRenderState(dev, D3DRS_CULLMODE, D3DCULL_NONE);
-    dev->lpVtbl->SetRenderState(dev, D3DRS_ALPHABLENDENABLE, FALSE);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_ALPHABLENDENABLE, TRUE);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_ALPHATESTENABLE, TRUE);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_ALPHAREF, 0x20);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_ALPHAFUNC, 5); /* GREATER */
     dev->lpVtbl->SetVertexShader(dev, D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+
+    /* Texture stage 0: modulate texture × vertex color */
+    dev->lpVtbl->SetTextureStageState(dev, 0, D3DTSS_COLOROP, D3DTOP_MODULATE);
+    dev->lpVtbl->SetTextureStageState(dev, 0, D3DTSS_COLORARG1, 0x02); /* D3DTA_TEXTURE */
+    dev->lpVtbl->SetTextureStageState(dev, 0, D3DTSS_COLORARG2, 0x00); /* D3DTA_DIFFUSE */
+    dev->lpVtbl->SetTextureStageState(dev, 0, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
+    dev->lpVtbl->SetTextureStageState(dev, 0, D3DTSS_ALPHAARG1, 0x02);
+    dev->lpVtbl->SetTextureStageState(dev, 0, D3DTSS_ALPHAARG2, 0x00);
+    /* Stage 1 disabled */
+    dev->lpVtbl->SetTextureStageState(dev, 1, D3DTSS_COLOROP, D3DTOP_DISABLE);
     dev->lpVtbl->SetTexture(dev, 0, NULL);
 
-    /* Flush batch via DrawPrimitiveUP */
+    /* Flush batch — binds current texture before draw */
     #define FLUSH_BATCH() do { \
         if (batch_count >= 3) { \
             dev->lpVtbl->DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, \
@@ -810,6 +832,20 @@ int rw_bridge_inject_track_to_pb(void)
             total_draws++; \
         } \
         batch_count = 0; \
+    } while(0)
+
+    /* Bind a texture, flushing the batch if it changed */
+    #define BIND_TEXTURE(tex) do { \
+        if ((tex) != cur_tex) { \
+            FLUSH_BATCH(); \
+            cur_tex = (tex); \
+            dev->lpVtbl->SetTexture(dev, 0, (IDirect3DBaseTexture8 *)cur_tex); \
+            if (cur_tex) { \
+                dev->lpVtbl->SetTextureStageState(dev, 0, D3DTSS_COLOROP, D3DTOP_MODULATE); \
+            } else { \
+                dev->lpVtbl->SetTextureStageState(dev, 0, D3DTSS_COLOROP, D3DTOP_SELECTARG2); \
+            } \
+        } \
     } while(0)
 
     for (int ci = 0; ci < g_track_data.chunk_count && total_verts_written < MAX_VERTS_PER_FRAME; ci++) {
@@ -823,8 +859,32 @@ int rw_bridge_inject_track_to_pb(void)
         if (dx*dx + dz*dz > cull_dist_sq)
             continue;
 
+        /* Determine which object each triangle strip index belongs to,
+         * so we can look up the per-object texture index.
+         *
+         * strip_breaks[obj] = first index of object obj's strip
+         * tex_indices[obj]  = static.dat texture index for object obj
+         */
+        int cur_obj = 0;
+
         /* Process triangle strip → triangle list */
         for (uint32_t i = 0; i + 2 < chunk->index_count && total_verts_written < MAX_VERTS_PER_FRAME; i++) {
+            /* Advance object pointer when we cross a strip break */
+            while (cur_obj + 1 < chunk->strip_break_count &&
+                   i >= chunk->strip_breaks[cur_obj + 1]) {
+                cur_obj++;
+            }
+
+            /* Look up texture for current object */
+            IDirect3DTexture8 *obj_tex = NULL;
+            if (stex && chunk->tex_indices && cur_obj < chunk->tex_index_count) {
+                uint16_t tex_idx = chunk->tex_indices[cur_obj];
+                if (tex_idx < (uint16_t)stex->count) {
+                    obj_tex = stex->entries[tex_idx].texture;
+                }
+            }
+            BIND_TEXTURE(obj_tex);
+
             uint16_t i0 = chunk->indices[i];
             uint16_t i1 = chunk->indices[i + 1];
             uint16_t i2 = chunk->indices[i + 2];
@@ -846,7 +906,7 @@ int rw_bridge_inject_track_to_pb(void)
                 float ndcz = cz * inv_w;
                 tri[v].x   = (cx * inv_w * 0.5f + 0.5f) * 640.0f;
                 tri[v].y   = (1.0f - (cy * inv_w * 0.5f + 0.5f)) * 480.0f;
-                tri[v].z   = ndcz * 0.5f + 0.5f;  /* depth [0,1] */
+                tri[v].z   = ndcz * 0.5f + 0.5f;
                 tri[v].rhw = inv_w;
                 tri[v].color = tv->color ? tv->color : 0xFF808080;
                 tri[v].u   = tv->u;
@@ -854,7 +914,6 @@ int rw_bridge_inject_track_to_pb(void)
             }
             if (!visible) continue;
 
-            /* Add to batch */
             batch[batch_count++] = tri[0];
             batch[batch_count++] = tri[1];
             batch[batch_count++] = tri[2];
@@ -869,15 +928,23 @@ int rw_bridge_inject_track_to_pb(void)
     }
 
     FLUSH_BATCH();
+
+    /* Restore state */
+    dev->lpVtbl->SetTexture(dev, 0, NULL);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_ALPHATESTENABLE, FALSE);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_ALPHABLENDENABLE, FALSE);
+
     #undef FLUSH_BATCH
+    #undef BIND_TEXTURE
     #undef BATCH_MAX_VERTS
 
     static uint32_t inject_count = 0;
     inject_count++;
     if (inject_count <= 3 || (inject_count % 300) == 0)
-        fprintf(stderr, "  [TRACK-DRAW] #%u: %d verts, %d draws, %d chunks\n",
+        fprintf(stderr, "  [TRACK-DRAW] #%u: %d verts, %d draws, %d chunks, textures=%s\n",
                 inject_count, total_verts_written, total_draws,
-                g_track_data.chunk_count);
+                g_track_data.chunk_count,
+                stex ? "YES" : "NO");
 
     return total_verts_written;
 }

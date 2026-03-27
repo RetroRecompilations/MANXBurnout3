@@ -1580,6 +1580,11 @@ int rw_has_track(void)
     return g_track_loaded;
 }
 
+StaticTexDict *rw_get_static_textures(void)
+{
+    return g_track_loaded ? &g_static_textures : NULL;
+}
+
 void rw_toggle_track(void)
 {
     g_track_visible = !g_track_visible;

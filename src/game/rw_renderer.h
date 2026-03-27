@@ -160,4 +160,9 @@ int rw_has_track(void);
 /** Toggle track geometry visibility in 3D mode. */
 void rw_toggle_track(void);
 
+/** Get the static texture dictionary for the current track.
+ *  Returns NULL if no track is loaded. */
+#include "static_textures.h"
+StaticTexDict *rw_get_static_textures(void);
+
 #endif /* RW_RENDERER_H */
