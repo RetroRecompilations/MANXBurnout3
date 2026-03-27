@@ -2124,6 +2124,10 @@ void sub_001E7B10(void)
 extern ptrdiff_t g_xbox_mem_offset;
 extern void sub_00351770_gen(void);
 
+/* Camera tracking: cameras created by sub_001D9510 */
+uint32_t g_created_cameras[8] = {0};
+int g_created_camera_count = 0;
+
 /* Gate for enabling the gen code render chain.
  * 0 = safe mode (bridge only, no gen calls)
  * 1 = call sub_00351490/sub_00351770_gen/sub_00350C10
@@ -2169,6 +2173,71 @@ void sub_00351090(void)
                 "swap=%u RT=0x%X/0x%X gen=%d\n",
                 call_count, dev_va, flags, frame, ebx_flag, rt0, rt1,
                 g_gen_render_chain_enabled);
+
+        /* Dump device matrices (full 4x4) to understand format */
+        if (dev_va > 0x10000 && dev_va < 0x4000000) {
+            float *view = (float*)XBOX_PTR(dev_va + 0xCA0);
+            float *proj = (float*)XBOX_PTR(dev_va + 0xC60);
+            fprintf(stderr, "  [RW-CAM]   dev+0xCA0 (4x4): [%.4f %.4f %.4f %.4f]\n"
+                            "                               [%.4f %.4f %.4f %.4f]\n"
+                            "                               [%.4f %.4f %.4f %.4f]\n"
+                            "                               [%.4f %.4f %.4f %.4f]\n",
+                    view[0], view[1], view[2], view[3],
+                    view[4], view[5], view[6], view[7],
+                    view[8], view[9], view[10], view[11],
+                    view[12], view[13], view[14], view[15]);
+            fprintf(stderr, "  [RW-CAM]   dev+0xC60 (4x4): [%.4f %.4f %.4f %.4f]\n"
+                            "                               [%.4f %.4f %.4f %.4f]\n"
+                            "                               [%.4f %.4f %.4f %.4f]\n"
+                            "                               [%.4f %.4f %.4f %.4f]\n",
+                    proj[0], proj[1], proj[2], proj[3],
+                    proj[4], proj[5], proj[6], proj[7],
+                    proj[8], proj[9], proj[10], proj[11],
+                    proj[12], proj[13], proj[14], proj[15]);
+
+            /* Also check camera struct at 0x4D4008 — frame pointer and viewWindow */
+            uint32_t cam_va = MEM32(0x4D5370);  /* active camera pointer */
+            if (cam_va > 0x10000 && cam_va < 0x4000000) {
+                uint32_t frame_ptr = MEM32(cam_va + 4);  /* RwObject.parent → RwFrame */
+                float vw_x = MEMF(cam_va + 0x8C);
+                float vw_y = MEMF(cam_va + 0x90);
+                float near_clip = MEMF(cam_va + 0x80);
+                float far_clip  = MEMF(cam_va + 0x84);
+                fprintf(stderr, "  [RW-CAM]   cam=0x%08X frame=0x%08X vw=(%.3f,%.3f) near=%.3f far=%.1f\n",
+                        cam_va, frame_ptr, vw_x, vw_y, near_clip, far_clip);
+                /* Frame ptr may be Xbox VA or native (mirror) pointer */
+                float *ltm = NULL;
+                if (frame_ptr > 0x10000 && frame_ptr < 0x4000000) {
+                    ltm = (float*)XBOX_PTR(frame_ptr + 0x58);
+                } else if (frame_ptr >= (uint32_t)g_xbox_mem_offset &&
+                           frame_ptr < (uint32_t)g_xbox_mem_offset + 0x4000000) {
+                    /* Native pointer — use directly */
+                    ltm = (float*)((uintptr_t)(frame_ptr + 0x58));
+                } else if (frame_ptr > 0x10000000) {
+                    /* Mirror view: modulo 64MB to get physical address, then use as Xbox VA */
+                    uint32_t phys = (frame_ptr - (uint32_t)g_xbox_mem_offset) % 0x04000000u;
+                    ltm = (float*)XBOX_PTR(phys + 0x58);
+                }
+                if (ltm) {
+                    fprintf(stderr, "  [RW-CAM]   LTM: right=(%.2f,%.2f,%.2f) up=(%.2f,%.2f,%.2f)\n",
+                            ltm[0], ltm[1], ltm[2], ltm[4], ltm[5], ltm[6]);
+                    fprintf(stderr, "  [RW-CAM]   LTM: at=(%.2f,%.2f,%.2f) pos=(%.2f,%.2f,%.2f)\n",
+                            ltm[8], ltm[9], ltm[10], ltm[12], ltm[13], ltm[14]);
+                }
+                /* Dump cameras created by sub_001D9510 (tracked dynamically) */
+                for (int ci = 0; ci < g_created_camera_count && ci < 4; ci++) {
+                    uint32_t cva = g_created_cameras[ci];
+                    if (cva > 0x10000 && cva < 0x4000000) {
+                        uint32_t cf = MEM32(cva + 4);
+                        float cvw = MEMF(cva + 0x8C);
+                        float cnr = MEMF(cva + 0x80);
+                        float cfr = MEMF(cva + 0x84);
+                        fprintf(stderr, "  [RW-CAM]   cam[%d]=0x%08X frame=0x%08X vw=%.3f near=%.3f far=%.1f\n",
+                                ci, cva, cf, cvw, cnr, cfr);
+                    }
+                }
+            }
+        }
     }
 
     if (dev_va < 0x10000 || dev_va >= 0x4000000)
@@ -2255,72 +2324,158 @@ done:
  *   +0x8C-0x90: computed view window params
  *   +0x2C: zero
  *
- * Our override: allocate camera struct in Xbox heap, set all fields matching
- * the gen code, skip the raster alloc (raster not needed for our D3D11 path).
+ * Our override: allocate camera + frame structs in Xbox heap, set all fields
+ * matching the gen code, skip the raster alloc (not needed for D3D11 path).
+ *
+/*
+ * Fixed issues vs. previous version:
+ *   1. Allocate an RwFrame and set camera+0x04 = frame_va (was NULL)
+ *   2. Initialize frame LTM to identity (was garbage)
+ *   3. Set sensible viewWindow defaults when viewport globals are 0
+ *   4. Override near/far to racing-appropriate values
  */
 void sub_001D9510(void)
 {
-    /* Allocate camera struct in Xbox heap (~256 bytes, zero-initialized) */
-    uint32_t cam_va = xbox_HeapAlloc(0x100, 1);
+    /* Allocate camera struct in Xbox heap (0x220 bytes to cover full RwCamera + plugins) */
+    uint32_t cam_va = xbox_HeapAlloc(0x220, 1);
     if (cam_va == 0) {
-        fprintf(stderr, "  [RW-CAM] sub_001D9510: heap alloc failed\n");
+        fprintf(stderr, "  [RW-CAM] sub_001D9510: heap alloc failed (camera)\n");
         eax = 0;
         esp += 4; return;
     }
 
-    /* Initialize camera struct matching gen code (recomp_0005.c:11776-11826) */
-    float clip_val = MEMF(0x3B168C);   /* Default clip value */
-    MEMF(cam_va + 0x6C) = clip_val;
-    MEMF(cam_va + 0x68) = clip_val;
-    MEMF(cam_va + 0x74) = clip_val;
-    MEMF(cam_va + 0x70) = clip_val;
-    MEMF(cam_va + 0x7C) = 0.0f;
-    MEMF(cam_va + 0x78) = 0.0f;
-    MEMF(cam_va + 0x80) = MEMF(0x36C2D4);  /* near clip */
-    MEMF(cam_va + 0x84) = MEMF(0x36C418);  /* far clip */
-    MEMF(cam_va + 0x88) = MEMF(0x3B1694);  /* fog distance */
+    /* Allocate RwFrame (0xA4 = 164 bytes, zero-initialized) */
+    uint32_t frame_va = xbox_HeapAlloc(0xA4, 1);
+    if (frame_va == 0) {
+        fprintf(stderr, "  [RW-CAM] sub_001D9510: heap alloc failed (frame)\n");
+        eax = 0;
+        esp += 4; return;
+    }
 
-    MEM8(cam_va) = 4;        /* type = camera */
+    /* ── Initialize RwFrame ── */
+    /* +0x00: RwObject (type=0=frame, parent=0) */
+    MEM8(frame_va) = 0;         /* type = rwFRAME */
+    MEM32(frame_va + 4) = 0;    /* parent = NULL */
+
+    /* +0x18: modelling matrix (identity) */
+    MEMF(frame_va + 0x18) = 1.0f;  /* right.x */
+    MEMF(frame_va + 0x1C) = 0.0f;
+    MEMF(frame_va + 0x20) = 0.0f;
+    MEMF(frame_va + 0x24) = 0.0f;  /* flags/pad */
+    MEMF(frame_va + 0x28) = 0.0f;
+    MEMF(frame_va + 0x2C) = 1.0f;  /* up.y */
+    MEMF(frame_va + 0x30) = 0.0f;
+    MEMF(frame_va + 0x34) = 0.0f;
+    MEMF(frame_va + 0x38) = 0.0f;
+    MEMF(frame_va + 0x3C) = 0.0f;
+    MEMF(frame_va + 0x40) = 1.0f;  /* at.z */
+    MEMF(frame_va + 0x44) = 0.0f;
+    MEMF(frame_va + 0x48) = 0.0f;  /* pos.x */
+    MEMF(frame_va + 0x4C) = 0.0f;  /* pos.y */
+    MEMF(frame_va + 0x50) = 0.0f;  /* pos.z */
+    MEMF(frame_va + 0x54) = 0.0f;  /* pad3 / matrix flags */
+
+    /* +0x58: LTM (local-to-world, identity) */
+    MEMF(frame_va + 0x58) = 1.0f;  /* right.x */
+    MEMF(frame_va + 0x5C) = 0.0f;
+    MEMF(frame_va + 0x60) = 0.0f;
+    MEMF(frame_va + 0x64) = 0.0f;
+    MEMF(frame_va + 0x68) = 0.0f;
+    MEMF(frame_va + 0x6C) = 1.0f;  /* up.y */
+    MEMF(frame_va + 0x70) = 0.0f;
+    MEMF(frame_va + 0x74) = 0.0f;
+    MEMF(frame_va + 0x78) = 0.0f;
+    MEMF(frame_va + 0x7C) = 0.0f;
+    MEMF(frame_va + 0x80) = 1.0f;  /* at.z */
+    MEMF(frame_va + 0x84) = 0.0f;
+    MEMF(frame_va + 0x88) = 0.0f;  /* pos.x */
+    MEMF(frame_va + 0x8C) = 0.0f;  /* pos.y */
+    MEMF(frame_va + 0x90) = 0.0f;  /* pos.z */
+    MEMF(frame_va + 0x94) = 0.0f;
+
+    /* +0x98: child/next/root */
+    MEM32(frame_va + 0x98) = 0;          /* child = NULL */
+    MEM32(frame_va + 0x9C) = 0;          /* next = NULL */
+    MEM32(frame_va + 0xA0) = frame_va;   /* root = self */
+
+    /* ── Initialize RwCamera ── */
+    MEM8(cam_va) = 4;        /* type = rwCAMERA */
     MEM8(cam_va + 1) = 0;
     MEM8(cam_va + 2) = 0;
     MEM8(cam_va + 3) = 0;
-    MEM32(cam_va + 4) = 0;
+    MEM32(cam_va + 4) = frame_va;  /* parent → RwFrame (was NULL!) */
+
+    /* +0x08: inFrame link (point to self for valid linked list) */
+    MEM32(cam_va + 0x08) = cam_va + 0x08;  /* next → self */
+    MEM32(cam_va + 0x0C) = cam_va + 0x08;  /* prev → self */
 
     /* RW camera vtable entries (Xbox VAs of recompiled functions) */
-    MEM32(cam_va + 0x10) = 0x1D9130;   /* camera begin update */
-    MEM32(cam_va + 0x18) = 0x1D91B0;   /* camera end update */
-    MEM32(cam_va + 0x1C) = 0x1D9180;   /* camera clear */
-    MEM32(cam_va + 0x14) = 1;          /* flags */
-    MEM32(cam_va + 0x60) = 0;          /* parent */
-    MEM32(cam_va + 0x64) = 0;          /* parent frame */
-    MEM32(cam_va + 0x2C) = 0;
+    MEM32(cam_va + 0x10) = 0x1D9130;   /* camera sync callback */
+    MEM32(cam_va + 0x14) = 1;          /* flags = active */
+    MEM32(cam_va + 0x18) = 0x1D91B0;   /* end update callback */
+    MEM32(cam_va + 0x1C) = 0x1D9180;   /* clear callback */
 
-    /* Compute view window params (from gen code lines 11801-11818) */
+    /* Clip planes (from .rdata constants) */
+    float clip_val = MEMF(0x3B168C);
+    MEMF(cam_va + 0x68) = clip_val;
+    MEMF(cam_va + 0x6C) = clip_val;
+    MEMF(cam_va + 0x70) = clip_val;
+    MEMF(cam_va + 0x74) = clip_val;
+    MEMF(cam_va + 0x78) = 0.0f;
+    MEMF(cam_va + 0x7C) = 0.0f;
+
+    /* Near/far clip — use .rdata values but override if too small for racing */
+    float near_clip = MEMF(0x36C2D4);
+    float far_clip  = MEMF(0x36C418);
+    if (far_clip < 100.0f) far_clip = 5000.0f;  /* Racing needs large far plane */
+    if (near_clip < 0.01f) near_clip = 0.1f;
+    MEMF(cam_va + 0x80) = near_clip;
+    MEMF(cam_va + 0x84) = far_clip;
+    MEMF(cam_va + 0x88) = MEMF(0x3B1694);  /* fog distance */
+
+    /* viewWindow — compute from viewport globals, with sensible fallback */
     {
         float vw_min = MEMF(0x7592B8);
         float vw_max = MEMF(0x7592BC);
-        float half_range = (vw_max - vw_min) * MEMF(0x3B188C);
-        float reciprocal = (vw_max - vw_min) - half_range * 2.0f;
-        float vw_lo = half_range + vw_min;
-        float vw_hi = vw_max - half_range;
-        float vw_param = (vw_hi - vw_lo) * MEMF(0x36C414);
-        float vw_final = ((vw_hi + vw_lo) - vw_param * MEMF(0x36C410)) * MEMF(0x3B1684);
-        MEMF(cam_va + 0x8C) = vw_param;
-        MEMF(cam_va + 0x90) = vw_final;
+        float vw_x, vw_y;
+        if (vw_max - vw_min > 0.001f) {
+            /* Original gen code computation */
+            float half_range = (vw_max - vw_min) * MEMF(0x3B188C);
+            float vw_lo = half_range + vw_min;
+            float vw_hi = vw_max - half_range;
+            vw_x = (vw_hi - vw_lo) * MEMF(0x36C414);
+            vw_y = ((vw_hi + vw_lo) - vw_x * MEMF(0x36C410)) * MEMF(0x3B1684);
+        } else {
+            /* Fallback: standard RW camera for 640x480 (4:3 aspect, ~90° HFOV) */
+            vw_x = 1.0f;
+            vw_y = 0.75f;
+        }
+        MEMF(cam_va + 0x8C) = vw_x;
+        MEMF(cam_va + 0x90) = vw_y;
     }
 
-    /* Call sub_001E1AF0 (RW frame attach) to link camera to scene graph */
-    esi = cam_va;  /* Save for return */
-    PUSH32(esp, cam_va);
-    PUSH32(esp, 0x3C0810);  /* RW global frame list */
-    PUSH32(esp, 0); sub_001E1AF0();
-    esp += 8;
+    /* +0x40: projection type (1 = perspective) */
+    MEM32(cam_va + 0x40) = 1;
+
+    /* Other fields */
+    MEM32(cam_va + 0x60) = 0;    /* clump ref */
+    MEM32(cam_va + 0x64) = 0;
+    MEM32(cam_va + 0x2C) = 0;
+
+    /* Also link frame's objectList to camera */
+    MEM32(frame_va + 0x10) = cam_va + 0x08;  /* objectList.next → camera's inFrame */
+    MEM32(frame_va + 0x14) = cam_va + 0x08;  /* objectList.prev → camera's inFrame */
 
     static int cam_count = 0;
+    if (g_created_camera_count < 8)
+        g_created_cameras[g_created_camera_count++] = cam_va;
     cam_count++;
     if (cam_count <= 5)
-        fprintf(stderr, "  [RW-CAM] sub_001D9510: created camera at 0x%08X (near=%.2f far=%.1f)\n",
-                cam_va, MEMF(cam_va + 0x80), MEMF(cam_va + 0x84));
+        fprintf(stderr, "  [RW-CAM] sub_001D9510: camera=0x%08X frame=0x%08X "
+                "vw=(%.3f,%.3f) near=%.2f far=%.1f\n",
+                cam_va, frame_va,
+                MEMF(cam_va + 0x8C), MEMF(cam_va + 0x90),
+                MEMF(cam_va + 0x80), MEMF(cam_va + 0x84));
 
     eax = cam_va;
     esp += 4; return;

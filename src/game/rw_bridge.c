@@ -56,10 +56,14 @@ static int g_bridge_rendered = 0;
 static int g_bridge_in_scene = 0;
 static int g_bridge_frame_count = 0;
 
-/* Camera state extracted from Xbox memory */
+/* Camera state extracted from Xbox memory or RW frame LTM */
 static float g_cam_pos[3] = {0};
 static float g_cam_fov = 60.0f;
 static int g_cam_valid = 0;
+static int g_cam_from_frame = 0;  /* 1 = from RwFrame LTM, 0 = fallback */
+static float g_cam_right[3] = {1,0,0};
+static float g_cam_up[3]    = {0,1,0};
+static float g_cam_at[3]    = {0,0,1};
 
 /* 2D rendering queue for im2d calls */
 #define IM2D_MAX_VERTS 4096
@@ -242,32 +246,137 @@ int rw_bridge_frame_rendered(void)
  * The camera viewport data at 0x4D9180 contains position, FOV, etc.
  * Returns 1 if we got valid camera data.
  */
+/* Helper: resolve a pointer that may be Xbox VA, native, or mirror to a native pointer.
+ * Returns NULL if unresolvable. */
+static void *resolve_xbox_ptr(uint32_t ptr)
+{
+    if (ptr == 0) return NULL;
+    /* Direct Xbox VA */
+    if (ptr > 0x10000 && ptr < 0x4000000)
+        return (void*)((uintptr_t)ptr + g_xbox_mem_offset);
+    /* Native pointer in primary mapping */
+    if (ptr >= (uint32_t)g_xbox_mem_offset &&
+        ptr < (uint32_t)g_xbox_mem_offset + 0x4000000)
+        return (void*)(uintptr_t)ptr;
+    /* Mirror view: modulo 64MB to get physical Xbox VA */
+    if (ptr > 0x10000000) {
+        uint32_t phys = (ptr - (uint32_t)g_xbox_mem_offset) % 0x04000000u;
+        if (phys > 0x10000 && phys < 0x4000000)
+            return (void*)((uintptr_t)phys + g_xbox_mem_offset);
+    }
+    return NULL;
+}
+
 static int read_rw_camera_state(void)
 {
-    /* Check if we're in gameplay (camera ptr indicates active camera) */
+    /* Check which camera is active */
     uint32_t cam_ptr = BMEM32(RW_CAM_PTR_ACTIVE);
 
-    /* Read camera position from viewport area */
+    /* ── Try to read camera position from the RW camera's frame LTM ── */
+    /* Priority: active camera → created gameplay cameras → physics fallback */
+
+    /* Step 1: Try the active camera's frame */
+    if (cam_ptr > 0x10000 && cam_ptr < 0x4000000) {
+        uint32_t frame_raw = BMEM32(cam_ptr + 4);  /* RwObject.parent → RwFrame */
+        float *ltm = (float*)resolve_xbox_ptr(frame_raw);
+        if (ltm) {
+            ltm = (float*)((uint8_t*)ltm + 0x58);  /* offset to RwFrame.ltm */
+            float cx = ltm[12];  /* pos.x (RwMatrix row 3) */
+            float cy = ltm[13];  /* pos.y */
+            float cz = ltm[14];  /* pos.z */
+
+            if (cx != 0.0f || cy != 0.0f || cz != 0.0f) {
+                /* Valid camera position from frame LTM */
+                g_cam_pos[0] = cx;
+                g_cam_pos[1] = cy;
+                g_cam_pos[2] = cz;
+
+                /* Extract FOV from camera viewWindow (camera+0x8C) */
+                float vw = BMEMF(cam_ptr + 0x8C);
+                if (vw > 0.01f)
+                    g_cam_fov = atanf(vw) * 2.0f * 57.2958f;  /* Convert viewWindow to degrees */
+                else
+                    g_cam_fov = 60.0f;
+
+                /* Store camera orientation from LTM for view matrix construction */
+                g_cam_right[0] = ltm[0]; g_cam_right[1] = ltm[1]; g_cam_right[2] = ltm[2];
+                g_cam_up[0]    = ltm[4]; g_cam_up[1]    = ltm[5]; g_cam_up[2]    = ltm[6];
+                g_cam_at[0]    = ltm[8]; g_cam_at[1]    = ltm[9]; g_cam_at[2]    = ltm[10];
+
+                g_cam_valid = 1;
+                g_cam_from_frame = 1;
+
+                static int logged_frame = 0;
+                if (!logged_frame || (g_bridge_frame_count % 500) == 0) {
+                    fprintf(stderr, "[RW-BRIDGE] Camera (frame LTM): pos=(%.1f, %.1f, %.1f) "
+                            "FOV=%.1f cam=0x%08X frame=0x%08X\n",
+                            cx, cy, cz, g_cam_fov, cam_ptr, frame_raw);
+                    logged_frame = 1;
+                }
+                return 1;
+            }
+        }
+    }
+
+    /* Step 2: Try created gameplay cameras */
+    extern uint32_t g_created_cameras[];
+    extern int g_created_camera_count;
+    for (int i = 0; i < g_created_camera_count; i++) {
+        uint32_t cva = g_created_cameras[i];
+        if (cva > 0x10000 && cva < 0x4000000) {
+            uint32_t frame_raw = BMEM32(cva + 4);
+            float *ltm = (float*)resolve_xbox_ptr(frame_raw);
+            if (ltm) {
+                ltm = (float*)((uint8_t*)ltm + 0x58);
+                float cx = ltm[12], cy = ltm[13], cz = ltm[14];
+                if (cx != 0.0f || cy != 0.0f || cz != 0.0f) {
+                    g_cam_pos[0] = cx; g_cam_pos[1] = cy; g_cam_pos[2] = cz;
+                    float vw = BMEMF(cva + 0x8C);
+                    g_cam_fov = (vw > 0.01f) ? atanf(vw) * 2.0f * 57.2958f : 60.0f;
+                    g_cam_right[0] = ltm[0]; g_cam_right[1] = ltm[1]; g_cam_right[2] = ltm[2];
+                    g_cam_up[0]    = ltm[4]; g_cam_up[1]    = ltm[5]; g_cam_up[2]    = ltm[6];
+                    g_cam_at[0]    = ltm[8]; g_cam_at[1]    = ltm[9]; g_cam_at[2]    = ltm[10];
+                    g_cam_valid = 1;
+                    g_cam_from_frame = 1;
+                    return 1;
+                }
+            }
+        }
+    }
+
+    /* Step 3: Legacy fallback — read from viewport addresses */
     float cx = BMEMF(RW_CAM_WORLD_X);
     float cy = BMEMF(RW_CAM_WORLD_Y);
     float cz = BMEMF(RW_CAM_WORLD_Z);
     float fov = BMEMF(RW_CAM_FOV);
 
-    /* If RW camera has no position but we're in gameplay mode,
-     * derive camera from the physics body position.
-     * Physics body at 0x5FFF00: +0x10=pos_x, +0x14=pos_y, +0x18=heading */
-    if (cx == 0.0f && cy == 0.0f && cz == 0.0f) {
+    if (cx != 0.0f || cy != 0.0f || cz != 0.0f) {
+        if (fov < 1.0f || fov > 179.0f) fov = 60.0f;
+        g_cam_pos[0] = cx; g_cam_pos[1] = cy; g_cam_pos[2] = cz;
+        g_cam_fov = fov;
+        g_cam_valid = 1;
+        g_cam_from_frame = 0;
+
+        static int logged = 0;
+        if (!logged || (g_bridge_frame_count % 500) == 0) {
+            fprintf(stderr, "[RW-BRIDGE] Camera (viewport): pos=(%.1f, %.1f, %.1f) FOV=%.1f cam_ptr=0x%08X\n",
+                    cx, cy, cz, fov, cam_ptr);
+            logged = 1;
+        }
+        return 1;
+    }
+
+    /* Step 4: Physics body fallback for gameplay */
+    {
         uint32_t game_st = BMEM32(0x4D53B8);
         extern int fe_menu_is_racing(void);
-        if (cam_ptr == 0x4D45D0 || game_st == 4 || fe_menu_is_racing()) {
-            /* Read physics body via same path as TICK log */
+        if (cam_ptr == RW_CAM_GAMEPLAY || game_st == 4 || fe_menu_is_racing()) {
             uint32_t vel_ptr = BMEM32(0x557880 + 0x1B4);
             float phys_x = 0, phys_y = 0;
             if (vel_ptr > 0x100 && vel_ptr < 0x3FFFFFF) {
                 phys_x = BMEMF(vel_ptr + 0x10);
                 phys_y = BMEMF(vel_ptr + 0x14);
             } else {
-                /* Fallback: direct address */
                 phys_x = BMEMF(0x5FFF10);
                 phys_y = BMEMF(0x5FFF14);
             }
@@ -276,21 +385,16 @@ static int read_rw_camera_state(void)
             float spd = (vel_ptr > 0x100 && vel_ptr < 0x3FFFFFF)
                         ? BMEMF(vel_ptr + 0x1C) : BMEMF(0x5FFF1C);
 
-            /* Place camera behind car based on heading.
-             * Physics uses XZ plane (phys_x=X, phys_y=Z in world).
-             * Camera Y is elevated above the car position. */
             float cam_dist = 15.0f + fabsf(spd) * 0.2f;
             cx = phys_x - sinf(hdg) * cam_dist;
-            cy = 5.0f;   /* height above car (relative, not world) */
+            cy = 5.0f;
             cz = phys_y - cosf(hdg) * cam_dist;
-            fov = 75.0f;  /* wider FOV for racing */
 
             if (cx != 0.0f || cz != 0.0f) {
-                g_cam_pos[0] = cx;
-                g_cam_pos[1] = cy;
-                g_cam_pos[2] = cz;
-                g_cam_fov = fov;
+                g_cam_pos[0] = cx; g_cam_pos[1] = cy; g_cam_pos[2] = cz;
+                g_cam_fov = 75.0f;
                 g_cam_valid = 1;
+                g_cam_from_frame = 0;
 
                 static int logged_phy = 0;
                 if (!logged_phy || (g_bridge_frame_count % 500) == 0) {
@@ -302,34 +406,36 @@ static int read_rw_camera_state(void)
                 return 1;
             }
         }
-        return 0;
     }
 
-    /* Validate FOV range */
-    if (fov < 1.0f || fov > 179.0f)
-        fov = 60.0f;
-
-    g_cam_pos[0] = cx;
-    g_cam_pos[1] = cy;
-    g_cam_pos[2] = cz;
-    g_cam_fov = fov;
-    g_cam_valid = 1;
-
-    static int logged = 0;
-    if (!logged || (g_bridge_frame_count % 500) == 0) {
-        fprintf(stderr, "[RW-BRIDGE] Camera: pos=(%.1f, %.1f, %.1f) FOV=%.1f cam_ptr=0x%08X\n",
-                cx, cy, cz, fov, cam_ptr);
-        logged = 1;
-    }
-
-    return 1;
+    return 0;
 }
 
 int rw_bridge_get_camera_view(float *out_matrix)
 {
     if (!g_cam_valid) return 0;
 
-    /* Build a simple look-at view matrix from camera position. */
+    /* If we have a valid frame LTM, build the view matrix directly from it.
+     * View matrix = inverse of camera world transform.
+     * For an orthonormal rotation matrix, inverse = transpose. */
+    if (g_cam_from_frame) {
+        float *r = g_cam_right;  /* Camera X axis in world */
+        float *u = g_cam_up;     /* Camera Y axis in world */
+        float *a = g_cam_at;     /* Camera Z axis in world (forward) */
+        float *p = g_cam_pos;    /* Camera position in world */
+
+        /* Transpose of rotation, then negate-dot for translation */
+        out_matrix[0]  = r[0];  out_matrix[1]  = u[0];  out_matrix[2]  = a[0];  out_matrix[3]  = 0;
+        out_matrix[4]  = r[1];  out_matrix[5]  = u[1];  out_matrix[6]  = a[1];  out_matrix[7]  = 0;
+        out_matrix[8]  = r[2];  out_matrix[9]  = u[2];  out_matrix[10] = a[2];  out_matrix[11] = 0;
+        out_matrix[12] = -(r[0]*p[0] + r[1]*p[1] + r[2]*p[2]);
+        out_matrix[13] = -(u[0]*p[0] + u[1]*p[1] + u[2]*p[2]);
+        out_matrix[14] = -(a[0]*p[0] + a[1]*p[1] + a[2]*p[2]);
+        out_matrix[15] = 1.0f;
+        return 1;
+    }
+
+    /* Fallback: build look-at view matrix from camera position */
     float eye[3] = { g_cam_pos[0], g_cam_pos[1], g_cam_pos[2] };
 
     /* Try car world matrix at 0x4D6850 first */
@@ -343,13 +449,11 @@ int rw_bridge_get_camera_view(float *out_matrix)
         target[1] = car_y;
         target[2] = car_z;
     } else {
-        /* Fallback: use physics body position as look-at target.
-         * Physics: +0x10=X, +0x14=Z (world XZ plane). Y=0 (ground). */
         float phys_x = BMEMF(0x5FFF10);
         float phys_z = BMEMF(0x5FFF14);
         if (phys_x != 0.0f || phys_z != 0.0f) {
             target[0] = phys_x;
-            target[1] = 0.0f;   /* ground level */
+            target[1] = 0.0f;
             target[2] = phys_z;
         } else {
             target[0] = eye[0];
