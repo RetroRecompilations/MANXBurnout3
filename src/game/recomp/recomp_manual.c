@@ -3322,8 +3322,71 @@ void sub_000110E0(void)
  */
 void sub_00135040(void)
 {
-    fprintf(stderr, "  [STUB] sub_00135040 (audio init) - skipped\n");
-    esp += 4; return; /* ret: pop dummy return address */
+    /* edi = audio subsystem struct base (set by caller, typically 0x40B310)
+     *
+     * The original function:
+     *   1. Calls sub_001526A0 (resource pipeline setup)
+     *   2. Calls sub_001CA350 (RW audio init) — this sets 0x73A190/0x73A194
+     *   3. Calls sub_001F7150 x2 (RW pipeline alloc) — returns handles
+     *   4. Sets up buffer pointers at edi+0x520/0x524/0x528
+     *   5. Enters RW pipeline iteration (spin-loop) — we skip this
+     *   6. Initializes resource slots at edi+0x6B50-0x6B60
+     *
+     * Our override: set the critical fields directly and mark audio as ready.
+     * The DirectSound device already exists (dsound_device.c), so the game's
+     * audio state machine (sub_0013EA20) can proceed.
+     */
+
+    /* edi is the audio subsystem base — check it's valid */
+    if (edi < 0x10000 || edi > 0x4000000) {
+        fprintf(stderr, "  [AUDIO-INIT] sub_00135040: invalid edi=0x%08X, skipping\n", edi);
+        esp += 4; return;
+    }
+
+    fprintf(stderr, "  [AUDIO-INIT] sub_00135040: initializing audio subsystem at 0x%08X\n", edi);
+
+    /* Set audio enable flags — sub_0013EA20 checks (0x73A190 | 0x73A194) != 0 */
+    MEM32(0x73A190) = edi;       /* Audio subsystem pointer A */
+    MEM32(0x73A194) = edi + 4;   /* Audio subsystem pointer B */
+
+    /* Set up buffer pointers (matches gen code lines 180246-180264) */
+    MEM32(edi + 0x520) = 0x411E80;  /* Audio buffer base */
+    MEM32(edi + 0x524) = 0x411E9C;  /* Streaming buffer base */
+    MEM32(edi + 0x528) = 1;         /* Initialized flag */
+
+    /* Initialize audio buffer memory */
+    MEM32(0x411E88) = 0;  /* RW pipe handle A (would come from sub_001F7150) */
+    MEMF(0x411E84) = 0.0f;
+    MEM32(0x411E90) = 0;
+    MEM32(0x411EA4) = 0;  /* RW pipe handle B */
+    MEMF(0x411EA0) = 0.0f;
+    MEM32(0x411EAC) = 0;
+
+    /* Clear resource slots */
+    MEM32(edi + 0x6B50) = 0;
+    MEM32(edi + 0x6B54) = 0;
+    MEM32(edi + 0x6B58) = 0;
+    MEM32(edi + 0x6B5C) = 0;
+    MEM32(edi + 0x6B60) = 1;  /* Resource init complete flag */
+
+    /* Mark init flag so we don't re-enter */
+    MEM8(edi + 0x2E04) = 1;
+
+    /* Zero the audio state controller fields that sub_0013EA20 checks */
+    MEM8(edi + 4) = 0;
+
+    /* Initialize the audio context pointer (used all over the audio code) */
+    MEM32(0x73A19C) = edi;
+
+    /* Set initial audio state values that sub_0013EA20 needs */
+    MEM8(0x411E74) = 0;    /* Master volume byte */
+    MEMF(0x3EBFCC) = 0.0f; /* Volume accumulator */
+    MEMF(0x4A1EF0) = 0.0f; /* Volume output */
+
+    fprintf(stderr, "  [AUDIO-INIT] Audio subsystem initialized: enable=0x%08X/0x%08X ctx=0x%08X\n",
+            MEM32(0x73A190), MEM32(0x73A194), MEM32(0x73A19C));
+
+    esp += 4; return;
 }
 
 /**
@@ -4618,26 +4681,30 @@ void sub_001AA100(void)
 
     case 4: {
         /* Phase 4: call sub_0013EA20 (audio/sound bank init).
-         * Audio system (DirectSound) is stubbed, so this may never return 1.
-         * Skip after a few attempts. */
+         * Audio system is now initialized via our sub_00135040 override.
+         * sub_0013EA20 manages the sound bank state machine — it needs
+         * multiple calls to progress through its internal states.
+         * Timeout after 15 tries (it may not fully complete without
+         * RW pipeline nodes, but it sets enough state to proceed). */
         static uint32_t phase4_tries = 0;
         phase4_tries++;
         PUSH32(esp, 0x40E120);
         PUSH32(esp, 0); sub_0013EA20();
         if ((eax & 0xFF) == 0) {
-            if (phase4_tries <= 5) {
-                fprintf(stderr, "  [1AA100] Phase 4: sub_0013EA20 returned 0 (try %u)\n",
-                        phase4_tries);
-                if (phase4_tries >= 5) {
-                    fprintf(stderr, "  [1AA100] Phase 4: skipping audio init (stubbed)\n");
+            if (phase4_tries <= 15) {
+                if (phase4_tries <= 3 || (phase4_tries % 5) == 0)
+                    fprintf(stderr, "  [1AA100] Phase 4: sub_0013EA20 returned 0 (try %u)\n",
+                            phase4_tries);
+                if (phase4_tries >= 15) {
+                    fprintf(stderr, "  [1AA100] Phase 4: audio init timeout after %u tries, advancing\n",
+                            phase4_tries);
                     MEM32(bp + 0x144384) = 5;
-                    goto ret0; /* will advance next call */
+                    goto ret0;
                 }
                 goto ret0;
             }
-            /* Already advanced phase, fall through */
         } else {
-            fprintf(stderr, "  [1AA100] Phase 4 → 5: audio ready\n");
+            fprintf(stderr, "  [1AA100] Phase 4 → 5: audio ready (try %u)\n", phase4_tries);
         }
         MEM32(bp + 0x144384) = 5;
         /* fall through */
