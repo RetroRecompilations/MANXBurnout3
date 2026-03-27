@@ -2265,6 +2265,38 @@ void sub_00351090(void)
 
         if (in_gameplay && cam_va > 0x10000 && cam_va < 0x4000000) {
             uint32_t frame_raw = MEM32(cam_va + 4);
+
+            /* If gameplay camera has no frame, allocate and attach one */
+            if (frame_raw == 0) {
+                static uint32_t gameplay_frame_va = 0;
+                if (gameplay_frame_va == 0) {
+                    gameplay_frame_va = xbox_HeapAlloc(0xA4, 1);
+                    if (gameplay_frame_va) {
+                        /* Initialize identity LTM */
+                        float *f = (float*)XBOX_PTR(gameplay_frame_va + 0x58);
+                        f[0]=1; f[1]=0; f[2]=0; f[3]=0;
+                        f[4]=0; f[5]=1; f[6]=0; f[7]=0;
+                        f[8]=0; f[9]=0; f[10]=1; f[11]=0;
+                        f[12]=0; f[13]=0; f[14]=0; f[15]=0;
+                        /* Also identity modelling matrix at +0x18 */
+                        float *m = (float*)XBOX_PTR(gameplay_frame_va + 0x18);
+                        m[0]=1; m[1]=0; m[2]=0; m[3]=0;
+                        m[4]=0; m[5]=1; m[6]=0; m[7]=0;
+                        m[8]=0; m[9]=0; m[10]=1; m[11]=0;
+                        m[12]=0; m[13]=0; m[14]=0; m[15]=0;
+                        MEM32(gameplay_frame_va + 0x98) = 0;  /* child */
+                        MEM32(gameplay_frame_va + 0x9C) = 0;  /* next */
+                        MEM32(gameplay_frame_va + 0xA0) = gameplay_frame_va;  /* root */
+                        fprintf(stderr, "  [RW-CAM] Allocated frame 0x%08X for gameplay camera 0x%08X\n",
+                                gameplay_frame_va, cam_va);
+                    }
+                }
+                if (gameplay_frame_va) {
+                    MEM32(cam_va + 4) = gameplay_frame_va;
+                    frame_raw = gameplay_frame_va;
+                }
+            }
+
             float *ltm = NULL;
             if (frame_raw > 0x10000 && frame_raw < 0x4000000) {
                 ltm = (float*)XBOX_PTR(frame_raw + 0x58);
