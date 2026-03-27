@@ -234,6 +234,50 @@ typedef enum D3DRENDERSTATETYPE {
     D3DRS_PSALPHAINPUTS7           = 207,
     D3DRS_PSFINALCOMBINERINPUTSABCD = 208,
     D3DRS_PSFINALCOMBINERINPUTSEFG  = 209,
+    D3DRS_PSRGBINPUTS0             = 210,
+    D3DRS_PSRGBINPUTS1             = 211,
+    D3DRS_PSRGBINPUTS2             = 212,
+    D3DRS_PSRGBINPUTS3             = 213,
+    D3DRS_PSRGBINPUTS4             = 214,
+    D3DRS_PSRGBINPUTS5             = 215,
+    D3DRS_PSRGBINPUTS6             = 216,
+    D3DRS_PSRGBINPUTS7             = 217,
+    D3DRS_PSRGBOUTPUTS0            = 218,
+    D3DRS_PSRGBOUTPUTS1            = 219,
+    D3DRS_PSRGBOUTPUTS2            = 220,
+    D3DRS_PSRGBOUTPUTS3            = 221,
+    D3DRS_PSRGBOUTPUTS4            = 222,
+    D3DRS_PSRGBOUTPUTS5            = 223,
+    D3DRS_PSRGBOUTPUTS6            = 224,
+    D3DRS_PSRGBOUTPUTS7            = 225,
+    D3DRS_PSALPHAOUTPUTS0          = 226,
+    D3DRS_PSALPHAOUTPUTS1          = 227,
+    D3DRS_PSALPHAOUTPUTS2          = 228,
+    D3DRS_PSALPHAOUTPUTS3          = 229,
+    D3DRS_PSALPHAOUTPUTS4          = 230,
+    D3DRS_PSALPHAOUTPUTS5          = 231,
+    D3DRS_PSALPHAOUTPUTS6          = 232,
+    D3DRS_PSALPHAOUTPUTS7          = 233,
+    D3DRS_PSCOMBINERCOUNT          = 234,
+    D3DRS_PSCONSTANT0_0            = 235,
+    D3DRS_PSCONSTANT0_1            = 236,
+    D3DRS_PSCONSTANT0_2            = 237,
+    D3DRS_PSCONSTANT0_3            = 238,
+    D3DRS_PSCONSTANT0_4            = 239,
+    D3DRS_PSCONSTANT0_5            = 240,
+    D3DRS_PSCONSTANT0_6            = 241,
+    D3DRS_PSCONSTANT0_7            = 242,
+    D3DRS_PSCONSTANT1_0            = 243,
+    D3DRS_PSCONSTANT1_1            = 244,
+    D3DRS_PSCONSTANT1_2            = 245,
+    D3DRS_PSCONSTANT1_3            = 246,
+    D3DRS_PSCONSTANT1_4            = 247,
+    D3DRS_PSCONSTANT1_5            = 248,
+    D3DRS_PSCONSTANT1_6            = 249,
+    D3DRS_PSCONSTANT1_7            = 250,
+    D3DRS_PSTEXTUREMODES           = 251,
+    D3DRS_PSDOTMAPPING             = 252,
+    D3DRS_PSINPUTTEXTURE           = 253,
 } D3DRENDERSTATETYPE;
 
 typedef enum D3DTEXTURESTAGESTATETYPE {
@@ -266,19 +310,46 @@ typedef enum D3DTEXTURESTAGESTATETYPE {
 } D3DTEXTURESTAGESTATETYPE;
 
 typedef enum D3DTEXTUREOP {
-    D3DTOP_DISABLE    = 1,
-    D3DTOP_SELECTARG1 = 2,
-    D3DTOP_SELECTARG2 = 3,
-    D3DTOP_MODULATE   = 4,
-    D3DTOP_MODULATE2X = 5,
-    D3DTOP_MODULATE4X = 6,
-    D3DTOP_ADD        = 7,
-    D3DTOP_ADDSIGNED  = 8,
-    D3DTOP_SUBTRACT   = 10,
-    D3DTOP_DOTPRODUCT3 = 24,
-    D3DTOP_MULTIPLYADD = 25,
-    D3DTOP_LERP       = 26,
+    D3DTOP_DISABLE              = 1,
+    D3DTOP_SELECTARG1           = 2,
+    D3DTOP_SELECTARG2           = 3,
+    D3DTOP_MODULATE             = 4,
+    D3DTOP_MODULATE2X           = 5,
+    D3DTOP_MODULATE4X           = 6,
+    D3DTOP_ADD                  = 7,
+    D3DTOP_ADDSIGNED            = 8,
+    D3DTOP_ADDSIGNED2X          = 9,
+    D3DTOP_SUBTRACT             = 10,
+    D3DTOP_ADDSMOOTH            = 11,
+    D3DTOP_BLENDDIFFUSEALPHA    = 12,
+    D3DTOP_BLENDTEXTUREALPHA    = 13,
+    D3DTOP_BLENDFACTORALPHA     = 14,
+    D3DTOP_BLENDCURRENTALPHA    = 15,
+    D3DTOP_PREMODULATE          = 16,
+    D3DTOP_DOTPRODUCT3          = 24,
+    D3DTOP_MULTIPLYADD          = 25,
+    D3DTOP_LERP                 = 26,
 } D3DTEXTUREOP;
+
+/* Texture argument flags (D3DTA_*) */
+#define D3DTA_DIFFUSE           0x00
+#define D3DTA_CURRENT           0x01
+#define D3DTA_TEXTURE           0x02
+#define D3DTA_TFACTOR           0x03
+#define D3DTA_SPECULAR          0x04
+#define D3DTA_COMPLEMENT        0x10
+#define D3DTA_ALPHAREPLICATE    0x20
+
+/* Light types */
+#define D3DLIGHT_POINT          1
+#define D3DLIGHT_SPOT           2
+#define D3DLIGHT_DIRECTIONAL    3
+
+/* Fog modes */
+#define D3DFOG_NONE             0
+#define D3DFOG_EXP              1
+#define D3DFOG_EXP2             2
+#define D3DFOG_LINEAR           3
 
 typedef enum D3DBLEND {
     D3DBLEND_ZERO            = 1,

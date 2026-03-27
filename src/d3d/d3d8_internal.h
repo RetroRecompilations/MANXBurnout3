@@ -34,6 +34,12 @@ const DWORD         *d3d8_GetTSS(DWORD stage);
 /* Transform accessors */
 const D3DMATRIX     *d3d8_GetTransform(D3DTRANSFORMSTATETYPE type);
 
+/* Lighting accessors (d3d8_device.c) */
+const D3DLIGHT8     *d3d8_GetLight(DWORD index);
+BOOL                 d3d8_GetLightEnable(DWORD index);
+const D3DMATERIAL8  *d3d8_GetMaterial(void);
+UINT                 d3d8_GetNumLights(void);
+
 /* ================================================================
  * Resource wrapper structures
  * ================================================================ */
@@ -112,6 +118,18 @@ void    d3d8_shaders_shutdown(void);
 
 /* Bind shaders + input layout for the given FVF, upload transform CBs */
 void    d3d8_shaders_prepare_draw(DWORD fvf);
+
+/* ================================================================
+ * NV2A Register Combiner pixel shaders (d3d8_combiners.c)
+ * ================================================================ */
+
+#include "d3d8_combiners.h"
+
+/* ================================================================
+ * NV2A Programmable Vertex Shaders (d3d8_vsh.c)
+ * ================================================================ */
+
+#include "d3d8_vsh.h"
 
 /* ================================================================
  * Render state management (d3d8_states.c)
