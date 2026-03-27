@@ -5298,3 +5298,55 @@ void sub_0034C2E0(void)
 
     esp += 4; return;
 }
+
+/**
+ * sub_00040820 - WaterFresnel texture array loader (STUB)
+ *
+ * Original: 0x00040820 - 0x00040855 (53 bytes) + tail call to
+ *           sub_00040860 (0x00040860 - 0x00040AE0, 640 bytes)
+ * CC: stdcall, 1 param (ret 4)
+ *
+ * Loads 17 WaterFresnel effect textures from "Graphics/%d.bum" files
+ * into an array of raster pointers at the address given by the parameter.
+ * Each iteration calls sub_00352560 (D3D surface creation), sub_001D2879
+ * (RW raster alloc), locks the surface, reads data via ICALL vtable, and
+ * memcpy's texture data.
+ *
+ * Crashes because: sub_001B33A0 (stream reader) is stubbed to mark-complete
+ * without loading data, so D3D surface creation returns garbage pointers.
+ * The memcpy (rep movsd) then reads from esi=0x80000000 (Xbox kernel range)
+ * which is unmapped, causing an access violation in VCRUNTIME140.dll memcpy.
+ *
+ * Stub: zeroes the 17-pointer array (no water fresnel textures) and returns
+ * success. The rendering pipeline should handle NULL raster pointers.
+ */
+void sub_00040820(void)
+{
+    /* Read parameter: address of 17-pointer array */
+    uint32_t arr_va = MEM32(esp + 4);
+
+    /* Zero out the 17 raster pointers (0x11 × 4 = 68 bytes) */
+    for (int i = 0; i < 0x11; i++) {
+        MEM32(arr_va + i * 4) = 0;
+    }
+
+    fprintf(stderr, "  [RW-TEX] sub_00040820: WaterFresnel stubbed, zeroed 17 ptrs at 0x%08X\n", arr_va);
+
+    eax = 1;  /* success (al=1, matching gen code return) */
+    esp += 8; return;  /* ret 4: pop return addr + 1 param */
+}
+
+/**
+ * sub_00040860 - WaterFresnel inner loop (STUB)
+ *
+ * Original: 0x00040860 - 0x00040AE0 (640 bytes, 224 insns)
+ * Tail-called from sub_00040820. Never reached with our override,
+ * but declared to satisfy linker references.
+ */
+void sub_00040860(void)
+{
+    /* Should never be reached - sub_00040820 override returns directly */
+    fprintf(stderr, "  [RW-TEX] sub_00040860: unexpected call (should not happen)\n");
+    eax = 1;
+    esp += 8; return;
+}
