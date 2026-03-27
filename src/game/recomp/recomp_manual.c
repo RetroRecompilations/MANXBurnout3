@@ -2253,6 +2253,84 @@ void sub_00351090(void)
     if (MEM32(dev_va + 0x1974) == 0) MEM32(dev_va + 0x1974) = 0x3A1F;
     if (MEM32(dev_va + 0x1978) == 0) MEM32(dev_va + 0x1978) = 0x3A25;
 
+    /* ═══ UPDATE DEVICE MATRICES FROM CAMERA FRAME ═══
+     * Since RwCameraBeginUpdate is never called by the D3D8LTCG pipeline,
+     * we populate the device view/projection matrices ourselves from the
+     * active camera's RwFrame LTM. This ensures the gen code render chain
+     * uses the correct camera transform.
+     *
+     * dev+0xCA0: Projection-like matrix (scale + depth)
+     * dev+0xC60: View/flip matrix (coordinate system conversion)
+     */
+    {
+        uint32_t cam_va = MEM32(0x4D5370);  /* Active camera */
+        if (cam_va > 0x10000 && cam_va < 0x4000000) {
+            /* Read viewWindow from camera struct */
+            float vw_x = MEMF(cam_va + 0x8C);
+            float vw_y = MEMF(cam_va + 0x90);
+            float near_clip = MEMF(cam_va + 0x80);
+            float far_clip  = MEMF(cam_va + 0x84);
+
+            /* If camera has valid viewWindow, update the projection-like matrix at +0xCA0 */
+            if (vw_x > 0.001f && vw_y > 0.001f && far_clip > near_clip) {
+                float *proj = (float*)XBOX_PTR(dev_va + 0xCA0);
+                /* RW-style projection: 1/vw_x and 1/vw_y are the scale factors */
+                float sx = 1.0f / vw_x;
+                float sy = 1.0f / vw_y;
+                float q = far_clip / (far_clip - near_clip);
+
+                proj[0]  = sx;   proj[1]  = 0;    proj[2]  = 0;    proj[3]  = 0;
+                proj[4]  = 0;    proj[5]  = sy;   proj[6]  = 0;    proj[7]  = 0;
+                proj[8]  = 0;    proj[9]  = 0;    proj[10] = q;    proj[11] = 1.0f;
+                proj[12] = 0;    proj[13] = 0;    proj[14] = -q * near_clip; proj[15] = 0;
+            }
+
+            /* Read camera frame and update view matrix at +0xC60 */
+            uint32_t frame_raw = MEM32(cam_va + 4);
+            /* Resolve frame pointer (may be Xbox VA, native, or mirror) */
+            float *ltm = NULL;
+            if (frame_raw > 0x10000 && frame_raw < 0x4000000) {
+                ltm = (float*)XBOX_PTR(frame_raw + 0x58);
+            } else if (frame_raw > 0x10000000) {
+                uint32_t phys = (frame_raw - (uint32_t)g_xbox_mem_offset) % 0x04000000u;
+                if (phys > 0x10000 && phys < 0x4000000)
+                    ltm = (float*)XBOX_PTR(phys + 0x58);
+            }
+
+            if (ltm) {
+                float px = ltm[12], py = ltm[13], pz = ltm[14];
+                float pos_mag2 = px*px + py*py + pz*pz;
+                /* Only update device matrices when camera has a real position
+                 * (at least 1 unit from origin). Menu cameras sit at (0,0,0)
+                 * and their LTM orientation may be garbage. */
+                if (pos_mag2 > 1.0f) {
+                    /* Build view matrix from frame LTM (inverse of world transform) */
+                    float *view = (float*)XBOX_PTR(dev_va + 0xC60);
+                    float rx = ltm[0], ry = ltm[1], rz = ltm[2];   /* right */
+                    float ux = ltm[4], uy = ltm[5], uz = ltm[6];   /* up */
+                    float ax = ltm[8], ay = ltm[9], az = ltm[10];  /* at */
+
+                    /* Transpose rotation, negate-dot translation */
+                    view[0]  = rx;   view[1]  = ux;   view[2]  = ax;   view[3]  = 0;
+                    view[4]  = ry;   view[5]  = uy;   view[6]  = ay;   view[7]  = 0;
+                    view[8]  = rz;   view[9]  = uz;   view[10] = az;   view[11] = 0;
+                    view[12] = -(rx*px + ry*py + rz*pz);
+                    view[13] = -(ux*px + uy*py + uz*pz);
+                    view[14] = -(ax*px + ay*py + az*pz);
+                    view[15] = 1.0f;
+
+                    static int logged_update = 0;
+                    if (!logged_update || (call_count % 500) == 0) {
+                        fprintf(stderr, "  [RW-CAM] Updated device matrices from camera 0x%08X frame LTM\n"
+                                "           pos=(%.1f,%.1f,%.1f) vw=(%.3f,%.3f)\n",
+                                cam_va, px, py, pz, vw_x, vw_y);
+                        logged_update = 1;
+                    }
+                }
+            }
+        }
+    }
+
     if (g_gen_render_chain_enabled && (ebx_flag & 3)) {
         /* ═══ GEN CODE RENDER CHAIN ═══
          * Calls the real D3D8LTCG pipeline. Requires fully initialized device
