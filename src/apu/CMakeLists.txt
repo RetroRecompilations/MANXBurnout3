@@ -10,6 +10,7 @@ add_library(apu_emu STATIC
     apu_vp.c
     apu_dsp.c
     apu_mmio_hook.c
+    apu_xaudio2.c
 )
 
 target_include_directories(apu_emu PRIVATE
@@ -31,5 +32,5 @@ if(MSVC)
     )
 endif()
 
-# Link kernel32 for threading, winmm for waveOut audio output
-target_link_libraries(apu_emu PRIVATE kernel32 winmm)
+# Link kernel32 for threading, winmm for waveOut fallback, ole32 for CoInitializeEx
+target_link_libraries(apu_emu PRIVATE kernel32 winmm ole32)
