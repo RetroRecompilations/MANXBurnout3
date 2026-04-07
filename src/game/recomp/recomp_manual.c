@@ -2852,15 +2852,30 @@ void sub_001D7D10(void)
                 else if (draw_mode == 6) { prim_count = idx_count / 3; d3d_type = 4; }
 
                 if (prim_count > 0 && vert_count < 65536) {
-                    /* Convert: skip packed_normal (offset 12, 4 bytes) */
-                    static uint8_t cvt_buf[65536 * 24]; /* 24 bytes per vert */
+                    /* Convert: skip packed_normal, brighten vertex colors.
+                     * Xbox vertex colors are pre-lit ambient (~20-30 range).
+                     * Boost them so geometry is visible without full lighting. */
+                    static uint8_t cvt_buf[65536 * 24];
                     for (uint32_t v = 0; v < vert_count; v++) {
                         uint8_t *s = src_vb + v * 28;
                         uint8_t *d = cvt_buf + v * 24;
                         memcpy(d, s, 12);       /* pos (float3) */
-                        memcpy(d+12, s+16, 4);  /* color (uint32) */
+                        /* Brighten color: clamp(color * 4, 255) */
+                        uint8_t *sc = s + 16;
+                        uint8_t r = sc[2], g = sc[1], b = sc[0], a = sc[3];
+                        d[12] = (b * 4 > 255) ? 255 : b * 4;
+                        d[13] = (g * 4 > 255) ? 255 : g * 4;
+                        d[14] = (r * 4 > 255) ? 255 : r * 4;
+                        d[15] = a ? a : 255;
                         memcpy(d+16, s+20, 8);  /* UV (float2) */
                     }
+
+                    /* Set render state for world-space geometry */
+                    dev->lpVtbl->SetRenderState(dev, D3DRS_LIGHTING, FALSE);
+                    dev->lpVtbl->SetRenderState(dev, D3DRS_ZENABLE, TRUE);
+                    dev->lpVtbl->SetRenderState(dev, D3DRS_ZWRITEENABLE, TRUE);
+                    dev->lpVtbl->SetRenderState(dev, D3DRS_CULLMODE, D3DCULL_NONE);
+
                     dev->lpVtbl->DrawIndexedPrimitiveUP(dev,
                         d3d_type, 0, vert_count, prim_count,
                         indices, D3DFMT_INDEX16,
