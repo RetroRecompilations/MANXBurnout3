@@ -645,6 +645,14 @@ int rw_bridge_camera_render(uint32_t camera_va)
         rw_bridge_camera_begin(camera_va);
     }
 
+    /* Parse any push buffer commands written by the gen code render chain
+     * (sub_00351770_gen). This picks up vertex data from the D3D8LTCG
+     * pipeline and translates it through the NV2A→D3D11 translator. */
+    {
+        extern void parse_live_pushbuffer(void);
+        parse_live_pushbuffer();
+    }
+
     /* Render track geometry via direct D3D8 DrawPrimitiveUP.
      * Pre-transforms track verts to screen space and draws in batches. */
     {

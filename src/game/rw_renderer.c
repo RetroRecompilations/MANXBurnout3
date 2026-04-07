@@ -1298,8 +1298,20 @@ static DWORD track_height_color(float y, float ground_y, uint32_t ao_color)
     return 0xFF000000 | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
 }
 
+/* Track directory (e.g., "Burnout 3 Takedown/Tracks/EU/C1_V1") for file loading */
+static char g_track_dir[512] = {0};
+
+const char *rw_get_track_dir(void) { return g_track_dir; }
+
 int rw_load_track(const char *path)
 {
+    /* Store track directory for file loading (strip filename from path) */
+    strncpy(g_track_dir, path, sizeof(g_track_dir) - 1);
+    g_track_dir[sizeof(g_track_dir) - 1] = '\0';
+    char *last_sep = strrchr(g_track_dir, '\\');
+    if (!last_sep) last_sep = strrchr(g_track_dir, '/');
+    if (last_sep) *last_sep = '\0';
+
     /* Unload any existing track first */
     rw_unload_track();
 
@@ -1898,8 +1910,6 @@ void rw_gameplay_render(void)
         mat4_multiply(world_m, trans_m, rot_m);
         rw_render_mesh(g_player_mesh, world_m);
     }
-
-    /* Traffic disabled in fly-cam mode */
 
     /* ── HUD overlay ── */
     render_3d_hud(dev);

@@ -184,6 +184,7 @@ void sub_001D9450(void);
 void sub_001D94A0(void);
 void sub_001D94D0(void);
 void sub_001D9510(void);
+void sub_001D7D10(void);
 void sub_001D7D50(void);
 void sub_001D7D70(void);
 void sub_001D9700(void);
@@ -341,6 +342,7 @@ static const struct {
     { 0x001D94A0u, (recomp_func_t)sub_001D94A0 },
     { 0x001D94D0u, (recomp_func_t)sub_001D94D0 },
     { 0x001D9510u, (recomp_func_t)sub_001D9510 },
+    { 0x001D7D10u, (recomp_func_t)sub_001D7D10 },
     { 0x001D7D50u, (recomp_func_t)sub_001D7D50 },
     { 0x001D7D70u, (recomp_func_t)sub_001D7D70 },
     { 0x001D9700u, (recomp_func_t)sub_001D9700 },
@@ -1275,9 +1277,11 @@ void sub_003518E0(void)
     uint32_t dev = MEM32(0x35FB48);
     if (dev >= 0x4000000) dev = dev % 0x4000000;
 
-    /* Parse PB commands written since last reset BEFORE resetting */
+    /* Parse PB commands written since last reset BEFORE resetting.
+     * Cap at ring size to avoid processing garbage from cursor overflow. */
     uint32_t write_ptr = (dev != 0 && dev < 0x4000000) ? MEM32(dev) : MEM32(0x35D6A0);
-    if (write_ptr > base) {
+    uint32_t ring_size = (dev != 0 && dev < 0x4000000) ? MEM32(dev + 0x44) : 0x400000;
+    if (write_ptr > base && (write_ptr - base) <= ring_size) {
         uint32_t bytes = write_ptr - base;
         static uint32_t total_pb_bytes = 0;
         total_pb_bytes += bytes;
@@ -1285,13 +1289,20 @@ void sub_003518E0(void)
             fprintf(stderr, "  [PB-KICK] #%u: %u bytes, total=%u\n",
                     g_pb_kick_count, bytes, total_pb_bytes);
         /* Parse and translate to D3D11 */
+        MEM32(0x35D6A0) = write_ptr;  /* sync global write ptr for parser */
         parse_live_pushbuffer();
+    } else if (write_ptr > base && g_pb_kick_count <= 5) {
+        fprintf(stderr, "  [PB-KICK] #%u: OVERFLOW! write=0x%X base=0x%X delta=%u (ring=%u)\n",
+                g_pb_kick_count, write_ptr, base, write_ptr - base, ring_size);
     }
 
     /* Reset cursors — simulate GPU consumed everything */
     MEM32(0x35D6A0) = base;
     if (dev != 0 && dev < 0x4000000) {
         MEM32(dev + 0x00) = base;  /* device PB cursor = base */
+        MEM32(dev + 0x04) = base + MEM32(dev + 0x44);  /* segment limit = end */
+        /* Keep fake GPU read at max so fence waits always exit */
+        MEM32(dev + 0x3004) = 0xFFFFFFFFu;
     }
 
     eax = base;  /* return base as new position */
@@ -1597,17 +1608,37 @@ void sub_0003FEE0(void)
 
     /* ── Step 11: Render dispatch — sub_001AD350 × 3 passes ── */
     uint32_t render_base = 0x7397B0;  /* base_obj + 0x12ADB0 = 0x60EA00 + 0x12ADB0 */
+
+    /* Dump the resource structure that sub_001AD350 reads */
+    if (log) {
+        uint32_t rb4 = MEM32(render_base + 4);
+        fprintf(stderr, "  [FEE0] render_base=0x%X [+4]=0x%X\n", render_base, rb4);
+        if (rb4 > 0x10000 && rb4 < 0x4000000) {
+            fprintf(stderr, "  [FEE0] res: [+0]=0x%X [+4]=0x%X [+8]=0x%X [+14]=0x%X [+15]=0x%X [+1C]=0x%X [+24]=0x%X\n",
+                    MEM32(rb4), MEM32(rb4+4), MEM32(rb4+8),
+                    (uint32_t)MEM8(rb4+0x14), (uint32_t)MEM8(rb4+0x15),
+                    (uint32_t)(int16_t)MEM16(rb4+0x1C), MEM32(rb4+0x24));
+        }
+    }
+
+    /* Render dispatch: sub_001AD350 × 3 passes.
+     * Pass 0, 1: typically 0 entries. Pass 2: 14 entries from static.dat. */
+    if (log) fprintf(stderr, "  [FEE0] Pass 0...\n");
     PUSH32(esp, 0);
     PUSH32(esp, render_base);
     PUSH32(esp, 0); sub_001AD350();
 
+    if (log) fprintf(stderr, "  [FEE0] Pass 1...\n");
     PUSH32(esp, 1);
     PUSH32(esp, render_base);
     PUSH32(esp, 0); sub_001AD350();
 
+    if (log) fprintf(stderr, "  [FEE0] Pass 2 (%d entries)...\n",
+            (int)(int16_t)MEM16(MEM32(render_base + 4) + 0x1C));
     PUSH32(esp, 2);
     PUSH32(esp, render_base);
     PUSH32(esp, 0); sub_001AD350();
+    if (log) fprintf(stderr, "  [FEE0] Pass 2 DONE\n");
 
     if (log)
         fprintf(stderr, "  [FEE0] #%u DONE (sub_00040CF0 enabled)\n", call_count);
@@ -2142,11 +2173,10 @@ void sub_00351090(void)
 
     call_count++;
 
-    /* Auto-enable gen render chain after warmup */
-    if (call_count == 60 && !g_gen_render_chain_enabled) {
-        g_gen_render_chain_enabled = 1;
-        fprintf(stderr, "  [RW-CAM] Auto-enabling gen render chain at frame %u\n", call_count);
-    }
+    /* Gen render chain disabled — render dispatch now goes through manual
+     * sub_001D7D10 bridge. The D3D8LTCG gen code (sub_00351490→sub_00351770_gen→
+     * sub_00350C10) has unresolved mid-function stubs that cause hangs.
+     * Enable manually with G key for debugging only. */
 
     /* Read device pointer from [0x35FB48], convert mirror addresses */
     dev_va = MEM32(0x35FB48);
@@ -2306,65 +2336,77 @@ void sub_00351090(void)
                     ltm = (float*)XBOX_PTR(phys + 0x58);
             }
 
-            /* If frame has no position, populate from physics body */
+            /* Populate camera frame LTM from physics body EVERY FRAME.
+             * The chase camera must track the car continuously, not just on
+             * the first frame. Previous code only ran when pos_mag2 < 1.0,
+             * freezing the camera at the initial spawn position. */
             if (ltm) {
-                float pos_mag2 = ltm[12]*ltm[12] + ltm[13]*ltm[13] + ltm[14]*ltm[14];
-                if (pos_mag2 < 1.0f) {
-                    /* Read physics body */
-                    uint32_t vel_ptr = MEM32(0x557880 + 0x1B4);
-                    float phys_x = 0, phys_z = 0, hdg = 0, spd = 0;
-                    if (vel_ptr > 0x100 && vel_ptr < 0x3FFFFFF) {
-                        phys_x = MEMF(vel_ptr + 0x10);
-                        phys_z = MEMF(vel_ptr + 0x14);
-                        hdg = MEMF(vel_ptr + 0x18);
-                        spd = MEMF(vel_ptr + 0x1C);
-                    } else {
-                        phys_x = MEMF(0x5FFF10);
-                        phys_z = MEMF(0x5FFF14);
-                        hdg = MEMF(0x5FFF18);
-                        spd = MEMF(0x5FFF1C);
-                    }
+                /* Read physics body */
+                uint32_t vel_ptr = MEM32(0x557880 + 0x1B4);
+                float phys_x = 0, phys_z = 0, hdg = 0, spd = 0;
+                if (vel_ptr > 0x100 && vel_ptr < 0x3FFFFFF) {
+                    phys_x = MEMF(vel_ptr + 0x10);
+                    phys_z = MEMF(vel_ptr + 0x14);
+                    hdg = MEMF(vel_ptr + 0x18);
+                    spd = MEMF(vel_ptr + 0x1C);
+                } else {
+                    phys_x = MEMF(0x5FFF10);
+                    phys_z = MEMF(0x5FFF14);
+                    hdg = MEMF(0x5FFF18);
+                    spd = MEMF(0x5FFF1C);
+                }
 
-                    if (phys_x != 0.0f || phys_z != 0.0f) {
-                        /* Compute chase camera position */
-                        float cam_dist = 15.0f + fabsf(spd) * 0.2f;
-                        float sh = sinf(hdg), ch = cosf(hdg);
-                        float cx = phys_x - sh * cam_dist;
-                        float cy = 5.0f;
-                        float cz = phys_z - ch * cam_dist;
+                if (phys_x != 0.0f || phys_z != 0.0f) {
+                    /* Compute chase camera position */
+                    float cam_dist = 15.0f + fabsf(spd) * 0.2f;
+                    float sh = sinf(hdg), ch = cosf(hdg);
+                    float cx = phys_x - sh * cam_dist;
+                    float cy = 5.0f;
+                    float cz = phys_z - ch * cam_dist;
 
-                        /* Write position to frame LTM */
-                        ltm[12] = cx;
-                        ltm[13] = cy;
-                        ltm[14] = cz;
+                    /* Write position to frame LTM */
+                    ltm[12] = cx;
+                    ltm[13] = cy;
+                    ltm[14] = cz;
 
-                        /* Write chase camera orientation to frame LTM.
-                         * Forward direction = heading vector toward car.
-                         * RW uses right-handed: right=X, up=Y, at=Z (forward). */
-                        float fx = sh, fz = ch;  /* forward = toward car (heading dir) */
-                        /* right = cross(up, forward) = cross((0,1,0), (fx,0,fz)) = (fz,0,-fx) */
-                        ltm[0] = fz;  ltm[1] = 0;     ltm[2] = -fx;  ltm[3] = 0;  /* right */
-                        ltm[4] = 0;   ltm[5] = 1.0f;  ltm[6] = 0;    ltm[7] = 0;  /* up */
-                        ltm[8] = fx;  ltm[9] = 0;     ltm[10] = fz;  ltm[11] = 0; /* at (forward) */
-                        ltm[15] = 0;
+                    /* Write chase camera orientation to frame LTM.
+                     * Forward direction = heading vector toward car.
+                     * RW uses right-handed: right=X, up=Y, at=Z (forward). */
+                    float fx = sh, fz = ch;  /* forward = toward car (heading dir) */
+                    /* right = cross(up, forward) = cross((0,1,0), (fx,0,fz)) = (fz,0,-fx) */
+                    ltm[0] = fz;  ltm[1] = 0;     ltm[2] = -fx;  ltm[3] = 0;  /* right */
+                    ltm[4] = 0;   ltm[5] = 1.0f;  ltm[6] = 0;    ltm[7] = 0;  /* up */
+                    ltm[8] = fx;  ltm[9] = 0;     ltm[10] = fz;  ltm[11] = 0; /* at (forward) */
+                    ltm[15] = 0;
 
-                        /* Also set viewWindow if camera doesn't have one */
-                        if (MEMF(cam_va + 0x8C) < 0.001f) {
-                            MEMF(cam_va + 0x8C) = 1.0f;    /* viewWindow.x */
-                            MEMF(cam_va + 0x90) = 0.75f;   /* viewWindow.y */
-                            MEMF(cam_va + 0x80) = 0.1f;    /* near clip */
-                            MEMF(cam_va + 0x84) = 5000.0f; /* far clip */
-                        }
-
-                        static int logged_pop = 0;
-                        if (!logged_pop || (call_count % 500) == 0) {
-                            fprintf(stderr, "  [RW-CAM] Populated frame LTM from physics: "
-                                    "pos=(%.1f,%.1f,%.1f) hdg=%.1f° spd=%.1f\n",
-                                    cx, cy, cz, hdg * 57.2958f, spd);
-                            logged_pop = 1;
-                        }
+                    static int logged_pop = 0;
+                    if (!logged_pop || (call_count % 500) == 0) {
+                        fprintf(stderr, "  [RW-CAM] Frame LTM from physics: "
+                                "pos=(%.1f,%.1f,%.1f) hdg=%.1f° spd=%.1f\n",
+                                cx, cy, cz, hdg * 57.2958f, spd);
+                        logged_pop = 1;
                     }
                 }
+            }
+        }
+    }
+
+    /* ═══ FORCE NEAR/FAR CLIP ON GAMEPLAY CAMERA ═══
+     * Gen code (sub_00351490, sub_00351770_gen) resets the camera's near/far
+     * clip planes each frame. Force valid values here so the projection
+     * matrix can be built correctly below. */
+    {
+        uint32_t cam_va = MEM32(0x4D5370);
+        if (cam_va == 0x4D45D0 && cam_va > 0x10000 && cam_va < 0x4000000) {
+            float nc = MEMF(cam_va + 0x80);
+            float fc = MEMF(cam_va + 0x84);
+            if (fc <= nc || fc < 1.0f) {
+                MEMF(cam_va + 0x80) = 0.1f;     /* near clip */
+                MEMF(cam_va + 0x84) = 5000.0f;  /* far clip */
+            }
+            if (MEMF(cam_va + 0x8C) < 0.001f) {
+                MEMF(cam_va + 0x8C) = 1.0f;     /* viewWindow.x */
+                MEMF(cam_va + 0x90) = 0.75f;    /* viewWindow.y */
             }
         }
     }
@@ -2453,6 +2495,32 @@ void sub_00351090(void)
          * context — sub_00351490 walks deep pointer chains in the device state.
          * Currently gated behind g_gen_render_chain_enabled (G key toggle). */
 
+        /* Reset PB write position to start of ring before each frame.
+         * The gen code writes NV2A push buffer commands; we parse them after.
+         * Without reset, writes accumulate and eventually overflow the 4MB ring. */
+        {
+            /* Use known good PB addresses (device+0x28 gets corrupted by gen code).
+             * PB base is at MEM32(0x35D69C), set during init and not touched by gen code.
+             * Ring size is at device+0x44 (4MB). */
+            uint32_t pb_base = MEM32(0x35D69C);
+            uint32_t pb_size = MEM32(dev_va + 0x44);
+            uint32_t pb_end  = pb_base + pb_size;
+            /* Re-apply all PB ring fields every frame (gen code clobbers them) */
+            MEM32(dev_va + 0x00) = pb_base;    /* device current write cursor */
+            MEM32(dev_va + 0x04) = pb_end;     /* device segment limit */
+            MEM32(dev_va + 0x08) = pb_base;    /* device secondary write cursor */
+            MEM32(dev_va + 0x24) = pb_base;    /* PB ring base */
+            MEM32(dev_va + 0x28) = pb_end;     /* PB ring end */
+            MEM32(dev_va + 0x2C) = pb_base;    /* PB write sequence position */
+            MEM32(0x35D6A0) = pb_base;          /* global PB write pointer */
+            /* Set fake GPU read = 0xFFFFFFFF so ALL fence waits exit.
+             * Fence pattern: exit when gpu_read >= fence_marker (edi).
+             * 0xFFFFFFFF is always >= any uint32 value → immediate exit.
+             * Space check is patched out in sub_00351770_gen. */
+            MEM32(dev_va + 0x3004) = 0xFFFFFFFFu;
+            MEM32(dev_va + 0x30) = dev_va + 0x3004;
+        }
+
         /* Step A: sub_00351490(0) — begin camera (NV2A state setup) */
         PUSH32(esp, 0);
         PUSH32(esp, 0); sub_00351490();
@@ -2469,8 +2537,14 @@ void sub_00351090(void)
                 PUSH32(esp, 1);
                 PUSH32(esp, 0); sub_00351770_gen();
 
-                if (call_count <= 5 || (call_count % 500) == 0)
-                    fprintf(stderr, "  [RW-CAM] sub_00351770_gen returned, eax=0x%X\n", eax);
+                {
+                    uint32_t pb_base = MEM32(dev_va + 0x24);
+                    uint32_t pb_after = MEM32(dev_va + 0x00);
+                    uint32_t pb_written = (pb_after > pb_base) ? pb_after - pb_base : 0;
+                    if (call_count <= 5 || (call_count % 500) == 0 || (pb_written > 100 && call_count < 200))
+                        fprintf(stderr, "  [RW-CAM] sub_00351770_gen: eax=0x%X pb_written=%u bytes (%u dwords)\n",
+                                eax, pb_written, pb_written / 4);
+                }
             }
         }
 
@@ -2673,6 +2747,63 @@ void sub_001D9510(void)
 
     eax = cam_va;
     esp += 4; return;
+}
+
+/**
+/**
+ * sub_001D7D10 - RW render dispatch → D3D8 bridge (OVERRIDE)
+ *
+ * Original: 0x001D7D10 - 0x001D7D2A (26 bytes, 9 insns)
+ * CC: cdecl, 3 params (geometry params from render entry +0x80/+0x84/+0x88)
+ * Caller: sub_001AD350 (render list dispatch)
+ * Caller cleanup: esp += 0xC after call
+ *
+ * Original flow: sub_001D7040 (RW driver setup) → sub_00350000 (D3D8LTCG render)
+ * Override: bypasses D3D8LTCG and counts draws for diagnostics.
+ * The render entry data contains vertex/index pointers from static.dat
+ * that the D3D8LTCG code would use to write NV2A push buffer commands.
+ */
+static uint32_t g_1D7D10_draws = 0;
+void sub_001D7D10(void)
+{
+    uint32_t draw_mode = MEM32(esp + 4);   /* NV2A draw mode (5=tristrip, 6=trilist) */
+    uint32_t dword_count = MEM32(esp + 8); /* inline vertex data in dwords */
+    uint32_t data_ptr = MEM32(esp + 12);   /* pointer to inline vertex data */
+
+    g_1D7D10_draws++;
+
+    /* Route NV2A inline array data through the pgraph D3D11 translator.
+     * Format: 5 dwords per vertex (float X, float Y, float U, float V, D3DCOLOR)
+     * Same as the menu PB replay INLINE_ARRAY format from session 40. */
+    if (draw_mode >= 1 && draw_mode <= 8 &&
+        dword_count > 0 && dword_count < 500000 &&
+        data_ptr > 0x10000 && data_ptr < 0x4000000)
+    {
+        extern int pgraph_d3d11_method(int subchan, uint32_t method, uint32_t param);
+        extern void pgraph_d3d11_flush(void);
+
+        /* Send BEGIN_END with draw mode */
+        pgraph_d3d11_method(0, 0x17FC, draw_mode);  /* NV2A_SET_BEGIN_END */
+
+        /* Send vertex data as INLINE_ARRAY */
+        uint32_t *data = (uint32_t*)XBOX_PTR(data_ptr);
+        for (uint32_t i = 0; i < dword_count; i++) {
+            pgraph_d3d11_method(0, 0x1818, data[i]);  /* NV2A_INLINE_ARRAY */
+        }
+
+        /* End primitive */
+        pgraph_d3d11_method(0, 0x17FC, 0);  /* NV2A_SET_BEGIN_END(0) = end */
+
+        pgraph_d3d11_flush();
+    }
+
+    if (g_1D7D10_draws <= 5 || (g_1D7D10_draws % 50000) == 0) {
+        uint32_t vert_count = dword_count / 5;  /* 5 dwords per vertex */
+        fprintf(stderr, "  [D3D-DRAW] #%u: mode=%u dwords=%u verts=%u data=0x%08X\n",
+                g_1D7D10_draws, draw_mode, dword_count, vert_count, data_ptr);
+    }
+
+    esp += 4; return; /* ret — caller cleans 3 params with esp += 0xC */
 }
 
 /**
@@ -4822,6 +4953,11 @@ void sub_00011240(void)
             name_va, flag_va, resource_va, param);
     fprintf(stderr, "  [LOAD]   file: '%s'\n", name_buf);
 
+    /* Detect corrupted filenames for static.dat / streamed.dat.
+     * The render list builder constructs the path on the stack but gen code
+     * corrupts the string. Detect by: the name contains "static.dat" but
+     * the first char is NOT a valid path char (alphanumeric, d:, /, \). */
+
     /* Try to translate the Xbox path and load the file.
      * Xbox paths like "d:\tracks\..." → "Burnout 3 Takedown\tracks\..."
      * But the string might also be a relative path within the game dir. */
@@ -4847,6 +4983,23 @@ void sub_00011240(void)
         if (!fp) {
             /* Try the name as-is */
             fp = fopen(name_buf, "rb");
+        }
+
+        /* Fallback for corrupted filenames containing "static.dat" or "streamed.dat":
+         * use the currently loaded track directory to construct the correct path.
+         * DISABLED: loading static.dat into the render list resource causes the
+         * relocated data to trigger spin loops in gen code during boot init.
+         * TODO: investigate which gen code function spins on the relocated data. */
+        if (!fp && (strstr(name_buf, "static.dat") || strstr(name_buf, "streamed.dat"))) {
+            extern const char *rw_get_track_dir(void);
+            const char *tdir = rw_get_track_dir();
+            if (tdir && tdir[0]) {
+                const char *dat_name = strstr(name_buf, "static.dat") ? "static.dat" : "streamed.dat";
+                snprintf(win_path, sizeof(win_path), "%s/%s", tdir, dat_name);
+                fp = fopen(win_path, "rb");
+                if (fp)
+                    fprintf(stderr, "  [LOAD] Fallback: opened '%s' via track dir\n", win_path);
+            }
         }
 
         if (fp) {

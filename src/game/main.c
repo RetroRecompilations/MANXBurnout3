@@ -1614,14 +1614,46 @@ static BOOL init_subsystems(void)
          * The xemu snapshot has xemu heap pointers (0x82xxxxxx) in the PB
          * ring management fields. These must point to our PB allocation.
          *
-         * Critical: device+0x30 is a POINTER to the GPU read position.
-         * D3D8LTCG code spin-waits reading MEM32(*dev+0x30) until GPU
-         * catches up. We point +0x30 to +0x2C (write counter) so
-         * GPU_read == write → no pending data → no spin loop. */
-        MEM32(dev + 0x24) = pb_start;       /* PB ring start */
+         * Critical: device+0x30 is a POINTER TO a GPU read position.
+         * D3D8LTCG code checks: if (write - requested >= write - *dev+0x30)
+         * skip rendering (not enough PB space). In unsigned ring semantics,
+         * we need gpu_read > write so the subtraction wraps to a large
+         * "available space" value.
+         *
+         * Previous approach (dev+0x30 → dev+0x2C): made gpu_read==write,
+         * eliminating spin-loops but also setting available_space=0.
+         * This caused sub_00351770_gen to ALWAYS skip scene rendering.
+         *
+         * Fix: store pb_end in a dedicated field and point +0x30 there.
+         * With gpu_read=pb_end and write=pb_start, the unsigned check
+         * (write-1) < (write-pb_end) passes, allowing PB allocation. */
+        /* ── PB ring management ──
+         * D3D8LTCG gen code uses multiple fields for PB ring management:
+         * +0x00: Current PB write cursor (gen code writes commands here)
+         * +0x04: PB segment limit (write must stay below this)
+         * +0x08: Secondary write cursor (alternate context)
+         * +0x24: PB ring base address
+         * +0x28: PB ring end address
+         * +0x2C: PB write sequence counter
+         * +0x30: POINTER to GPU read position
+         * +0x44: PB ring total size
+         *
+         * The gen code checks (device+0 < device+4) before each write.
+         * If false, calls sub_003518E0 to wrap/reallocate PB segment.
+         * Sub_00351770_gen checks (write-requested >= write-gpu_read)
+         * to verify enough ring space; with gpu_read=pb_end and write=pb_start,
+         * unsigned subtraction gives huge available space. */
+        MEM32(dev + 0x00) = pb_start;       /* PB write cursor = start */
+        MEM32(dev + 0x04) = pb_end;         /* PB segment limit = end */
+        MEM32(dev + 0x08) = pb_start;       /* Secondary write cursor */
+        MEM32(dev + 0x24) = pb_start;       /* PB ring base */
         MEM32(dev + 0x28) = pb_end;         /* PB ring end */
-        MEM32(dev + 0x2C) = 0;              /* PB write sequence counter */
-        MEM32(dev + 0x30) = dev + 0x2C;     /* GPU read ptr → write counter (always caught up) */
+        MEM32(dev + 0x2C) = pb_start;       /* PB write sequence position */
+        /* dev+0x3004: fake GPU read position (safe area in device context).
+         * Set to pb_end so the ring appears fully free to the gen code.
+         * Point dev+0x30 to this address. */
+        MEM32(dev + 0x3004) = pb_end;
+        MEM32(dev + 0x30) = dev + 0x3004;   /* GPU read ptr → always at PB end */
         MEM32(dev + 0x34) = 0;              /* fence write index */
         MEM32(dev + 0x38) = 3;              /* fence mask (4 entries) */
         MEM32(dev + 0x3C) = 0;              /* fence state */
@@ -1634,6 +1666,10 @@ static BOOL init_subsystems(void)
         MEM32(dev + 0x1974) = 0x3A1F;       /* RT surface 0 (from xemu) */
         MEM32(dev + 0x1978) = 0x3A25;       /* RT surface 1 (from xemu) */
 
+        fprintf(stderr, "  D3D8 PB ring: pb_start=0x%08X pb_end=0x%08X "
+                "dev+0x24=0x%08X dev+0x28=0x%08X dev+0x2C=0x%08X dev+0x30=0x%08X dev+0x44=0x%08X\n",
+                pb_start, pb_end, MEM32(dev + 0x24), MEM32(dev + 0x28),
+                MEM32(dev + 0x2C), MEM32(dev + 0x30), MEM32(dev + 0x44));
         fprintf(stderr, "  D3D8 PB ring: GPU_read→dev+0x2C, fence→dev+0x3000, "
                 "RT=0x3A1F/0x3A25\n");
 
