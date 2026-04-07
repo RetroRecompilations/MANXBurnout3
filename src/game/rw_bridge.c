@@ -615,6 +615,15 @@ int rw_bridge_camera_render(uint32_t camera_va)
             }
 
             dev->lpVtbl->EndScene(dev);
+
+            /* ImGui overlay (toast notifications, menus) before Present */
+            {
+                extern void menu_gui_begin_frame(void);
+                extern void menu_gui_render(void);
+                menu_gui_begin_frame();
+                menu_gui_render();
+            }
+
             dev->lpVtbl->Present(dev, NULL, NULL, NULL, NULL);
             {
                 extern volatile uint32_t g_present_count;
@@ -668,6 +677,14 @@ int rw_bridge_camera_render(uint32_t camera_va)
 
     /* End the scene — bridge owns the full BeginScene/EndScene lifecycle */
     rw_bridge_camera_end(camera_va);
+
+    /* ImGui overlay before Present */
+    {
+        extern void menu_gui_begin_frame(void);
+        extern void menu_gui_render(void);
+        menu_gui_begin_frame();
+        menu_gui_render();
+    }
 
     /* Present the frame — gameplay path must Present (menu path does its own) */
     dev->lpVtbl->Present(dev, NULL, NULL, NULL, NULL);

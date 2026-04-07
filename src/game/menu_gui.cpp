@@ -48,6 +48,12 @@ static struct {
     float camera_fov;
     float camera_distance;
     bool  skip_intro;
+
+    /* Screenshot / toast */
+    bool  screenshot_requested;
+    char  toast_msg[256];
+    DWORD toast_start;
+    int   shot_counter;
 } g_menu = {
     false, false, false, false, 0,
     /* defaults */
@@ -469,7 +475,9 @@ extern "C" int menu_gui_wndproc(void *hwnd, unsigned int msg, unsigned long long
 extern "C" void menu_gui_begin_frame(void)
 {
     if (!g_menu.initialized) return;
-    if (!g_menu.show_settings && !g_menu.show_debug && !g_menu.show_about) return;
+    bool need_frame = g_menu.show_settings || g_menu.show_debug ||
+                      g_menu.show_about || g_menu.toast_msg[0] != '\0';
+    if (!need_frame) return;
 
     ImGui_ImplDX11_NewFrame();
     ImGui_ImplWin32_NewFrame();
@@ -479,12 +487,17 @@ extern "C" void menu_gui_begin_frame(void)
 extern "C" void menu_gui_render(void)
 {
     if (!g_menu.initialized) return;
-    if (!g_menu.show_settings && !g_menu.show_debug && !g_menu.show_about) return;
+    bool need_frame = g_menu.show_settings || g_menu.show_debug ||
+                      g_menu.show_about || g_menu.toast_msg[0] != '\0';
+    if (!need_frame) return;
 
     /* Draw active menus */
     if (g_menu.show_settings) draw_settings_menu();
     if (g_menu.show_debug)    draw_debug_menu();
     if (g_menu.show_about)    draw_about_window();
+
+    /* Draw toast notification (always, even when no menu is open) */
+    menu_gui_draw_toast();
 
     /* Render */
     ImGui::Render();
@@ -526,4 +539,123 @@ extern "C" void menu_gui_show_about(void)
 extern "C" int menu_gui_skip_intro(void)
 {
     return g_menu.skip_intro ? 1 : 0;
+}
+
+/* ================================================================
+ * Screenshot capture (D3D11 backbuffer → PNG via stb_image_write)
+ * ================================================================ */
+
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "../../third_party/stb_image_write.h"
+
+extern "C" void menu_gui_take_screenshot(void)
+{
+    ID3D11Device *device = d3d8_GetD3D11Device();
+    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
+    IDXGISwapChain *sc = d3d8_GetSwapChain();
+    if (!device || !ctx || !sc) return;
+
+    /* Get the back buffer */
+    ID3D11Texture2D *backbuf = NULL;
+    HRESULT hr = sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&backbuf);
+    if (FAILED(hr) || !backbuf) return;
+
+    D3D11_TEXTURE2D_DESC desc;
+    backbuf->GetDesc(&desc);
+
+    /* Create a staging texture for CPU readback */
+    D3D11_TEXTURE2D_DESC staging_desc = desc;
+    staging_desc.Usage = D3D11_USAGE_STAGING;
+    staging_desc.BindFlags = 0;
+    staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    staging_desc.MiscFlags = 0;
+
+    ID3D11Texture2D *staging = NULL;
+    hr = device->CreateTexture2D(&staging_desc, NULL, &staging);
+    if (FAILED(hr) || !staging) { backbuf->Release(); return; }
+
+    ctx->CopyResource((ID3D11Resource*)staging, (ID3D11Resource*)backbuf);
+    backbuf->Release();
+
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    hr = ctx->Map((ID3D11Resource*)staging, 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr)) { staging->Release(); return; }
+
+    /* Build filename: screenshot_NNNN.png */
+    char filename[256];
+    snprintf(filename, sizeof(filename), "screenshot_%04d.png", g_menu.shot_counter++);
+
+    /* Convert BGRA → RGBA for stb_image_write */
+    int w = (int)desc.Width, h = (int)desc.Height;
+    unsigned char *pixels = (unsigned char*)malloc(w * h * 4);
+    if (pixels) {
+        for (int y = 0; y < h; y++) {
+            unsigned char *src = (unsigned char*)mapped.pData + y * mapped.RowPitch;
+            unsigned char *dst = pixels + y * w * 4;
+            for (int x = 0; x < w; x++) {
+                dst[x*4+0] = src[x*4+2]; /* R ← B */
+                dst[x*4+1] = src[x*4+1]; /* G */
+                dst[x*4+2] = src[x*4+0]; /* B ← R */
+                dst[x*4+3] = 255;         /* A */
+            }
+        }
+        if (stbi_write_png(filename, w, h, 4, pixels, w * 4)) {
+            fprintf(stderr, "Screenshot saved: %s\n", filename);
+            /* Show toast */
+            strncpy(g_menu.toast_msg, filename, sizeof(g_menu.toast_msg) - 1);
+            g_menu.toast_msg[sizeof(g_menu.toast_msg) - 1] = '\0';
+            g_menu.toast_start = GetTickCount();
+        } else {
+            fprintf(stderr, "Screenshot FAILED: %s\n", filename);
+        }
+        free(pixels);
+    }
+
+    ctx->Unmap((ID3D11Resource*)staging, 0);
+    staging->Release();
+}
+
+/* ================================================================
+ * Toast notification (bottom-right, 2.5s with fade)
+ * ================================================================ */
+
+extern "C" void menu_gui_draw_toast(void)
+{
+    if (!g_menu.initialized) return;
+    if (g_menu.toast_msg[0] == '\0') return;
+
+    DWORD now = GetTickCount();
+    DWORD elapsed = now - g_menu.toast_start;
+
+    if (elapsed > 2500) {
+        g_menu.toast_msg[0] = '\0';
+        return;
+    }
+
+    float alpha = 1.0f;
+    if (elapsed > 2000)
+        alpha = 1.0f - (float)(elapsed - 2000) / 500.0f;
+
+    ImGuiIO &io = ImGui::GetIO();
+    ImVec2 pos(io.DisplaySize.x - 20, io.DisplaySize.y - 40);
+    ImGui::SetNextWindowPos(pos, 0, ImVec2(1.0f, 1.0f));
+    ImGui::SetNextWindowBgAlpha(0.7f * alpha);
+
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12, 8));
+
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration |
+                             ImGuiWindowFlags_NoInputs |
+                             ImGuiWindowFlags_AlwaysAutoResize |
+                             ImGuiWindowFlags_NoNav |
+                             ImGuiWindowFlags_NoFocusOnAppearing |
+                             ImGuiWindowFlags_NoMove;
+
+    if (ImGui::Begin("##toast", NULL, flags)) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 1, alpha));
+        ImGui::TextUnformatted(g_menu.toast_msg);
+        ImGui::PopStyleColor();
+    }
+    ImGui::End();
+    ImGui::PopStyleVar(2);
 }

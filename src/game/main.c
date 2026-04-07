@@ -1295,6 +1295,7 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg,
     case WM_KEYDOWN:
         if (wParam == VK_F1) { menu_gui_toggle_settings(); return 0; }
         if (wParam == VK_F2) { menu_gui_toggle_debug(); return 0; }
+        if (wParam == VK_F12) { menu_gui_take_screenshot(); return 0; }
         if (wParam == VK_ESCAPE) {
             if (!menu_gui_is_active()) {
                 g_running = FALSE;

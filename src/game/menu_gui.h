@@ -43,6 +43,14 @@ void menu_gui_show_about(void);
 /* Returns 1 if user has chosen to skip intro videos */
 int menu_gui_skip_intro(void);
 
+/* Capture a screenshot of the current frame (F12). Saves screenshot_NNNN.png
+ * and shows a toast notification in the bottom-right corner. */
+void menu_gui_take_screenshot(void);
+
+/* Draw the toast notification overlay. Call during the ImGui frame
+ * (between begin_frame and render). */
+void menu_gui_draw_toast(void);
+
 #ifdef __cplusplus
 }
 #endif
