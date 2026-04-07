@@ -616,19 +616,8 @@ int rw_bridge_camera_render(uint32_t camera_va)
 
             dev->lpVtbl->EndScene(dev);
 
-            /* ImGui overlay (toast notifications, menus) before Present */
-            {
-                extern void menu_gui_begin_frame(void);
-                extern void menu_gui_render(void);
-                menu_gui_begin_frame();
-                menu_gui_render();
-            }
-
-            dev->lpVtbl->Present(dev, NULL, NULL, NULL, NULL);
-            {
-                extern volatile uint32_t g_present_count;
-                g_present_count++;
-            }
+            /* Don't Present yet — sub_0003FEE0's render dispatch will draw
+             * static.dat geometry after us. Present happens in main loop. */
             g_bridge_rendered = 1;
             return 1;
         }

@@ -4976,10 +4976,16 @@ void game_frame_pump(void)
                 g_present_count++;
             }
         } else {
-            /* Bridge rendered — skip EndScene/Present (bridge did it).
-             * Still render ImGui overlay. */
+            /* Bridge rendered but deferred Present so sub_0003FEE0's render
+             * dispatch can draw static.dat geometry into the same frame.
+             * Now Present the combined result with ImGui overlay. */
             menu_gui_begin_frame();
             menu_gui_render();
+            g_d3d_device->lpVtbl->Present(g_d3d_device, NULL, NULL, NULL, NULL);
+            {
+                extern volatile uint32_t g_present_count;
+                g_present_count++;
+            }
         }
     }
 
