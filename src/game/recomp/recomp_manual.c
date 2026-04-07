@@ -1622,7 +1622,9 @@ void sub_0003FEE0(void)
     }
 
     /* Render dispatch: sub_001AD350 × 3 passes.
-     * Pass 0, 1: typically 0 entries. Pass 2: 14 entries from static.dat. */
+     * Pass 0, 1: typically 0 entries. Pass 2: 14 entries from static.dat.
+     * g_current_geom_base is set by sub_001AD350's inner loop for sub_001D7D10. */
+    extern uint32_t g_current_geom_base;
     if (log) fprintf(stderr, "  [FEE0] Pass 0...\n");
     PUSH32(esp, 0);
     PUSH32(esp, render_base);
@@ -2763,44 +2765,115 @@ void sub_001D9510(void)
  * The render entry data contains vertex/index pointers from static.dat
  * that the D3D8LTCG code would use to write NV2A push buffer commands.
  */
+uint32_t g_current_geom_base = 0;  /* set by sub_001AD350 for sub_001D7D10 */
 static uint32_t g_1D7D10_draws = 0;
 void sub_001D7D10(void)
 {
-    uint32_t draw_mode = MEM32(esp + 4);   /* NV2A draw mode (5=tristrip, 6=trilist) */
-    uint32_t dword_count = MEM32(esp + 8); /* inline vertex data in dwords */
-    uint32_t data_ptr = MEM32(esp + 12);   /* pointer to inline vertex data */
+    /* Params from render entry geometry object at edi+0x80/+0x84/+0x88:
+     *   param1 = NV2A draw mode (5=tristrip, 6=trilist)
+     *   param2 = index count
+     *   param3 = index buffer offset from geometry base
+     *
+     * The geometry object layout (0x90 bytes per draw):
+     *   +0x00..+0x7F: bounding box (8 × float3)
+     *   +0x80: draw mode
+     *   +0x84: index count
+     *   +0x88: index buffer offset (relative to geom base from entry+0x4C)
+     *   +0x8C: end marker (0xFFFFFFFF)
+     *
+     * Vertex buffer starts at geometry_base + 0x90 (offset TBD)
+     * 28-byte stride: float3 pos, uint32 packed_normal, uint32 color, float2 UV
+     *
+     * We reconstruct the geometry object address from the caller's edi register
+     * which was set to entry_base + running_offset before pushing params. */
+    uint32_t draw_mode = MEM32(esp + 4);
+    uint32_t idx_count = MEM32(esp + 8);
+    uint32_t idx_offset = MEM32(esp + 12);
 
     g_1D7D10_draws++;
 
-    /* Route NV2A inline array data through the pgraph D3D11 translator.
-     * Format: 5 dwords per vertex (float X, float Y, float U, float V, D3DCOLOR)
-     * Same as the menu PB replay INLINE_ARRAY format from session 40. */
+    /* The caller (sub_001AD350) set edi = geom_base + running_offset.
+     * It then read params from edi+0x80/84/88. So the geom object base
+     * was at the address that stored these params. We can recover it
+     * from the stack — the caller pushed edi's derived values.
+     * Actually: edi was stored on the stack at esp+0x28 in the caller.
+     * But we can compute: geom_base is in the entry at ebx+0x4C.
+     *
+     * Simpler approach: idx_offset is relative to geom_base (entry+0x4C).
+     * The render entry's geom_base was used by the caller. Since we can't
+     * easily access edi from here, let's look at the pattern:
+     * The 3rd param (idx_offset) = 0x0A14 for draw #1.
+     * Geom_base = 0x022CC060. So idx_buf = 0x022CC060 + 0x0A14 = 0x022CCA74.
+     * But the caller passed idx_offset as the RAW value from edi+0x88 which
+     * is ALREADY an absolute pointer (after relocation by sub_0019B4E0).
+     * So param3 IS the absolute index buffer pointer, not an offset! */
     if (draw_mode >= 1 && draw_mode <= 8 &&
-        dword_count > 0 && dword_count < 500000 &&
-        data_ptr > 0x10000 && data_ptr < 0x4000000)
+        idx_count > 0 && idx_count < 100000 &&
+        idx_offset > 0x10000 && idx_offset < 0x4000000)
     {
-        extern int pgraph_d3d11_method(int subchan, uint32_t method, uint32_t param);
-        extern void pgraph_d3d11_flush(void);
+        IDirect3DDevice8 *dev = xbox_GetD3DDevice();
+        if (dev) {
+            /* Index buffer: uint16 array at idx_offset */
+            uint16_t *indices = (uint16_t*)XBOX_PTR(idx_offset);
 
-        /* Send BEGIN_END with draw mode */
-        pgraph_d3d11_method(0, 0x17FC, draw_mode);  /* NV2A_SET_BEGIN_END */
+            /* Vertex buffer: we need to find it. The geometry object at
+             * (idx_offset - entry_idx_offset) has vertices starting at +0x90.
+             * But we don't have the geom base here directly.
+             *
+             * Alternative: scan backwards from the index buffer to find the
+             * bounding box / vertex data start. The vertex data starts at
+             * geom_base + some_header_size. Since geom_base+0x80 = draw_mode,
+             * and geom_base+0x88 = idx_offset, we can compute:
+             * geom_base = (address where +0x88 == idx_offset).
+             * But that's circular. Let's use a different approach.
+             *
+             * The geometry data is contiguous: [bbox 0x80][params 0x10][vertices...][indices]
+             * So vertex_start = geom_base + 0x90, and the indices reference
+             * vertices starting from index 0 at vertex_start.
+             * We need geom_base. Since this function is called per-draw from
+             * sub_001AD350 which tracks the geometry base, let's use a global. */
+            extern uint32_t g_current_geom_base;
+            if (g_current_geom_base > 0x10000 && g_current_geom_base < 0x4000000) {
+                /* Source vertex buffer at geom_base + 0x90.
+                 * Format: 28 bytes (float3 pos, uint32 packed_normal, uint32 color, float2 UV)
+                 * Need to convert to 24-byte FVF (float3 pos, uint32 color, float2 UV)
+                 * by skipping the packed_normal dword. */
+                uint8_t *src_vb = (uint8_t*)XBOX_PTR(g_current_geom_base + 0x90);
 
-        /* Send vertex data as INLINE_ARRAY */
-        uint32_t *data = (uint32_t*)XBOX_PTR(data_ptr);
-        for (uint32_t i = 0; i < dword_count; i++) {
-            pgraph_d3d11_method(0, 0x1818, data[i]);  /* NV2A_INLINE_ARRAY */
+                /* Find max vertex index to know how many verts to convert */
+                uint32_t max_idx = 0;
+                for (uint32_t i = 0; i < idx_count; i++)
+                    if (indices[i] > max_idx) max_idx = indices[i];
+                uint32_t vert_count = max_idx + 1;
+
+                uint32_t prim_count = 0;
+                uint32_t d3d_type = 4; /* D3DPT_TRIANGLELIST */
+                if (draw_mode == 5) { prim_count = (idx_count > 2) ? idx_count - 2 : 0; d3d_type = 5; }
+                else if (draw_mode == 6) { prim_count = idx_count / 3; d3d_type = 4; }
+
+                if (prim_count > 0 && vert_count < 65536) {
+                    /* Convert: skip packed_normal (offset 12, 4 bytes) */
+                    static uint8_t cvt_buf[65536 * 24]; /* 24 bytes per vert */
+                    for (uint32_t v = 0; v < vert_count; v++) {
+                        uint8_t *s = src_vb + v * 28;
+                        uint8_t *d = cvt_buf + v * 24;
+                        memcpy(d, s, 12);       /* pos (float3) */
+                        memcpy(d+12, s+16, 4);  /* color (uint32) */
+                        memcpy(d+16, s+20, 8);  /* UV (float2) */
+                    }
+                    dev->lpVtbl->DrawIndexedPrimitiveUP(dev,
+                        d3d_type, 0, vert_count, prim_count,
+                        indices, D3DFMT_INDEX16,
+                        cvt_buf, 24);
+                }
+            }
         }
-
-        /* End primitive */
-        pgraph_d3d11_method(0, 0x17FC, 0);  /* NV2A_SET_BEGIN_END(0) = end */
-
-        pgraph_d3d11_flush();
     }
 
     if (g_1D7D10_draws <= 5 || (g_1D7D10_draws % 50000) == 0) {
-        uint32_t vert_count = dword_count / 5;  /* 5 dwords per vertex */
-        fprintf(stderr, "  [D3D-DRAW] #%u: mode=%u dwords=%u verts=%u data=0x%08X\n",
-                g_1D7D10_draws, draw_mode, dword_count, vert_count, data_ptr);
+        extern uint32_t g_current_geom_base;
+        fprintf(stderr, "  [D3D-DRAW] #%u: mode=%u idxs=%u idx_ptr=0x%08X geom=0x%08X\n",
+                g_1D7D10_draws, draw_mode, idx_count, idx_offset, g_current_geom_base);
     }
 
     esp += 4; return; /* ret — caller cleans 3 params with esp += 0xC */
