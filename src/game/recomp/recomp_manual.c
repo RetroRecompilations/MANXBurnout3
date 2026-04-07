@@ -9,6 +9,7 @@
 
 #define RECOMP_GENERATED_CODE
 #include "gen/recomp_funcs.h"
+#include "../static_textures.h"
 #include <math.h>
 #include <stdio.h>
 
@@ -2860,21 +2861,55 @@ void sub_001D7D10(void)
                         uint8_t *s = src_vb + v * 28;
                         uint8_t *d = cvt_buf + v * 24;
                         memcpy(d, s, 12);       /* pos (float3) */
-                        /* Brighten color: clamp(color * 4, 255) */
-                        uint8_t *sc = s + 16;
-                        uint8_t r = sc[2], g = sc[1], b = sc[0], a = sc[3];
-                        d[12] = (b * 4 > 255) ? 255 : b * 4;
-                        d[13] = (g * 4 > 255) ? 255 : g * 4;
-                        d[14] = (r * 4 > 255) ? 255 : r * 4;
-                        d[15] = a ? a : 255;
+                        /* Color: Xbox D3DCOLOR is ARGB uint32, same as PC.
+                         * Brighten by shifting up (ambient values are 20-80). */
+                        uint32_t col = *(uint32_t*)(s + 16);
+                        uint32_t r = (col >> 16) & 0xFF;
+                        uint32_t g = (col >> 8) & 0xFF;
+                        uint32_t b = col & 0xFF;
+                        r = (r * 3 > 255) ? 255 : r * 3;
+                        g = (g * 3 > 255) ? 255 : g * 3;
+                        b = (b * 3 > 255) ? 255 : b * 3;
+                        *(uint32_t*)(d + 12) = 0xFF000000 | (r << 16) | (g << 8) | b;
                         memcpy(d+16, s+20, 8);  /* UV (float2) */
                     }
 
-                    /* Set render state for world-space geometry */
+                    /* Set vertex format and render state */
+                    dev->lpVtbl->SetVertexShader(dev,
+                        D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1);
                     dev->lpVtbl->SetRenderState(dev, D3DRS_LIGHTING, FALSE);
                     dev->lpVtbl->SetRenderState(dev, D3DRS_ZENABLE, TRUE);
                     dev->lpVtbl->SetRenderState(dev, D3DRS_ZWRITEENABLE, TRUE);
                     dev->lpVtbl->SetRenderState(dev, D3DRS_CULLMODE, D3DCULL_NONE);
+
+                    /* Bind texture from static texture dictionary.
+                     * Use the render state index from sub_0034EDB0's last call.
+                     * sub_0034EDB0 stores the index at 0x35D2C0 table. Read the
+                     * most recently set render state's associated texture.
+                     * For now: use geom_base to derive a texture index — each
+                     * geometry group in static.dat corresponds to a texture. */
+                    {
+                        extern StaticTexDict *rw_get_static_textures(void);
+                        StaticTexDict *stex = rw_get_static_textures();
+                        if (stex && stex->count > 0) {
+                            uint32_t tex_idx = (g_current_geom_base >> 8) % (uint32_t)stex->count;
+                            IDirect3DTexture8 *tex = stex->entries[tex_idx].texture;
+                            if (tex) {
+                                dev->lpVtbl->SetTexture(dev, 0, (IDirect3DBaseTexture8*)tex);
+                                /* Configure texture stage to modulate texture × vertex color */
+                                dev->lpVtbl->SetTextureStageState(dev, 0,
+                                    D3DTSS_COLOROP, D3DTOP_MODULATE);
+                                dev->lpVtbl->SetTextureStageState(dev, 0,
+                                    D3DTSS_COLORARG1, D3DTA_TEXTURE);
+                                dev->lpVtbl->SetTextureStageState(dev, 0,
+                                    D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+                                dev->lpVtbl->SetTextureStageState(dev, 0,
+                                    D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+                                dev->lpVtbl->SetTextureStageState(dev, 0,
+                                    D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
+                            }
+                        }
+                    }
 
                     dev->lpVtbl->DrawIndexedPrimitiveUP(dev,
                         d3d_type, 0, vert_count, prim_count,
@@ -2884,6 +2919,8 @@ void sub_001D7D10(void)
             }
         }
     }
+
+    /* removed auto-screenshot — use F12 */
 
     if (g_1D7D10_draws <= 5 || (g_1D7D10_draws % 50000) == 0) {
         extern uint32_t g_current_geom_base;
