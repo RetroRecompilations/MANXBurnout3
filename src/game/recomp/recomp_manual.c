@@ -10,6 +10,7 @@
 #define RECOMP_GENERATED_CODE
 #include "gen/recomp_funcs.h"
 #include "../static_textures.h"
+#include "../track_loader.h"
 #include <math.h>
 #include <stdio.h>
 
@@ -1598,11 +1599,17 @@ void sub_0003FEE0(void)
      * sub_00040310 (matrix→render state) needs sub_001CF153 output
      * TODO: re-enable once sub_00040CF0 output is validated */
 
-    /* ── Step 10: D3D clear via sub_0034C2E0 ── */
+    /* BeginScene for FEE0's geometry draws (bridge already did EndScene) */
+    {
+        IDirect3DDevice8 *d3d = xbox_GetD3DDevice();
+        if (d3d) d3d->lpVtbl->BeginScene(d3d);
+    }
+
+    /* ── Step 10: D3D clear — depth only (keep menu content from bridge) ── */
     PUSH32(esp, 0);            /* stencil */
     PUSH32(esp, 0x3F800000);   /* depth = 1.0f */
-    PUSH32(esp, 0);            /* color = black */
-    PUSH32(esp, 0x83);         /* flags = color|depth|stencil */
+    PUSH32(esp, 0);            /* color = black (unused — not clearing color) */
+    PUSH32(esp, 0x02);         /* flags = depth only (skip color clear) */
     PUSH32(esp, 0);            /* rect count */
     PUSH32(esp, 0);            /* rects ptr */
     PUSH32(esp, 0); sub_0034C2E0();
@@ -1642,6 +1649,12 @@ void sub_0003FEE0(void)
     PUSH32(esp, render_base);
     PUSH32(esp, 0); sub_001AD350();
     if (log) fprintf(stderr, "  [FEE0] Pass 2 DONE\n");
+
+    /* EndScene to match BeginScene above */
+    {
+        IDirect3DDevice8 *d3d = xbox_GetD3DDevice();
+        if (d3d) d3d->lpVtbl->EndScene(d3d);
+    }
 
     if (log)
         fprintf(stderr, "  [FEE0] #%u DONE (sub_00040CF0 enabled)\n", call_count);
@@ -2878,6 +2891,54 @@ void sub_001D7D10(void)
                     dev->lpVtbl->SetVertexShader(dev,
                         D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1);
                     dev->lpVtbl->SetRenderState(dev, D3DRS_LIGHTING, FALSE);
+
+                    /* Set view/projection for world-space track geometry.
+                     * Build a look-at view + perspective projection targeting
+                     * the track center (from loaded track data). */
+                    {
+                        extern float g_track_spawn_x, g_track_spawn_z;
+                        extern TrackData g_track_data;
+                        extern int g_track_loaded;
+                        float cx = g_track_loaded ? g_track_data.center[0] : 1970.0f;
+                        float cy = g_track_loaded ? g_track_data.center[1] + 200.0f : 200.0f;
+                        float cz = g_track_loaded ? g_track_data.center[2] : 1420.0f;
+                        float tx = cx, ty = cy - 200.0f, tz = cz + 100.0f;
+
+                        /* Simple look-at view matrix */
+                        float fx = tx-cx, fy = ty-cy, fz = tz-cz;
+                        float fl = sqrtf(fx*fx+fy*fy+fz*fz);
+                        if (fl > 0.001f) { fx/=fl; fy/=fl; fz/=fl; }
+                        float rx = fy*0-0*fz, ry = fz*0-fx*0, rz = fx*0-fy*0;
+                        /* cross(f, up(0,1,0)) */
+                        rx = fy*0.0f - fz*1.0f; /* not right, let me simplify */
+
+                        D3DMATRIX vm;
+                        memset(&vm, 0, sizeof(vm));
+                        /* Look down at track center from above */
+                        vm._11 = 1; vm._22 = 0; vm._23 = -1; vm._32 = 1; vm._33 = 0;
+                        vm._41 = -cx; vm._42 = -cz; vm._43 = cy;
+                        vm._44 = 1.0f;
+
+                        /* Perspective projection */
+                        float fov = 1.0f; /* ~60 degrees */
+                        float aspect = 640.0f / 480.0f;
+                        float znear = 1.0f, zfar = 5000.0f;
+                        D3DMATRIX pm;
+                        memset(&pm, 0, sizeof(pm));
+                        pm._11 = fov / aspect;
+                        pm._22 = fov;
+                        pm._33 = zfar / (zfar - znear);
+                        pm._34 = 1.0f;
+                        pm._43 = -znear * zfar / (zfar - znear);
+
+                        D3DMATRIX wm;
+                        memset(&wm, 0, sizeof(wm));
+                        wm._11 = wm._22 = wm._33 = wm._44 = 1.0f;
+
+                        dev->lpVtbl->SetTransform(dev, D3DTS_VIEW, &vm);
+                        dev->lpVtbl->SetTransform(dev, D3DTS_PROJECTION, &pm);
+                        dev->lpVtbl->SetTransform(dev, D3DTS_WORLD, &wm);
+                    }
                     dev->lpVtbl->SetRenderState(dev, D3DRS_ZENABLE, TRUE);
                     dev->lpVtbl->SetRenderState(dev, D3DRS_ZWRITEENABLE, TRUE);
                     dev->lpVtbl->SetRenderState(dev, D3DRS_CULLMODE, D3DCULL_NONE);

@@ -4969,23 +4969,20 @@ void game_frame_pump(void)
             g_d3d_device->lpVtbl->EndScene(g_d3d_device);
             menu_gui_begin_frame();
             menu_gui_render();
-            /* Only present here if the bridge didn't render. */
             g_d3d_device->lpVtbl->Present(g_d3d_device, NULL, NULL, NULL, NULL);
-            {
-                extern volatile uint32_t g_present_count;
-                g_present_count++;
-            }
         } else {
             /* Bridge rendered but deferred Present so sub_0003FEE0's render
-             * dispatch can draw static.dat geometry into the same frame.
-             * Now Present the combined result with ImGui overlay. */
+             * dispatch can draw static.dat geometry into the same frame. */
             menu_gui_begin_frame();
             menu_gui_render();
             g_d3d_device->lpVtbl->Present(g_d3d_device, NULL, NULL, NULL, NULL);
-            {
-                extern volatile uint32_t g_present_count;
-                g_present_count++;
-            }
+        }
+        /* Auto-screenshot on frame 150 to capture geometry state */
+        {
+            extern volatile uint32_t g_present_count;
+            if (g_present_count == 150)
+                menu_gui_take_screenshot();
+            g_present_count++;
         }
     }
 
