@@ -26,7 +26,6 @@ endif()
 find_package(SDL3 REQUIRED)
 find_package(Vulkan REQUIRED)
 find_package(Threads REQUIRED)
-find_library(SHADERC_LIBRARY NAMES shaderc_shared shaderc)
 
 set(B3_HOST_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/manx_host")
 set(B3_GAME_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/game")
@@ -39,7 +38,6 @@ add_library(burnout3_port STATIC
     ${B3_HOST_DIR}/burnout3_kernel_shim.c
     ${B3_HOST_DIR}/burnout3_game_native.c
     ${B3_HOST_DIR}/burnout3_game_frame_pump.c
-    ${B3_D3D_DIR}/vulkan_d3d8.c
     ${B3_GAME_DIR}/txd_loader.c
     ${B3_GAME_DIR}/bgv_loader.c
     ${B3_GAME_DIR}/track_loader.c
@@ -66,12 +64,10 @@ target_compile_options(burnout3_port PRIVATE -w)
 target_link_libraries(burnout3_port PUBLIC
     Vulkan::Vulkan
     MANXFramework::XboxTexture
+    MANXFramework::XboxD3D8
     Threads::Threads
     ${CMAKE_DL_LIBS}
     m)
-if(SHADERC_LIBRARY)
-    target_link_libraries(burnout3_port PUBLIC ${SHADERC_LIBRARY})
-endif()
 if(TARGET MANXFramework::FMV)
     target_compile_definitions(burnout3_port PRIVATE B3_HAVE_FFMPEG)
     target_link_libraries(burnout3_port PUBLIC MANXFramework::FMV)
@@ -139,18 +135,6 @@ target_link_libraries(MANXBurnout3 PRIVATE
 
 if(MANX_BURNOUT3_BUILD_TESTS)
     enable_testing()
-
-    add_executable(burnout3_render_unit_test
-        tests/manx/burnout3_render_unit_test.c)
-    target_include_directories(burnout3_render_unit_test PRIVATE ${B3_D3D_DIR})
-    target_link_libraries(burnout3_render_unit_test PRIVATE
-        Vulkan::Vulkan ${CMAKE_DL_LIBS} m)
-    if(SHADERC_LIBRARY)
-        target_link_libraries(burnout3_render_unit_test PRIVATE
-            ${SHADERC_LIBRARY})
-    endif()
-    add_test(NAME burnout3_render_unit_test
-        COMMAND burnout3_render_unit_test)
 
     add_executable(burnout3_gameplay_unit_test
         tests/manx/burnout3_gameplay_unit_test.c)
