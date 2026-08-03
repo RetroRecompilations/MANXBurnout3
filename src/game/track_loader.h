@@ -24,19 +24,35 @@ typedef struct {
     float u, v;               /* texture coordinates */
 } TrackVertex;                /* 28 bytes */
 
-/* A section's geometry (vertex + index buffers) */
+/* A section's geometry (vertex + index buffers).
+ *
+ * One entry per object descriptor in the section. Each object is exactly one
+ * DrawIndexedVertices call in the original game: a primitive type, a run of
+ * indices, and a texture. The runs are ascending but NOT contiguous (there is
+ * up to one index of alignment padding between them), so both the start and
+ * the length are needed. */
 typedef struct {
     TrackVertex *vertices;
     uint32_t vertex_count;
     uint16_t *indices;
     uint32_t index_count;
     float center[3];          /* section center from header */
-    /* Per-object strip boundaries: strip_breaks[i] = start index of object i's strip */
+    /* Per-object strip start: strip_breaks[i] = first index of object i */
     uint32_t *strip_breaks;
-    int strip_break_count;
+    int strip_break_count;    /* == object count */
+    /* Per-object index count (NOT strip_breaks[i+1] - strip_breaks[i]) */
+    uint32_t *strip_lens;
+    /* Per-object primitive type, as passed to DrawIndexedVertices:
+     * 6 = triangle strip (all real geometry), 2 = line list. */
+    uint8_t *strip_prims;
     /* Per-object texture indices (global index into static.dat texture list) */
     uint16_t *tex_indices;
     int tex_index_count;
+    /* Per-object world-space bounds: 6 floats each (min xyz, then max xyz),
+     * from the eight corners the game stores at descriptor +0x00. The corners
+     * describe an oriented box; the enclosing AABB is what broad-phase wants
+     * and measures within ~2 units of the object's own vertex extent. */
+    float *obj_bbox;
 } TrackChunk;
 
 /* Road spine waypoint (de-duplicated section centers forming a driveable path) */

@@ -13,6 +13,15 @@
 extern "C" {
 #endif
 
+/** Set the game data directory (for ovid/ intro FMVs). Call before
+ *  fe_menu_init; without it the boot intro is skipped entirely. */
+void fe_menu_set_game_dir(const char *dir);
+
+/** Pull decoded intro-movie audio as 48 kHz signed 16-bit stereo PCM.
+ *  Returns the number of frames written; callers should silence-fill the
+ *  remainder. */
+int fe_menu_audio_callback(int16_t *stereo, int max_frames);
+
 /** Initialize the menu system (call after textures are loaded). */
 void fe_menu_init(void);
 
@@ -34,6 +43,13 @@ int fe_menu_is_racing(void);
 
 /** Stop the current race and return to menus. */
 void fe_menu_stop_race(void);
+
+/** Returns 1 once fe_menu_render_frame has produced a frame at least once.
+ *  Used by the bridge to know when the recompiled game's state machine has
+ *  advanced far enough to render menu UI (game_state == 5). Until the first
+ *  render, the bridge drives fe_menu_update unconditionally so the state
+ *  machine actually advances from boot-time 0 to menu 5. */
+int fe_menu_rendered_once(void);
 
 #ifdef __cplusplus
 }

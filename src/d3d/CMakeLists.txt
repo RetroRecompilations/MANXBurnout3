@@ -1,8 +1,7 @@
-# D3D8→D3D11 Compatibility Layer
-# Implements Xbox D3D8 interface backed by Direct3D 11
+# D3D8 Compatibility Layer (legacy D3D11 backend — being replaced by Vulkan)
+# vulkan_d3d8.c is the new GPU Vulkan backend.
 
 add_library(d3d8_compat STATIC
-    d3d8_device.c
     d3d8_resources.c
     d3d8_shaders.c
     d3d8_states.c
@@ -14,7 +13,7 @@ target_include_directories(d3d8_compat PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-# D3D11 and DXGI libraries
+# D3D11 and DXGI libraries (for remaining D3D11 files)
 target_link_libraries(d3d8_compat
     d3d11
     dxgi

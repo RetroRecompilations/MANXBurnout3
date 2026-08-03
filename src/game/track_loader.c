@@ -1,14 +1,52 @@
 /**
  * Burnout 3: Takedown - Track Geometry Loader
  *
- * Parses streamed.dat track files using section-based format:
- *   - File is a chain of variable-size sections
- *   - Each section header: version(1) at +0x00, section_size at +0x08,
- *     bounding position at +0x10, waypoint offset at +0x54, object count at +0x60
- *   - Vertex buffer starts at: header[+0x54] + 0x50
- *     (equivalently: 0x0C90 + object_count * 0x90)
- *   - Vertex format: float3 pos + uint32 packed_normal + uint32 color + float2 UV (28B stride)
- *   - Index data (uint16 triangle strip) follows vertex buffer
+ * Parses streamed.dat track files. The layout below is not inferred: it is
+ * read straight out of the retail XBE, which loads each section as a memory
+ * image and relocates a handful of self-relative offsets in place.
+ *
+ * The relevant routines are:
+ *
+ *   sub_0019CC60  loads a section and calls the fixup with the mesh header
+ *                 address = section + 0x50.
+ *   sub_0019B440  the fixup. With ecx = mesh header:
+ *                     [ecx+0x04] += ecx          vertex data
+ *                     [ecx+0x0C] += ecx          object descriptor array
+ *                     count = (int16)[ecx+0x10]
+ *                     for i in 0..count:
+ *                         d = [ecx+0x0C] + i*0x90
+ *                         [d+0x88] += d          index data (self-relative!)
+ *   sub_001AD050  the draw loop:
+ *                     SetStreamSource(0, &obj[0x40], 0x1C)      <- stride 28
+ *                     DrawIndexedVertices([d+0x80], [d+0x84], [d+0x88])
+ *
+ * So, section-relative:
+ *   +0x00  version (1 on disk; the game overwrites it with 2 once fixed up)
+ *   +0x08  section size
+ *   +0x10  centre float3
+ *   +0x54  vertex data offset,      relative to section+0x50
+ *   +0x5C  descriptor array offset, relative to section+0x50
+ *   +0x60  descriptor count (uint16)
+ *   +0x84  per-object texture ids (uint16)
+ * and each 0x90-byte descriptor:
+ *   +0x00  eight bbox corners (float3 + one padding dword each)
+ *   +0x80  primitive type   (6 = triangle strip, 2 = line list)
+ *   +0x84  index count
+ *   +0x88  index data offset, relative to the descriptor's own address
+ *   +0x8C  next-object byte for the material chain, -1 = end
+ *
+ * The vertex block runs from the vertex offset up to the first index run, and
+ * that span is always an exact multiple of 28 (verified over all 36 shipped
+ * streamed.dat files: no misalignment, no out-of-range index, no overlapping
+ * index run).
+ *
+ * The padding dword after each bbox corner is uninitialised heap junk, not a
+ * field. It reads 0xE32B0CB2 in the high-detail sections and something else in
+ * the LOD ones, which is why it once looked like a section-type marker.
+ *
+ * Sections come in pairs: a high-detail section immediately followed by a
+ * low-detail LOD copy of the same area, with a bit-identical centre. Only the
+ * high-detail half is loaded. See the note on B3_LOAD_LOD below.
  */
 
 #include "track_loader.h"
@@ -20,6 +58,26 @@
 
 #define TRACK_VERTEX_STRIDE  28
 #define MIN_VERTS_PER_SECTION 10
+
+/* Section-relative offsets (see the header comment). */
+#define SEC_VERSION      0x00
+#define SEC_SIZE         0x08
+#define SEC_CENTRE       0x10
+#define SEC_TEXIDS       (getenv("B3_TEXID_D4") ? 0xD4 : 0x84)
+#define MESH_BASE        0x50
+#define MESH_VTX_REL     (MESH_BASE + 0x04)
+#define MESH_DESC_REL    (MESH_BASE + 0x0C)
+#define MESH_DESC_COUNT  (MESH_BASE + 0x10)
+
+/* Descriptor-relative offsets. */
+#define DESC_STRIDE      0x90
+#define DESC_PRIM        0x80
+#define DESC_ICOUNT      0x84
+#define DESC_IOFF        0x88
+
+static uint32_t rd_u32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
+static int32_t  rd_s32(const uint8_t *p) { int32_t  v; memcpy(&v, p, 4); return v; }
+static uint16_t rd_u16(const uint8_t *p) { uint16_t v; memcpy(&v, p, 2); return v; }
 
 int track_load(const char *path, TrackData *track)
 {
@@ -46,82 +104,158 @@ int track_load(const char *path, TrackData *track)
     fread(data, 1, (size_t)file_size, f);
     fclose(f);
 
-    /* Parse section chain */
-    int max_sections = 256;
+    /* Parse section chain. The largest shipped track (EU/M1) has 260
+     * sections, so 256 was not enough headroom even before B3_LOAD_LOD. */
+    int max_sections = 1024;
     TrackChunk *chunks = (TrackChunk *)calloc(max_sections, sizeof(TrackChunk));
     int chunk_count = 0;
 
     float overall_min[3] = {  1e30f,  1e30f,  1e30f };
     float overall_max[3] = { -1e30f, -1e30f, -1e30f };
     int total_verts = 0, total_indices = 0;
+    int total_objects = 0, section_count = 0, lod_skipped = 0, rejected = 0;
+
+    const int load_lod = getenv("B3_LOAD_LOD") ? 1 : 0;
+    int have_prev_centre = 0;
+    float prev_centre[3] = { 0.0f, 0.0f, 0.0f };
 
     uint32_t sec_off = 0;
-    while (sec_off + 0x80 <= (uint32_t)file_size) {
+    while (sec_off + 0x100 <= (uint32_t)file_size) {
         const uint8_t *sec = data + sec_off;
 
         /* Read section header */
-        uint32_t version, sec_size, waypoint_off;
-        memcpy(&version,      sec + 0x00, 4);
-        memcpy(&sec_size,     sec + 0x08, 4);
-        memcpy(&waypoint_off, sec + 0x54, 4);
+        uint32_t version  = rd_u32(sec + SEC_VERSION);
+        uint32_t sec_size = rd_u32(sec + SEC_SIZE);
 
-        if (version != 1 || sec_size == 0 || sec_size > (uint32_t)file_size ||
+        if (version != 1 || sec_size < 0x100 || sec_size > (uint32_t)file_size ||
             sec_off + sec_size > (uint32_t)file_size)
             break;
 
-        /* Read object count from +0x60 */
-        uint32_t obj_count;
-        memcpy(&obj_count, sec + 0x60, 4);
+        section_count++;
 
         /* Section center position from header (+0x10) */
         float cx, cy, cz;
-        memcpy(&cx, sec + 0x10, 4);
-        memcpy(&cy, sec + 0x14, 4);
-        memcpy(&cz, sec + 0x18, 4);
+        memcpy(&cx, sec + SEC_CENTRE + 0, 4);
+        memcpy(&cy, sec + SEC_CENTRE + 4, 4);
+        memcpy(&cz, sec + SEC_CENTRE + 8, 4);
 
-        /* Vertex buffer starts at waypoint_offset + 0x50 */
-        uint32_t vb_start = waypoint_off + 0x50;
-        if (vb_start >= sec_size || vb_start + TRACK_VERTEX_STRIDE > sec_size) {
+        /* Sections alternate high-detail / LOD, and the LOD copy repeats its
+         * partner's centre bit for bit. Measured over all 36 shipped
+         * streamed.dat files: the alternation never breaks, the centres are
+         * always exactly equal, and the LOD half carries about 30% of the
+         * vertices over the same bounding box. Loading both draws the world
+         * twice, so the LOD half is skipped. B3_LOAD_LOD=1 loads it anyway,
+         * for inspection. */
+        int is_lod = (have_prev_centre &&
+                      cx == prev_centre[0] &&
+                      cy == prev_centre[1] &&
+                      cz == prev_centre[2]);
+        have_prev_centre = 1;
+        prev_centre[0] = cx;
+        prev_centre[1] = cy;
+        prev_centre[2] = cz;
+        if (is_lod && !load_lod) {
+            lod_skipped++;
             sec_off += sec_size;
             continue;
         }
 
-        /* Sections come in pairs. Only type-0 sections (where vb_start matches
-         * the formula 0x0C90 + obj_count * 0x90) have the expected vertex/index
-         * layout. Type-1 sections have a different internal format — skip them. */
-        uint32_t expected_vb = 0x0C90 + obj_count * 0x90;
-        if (vb_start != expected_vb) {
+        /* Mesh header at section+0x50; both offsets are relative to it. */
+        int32_t  vtx_rel   = rd_s32(sec + MESH_VTX_REL);
+        int32_t  desc_rel  = rd_s32(sec + MESH_DESC_REL);
+        uint32_t obj_count = rd_u16(sec + MESH_DESC_COUNT);
+
+        int64_t vb64 = (int64_t)MESH_BASE + vtx_rel;
+        int64_t db64 = (int64_t)MESH_BASE + desc_rel;
+
+        if (obj_count == 0 ||
+            vb64 < MESH_BASE || vb64 + TRACK_VERTEX_STRIDE > (int64_t)sec_size ||
+            db64 < MESH_BASE ||
+            db64 + (int64_t)obj_count * DESC_STRIDE > (int64_t)sec_size) {
+            rejected++;
             sec_off += sec_size;
             continue;
         }
 
-        /* Count valid vertices at stride 28 */
-        uint32_t vb_count = 0;
-        uint32_t off = vb_start;
-        while (off + TRACK_VERTEX_STRIDE <= sec_size) {
-            float x, y, z;
-            memcpy(&x, sec + off,     4);
-            memcpy(&y, sec + off + 4, 4);
-            memcpy(&z, sec + off + 8, 4);
+        uint32_t vb_start = (uint32_t)vb64;
+        uint32_t db_start = (uint32_t)db64;
 
-            /* Valid vertex: finite coords, at least one > 10 (world scale) */
-            if (x == x && y == y && z == z &&
-                fabsf(x) < 50000.0f && fabsf(y) < 50000.0f && fabsf(z) < 50000.0f &&
-                (fabsf(x) > 10.0f || fabsf(z) > 10.0f)) {
-                vb_count++;
-                off += TRACK_VERTEX_STRIDE;
-            } else {
+        /* Walk the object descriptors. Each one is a single
+         * DrawIndexedVertices call, and its index run is located by an offset
+         * relative to the descriptor itself. The runs ascend in object order
+         * but are not contiguous: consecutive runs are separated by up to one
+         * index of alignment padding, so the length has to come from +0x84
+         * rather than from the next run's start.
+         *
+         * The vertex block is everything between the vertex offset and the
+         * first index run. That span is an exact multiple of 28 in every
+         * section of every shipped track, which is the check below.
+         *
+         * What this replaces, measured on US/C1_V1: the old cumulative-sum
+         * rule (object k starts where object k-1's count ended) ignores that
+         * padding, so only 82 of 1744 objects started on the right index —
+         * the rest were off by up to 34, mean 10. An odd offset also flips
+         * the strip's winding. Separately the old index reader had no end
+         * condition at all, so it ran 329168 indices where there are 265733,
+         * appending 24% trailing junk to the last object's strip. */
+        uint32_t *ob_start = (uint32_t *)malloc((size_t)obj_count * sizeof(uint32_t));
+        uint32_t *ob_len   = (uint32_t *)malloc((size_t)obj_count * sizeof(uint32_t));
+        uint8_t  *ob_prim  = (uint8_t  *)malloc((size_t)obj_count * sizeof(uint8_t));
+        float    *ob_bbox  = (float    *)malloc((size_t)obj_count * 6 * sizeof(float));
+        int ok = (ob_start != NULL && ob_len != NULL && ob_prim != NULL &&
+                  ob_bbox != NULL);
+
+        int64_t idx_lo = -1, idx_hi = -1;
+
+        for (uint32_t o = 0; ok && o < obj_count; o++) {
+            uint32_t d = db_start + o * DESC_STRIDE;
+            uint32_t prim   = rd_u32(sec + d + DESC_PRIM);
+            uint32_t icount = rd_u32(sec + d + DESC_ICOUNT);
+            int32_t  ioff   = rd_s32(sec + d + DESC_IOFF);
+            int64_t  start  = (int64_t)d + ioff;
+
+            if (icount == 0 || icount > sec_size / 2 ||
+                start < (int64_t)vb_start ||
+                start + (int64_t)icount * 2 > (int64_t)sec_size) {
+                ok = 0;
                 break;
             }
-        }
-        uint32_t vb_end = vb_start + vb_count * TRACK_VERTEX_STRIDE;
+            ob_start[o] = (uint32_t)start;
+            ob_len[o]   = icount;
+            ob_prim[o]  = (uint8_t)(prim > 0xFF ? 0 : prim);
 
-        if (vb_count < MIN_VERTS_PER_SECTION) {
+            /* Eight corners at the descriptor's own address, each a float3
+             * followed by a padding dword of uninitialised heap junk. */
+            float *bb = &ob_bbox[o * 6];
+            bb[0] = bb[1] = bb[2] =  1e30f;
+            bb[3] = bb[4] = bb[5] = -1e30f;
+            for (int c = 0; c < 8; c++) {
+                float p[3];
+                memcpy(p, sec + d + c * 16, sizeof p);
+                for (int a = 0; a < 3; a++) {
+                    if (p[a] < bb[a])     bb[a]     = p[a];
+                    if (p[a] > bb[3 + a]) bb[3 + a] = p[a];
+                }
+            }
+
+            if (idx_lo < 0 || start < idx_lo) idx_lo = start;
+            if (start + (int64_t)icount * 2 > idx_hi)
+                idx_hi = start + (int64_t)icount * 2;
+        }
+
+        int64_t vspan = ok ? (idx_lo - (int64_t)vb_start) : -1;
+        if (!ok || vspan <= 0 || (vspan % TRACK_VERTEX_STRIDE) != 0) {
+            rejected++;
+            free(ob_start); free(ob_len); free(ob_prim); free(ob_bbox);
             sec_off += sec_size;
             continue;
         }
 
-        if (chunk_count >= max_sections) {
+        uint32_t vb_count = (uint32_t)(vspan / TRACK_VERTEX_STRIDE);
+
+        if (vb_count < MIN_VERTS_PER_SECTION || chunk_count >= max_sections) {
+            if (vb_count < MIN_VERTS_PER_SECTION) rejected++;
+            free(ob_start); free(ob_len); free(ob_prim); free(ob_bbox);
             sec_off += sec_size;
             continue;
         }
@@ -154,62 +288,49 @@ int track_load(const char *path, TrackData *track)
             if (v->z > overall_max[2]) overall_max[2] = v->z;
         }
 
-        /* Collect index data (uint16 values after vertex buffer) */
-        uint32_t ib_count = 0;
-        uint32_t ib_off = vb_end;
-        while (ib_off + 2 <= sec_size) {
-            uint16_t idx;
-            memcpy(&idx, sec + ib_off, 2);
-            if (idx < vb_count) {
-                ib_count++;
-                ib_off += 2;
-            } else {
-                break;
-            }
-        }
+        /* Copy the whole index region in one go and record each object's run
+         * relative to its start. The region ends where the last run ends —
+         * the old reader had no end at all, because its `idx < vertex_count`
+         * test never fails and so ate the rest of the section. */
+        uint32_t ib_count = (uint32_t)((idx_hi - idx_lo) / 2);
+        chunk->index_count = ib_count;
+        chunk->indices = (uint16_t *)malloc((size_t)ib_count * sizeof(uint16_t));
+        if (chunk->indices)
+            memcpy(chunk->indices, sec + idx_lo, (size_t)ib_count * 2);
 
-        if (ib_count >= 3) {
-            chunk->index_count = ib_count;
-            chunk->indices = (uint16_t *)malloc((size_t)ib_count * sizeof(uint16_t));
-            memcpy(chunk->indices, sec + vb_end, ib_count * 2);
-        }
+        /* Per-object index run, primitive type and texture id.
+         *
+         * The texture ids are a uint16 array inline in the section header at
+         * +0x84, one per object, indexing the static.dat texture list. */
+        chunk->strip_breaks = (uint32_t *)malloc((size_t)obj_count * sizeof(uint32_t));
+        chunk->strip_lens   = (uint32_t *)malloc((size_t)obj_count * sizeof(uint32_t));
+        chunk->strip_prims  = (uint8_t  *)malloc((size_t)obj_count * sizeof(uint8_t));
+        chunk->tex_indices  = (uint16_t *)malloc((size_t)obj_count * sizeof(uint16_t));
 
-        /* Read per-object strip boundaries from object descriptors.
-         * Each 0x90-byte object descriptor at section+0x0C90 has idx_count at +0x84.
-         * Objects define separate triangle strips within the shared index buffer. */
-        if (obj_count > 0 && ib_count >= 3) {
-            chunk->strip_breaks = (uint32_t *)malloc((obj_count + 1) * sizeof(uint32_t));
-            chunk->strip_break_count = 0;
-            uint32_t cum = 0;
+        if (chunk->strip_breaks && chunk->strip_lens && chunk->strip_prims &&
+            chunk->tex_indices && chunk->indices) {
             for (uint32_t oi = 0; oi < obj_count; oi++) {
-                uint32_t desc_off = 0x0C90 + oi * 0x90 + 0x84;
-                if (desc_off + 4 <= sec_size) {
-                    uint32_t obj_idx_count;
-                    memcpy(&obj_idx_count, sec + desc_off, 4);
-                    chunk->strip_breaks[chunk->strip_break_count++] = cum;
-                    cum += obj_idx_count;
-                }
+                chunk->strip_breaks[oi] = (uint32_t)((ob_start[oi] - idx_lo) / 2);
+                chunk->strip_lens[oi]   = ob_len[oi];
+                chunk->strip_prims[oi]  = ob_prim[oi];
+                uint32_t ti_off = SEC_TEXIDS + oi * 2;
+                chunk->tex_indices[oi] =
+                    (ti_off + 2 <= sec_size) ? rd_u16(sec + ti_off) : 0;
             }
-            /* Final sentinel = total indices covered by objects */
-            chunk->strip_breaks[chunk->strip_break_count] = cum;
+            chunk->strip_break_count = (int)obj_count;
+            chunk->tex_index_count   = (int)obj_count;
+            chunk->obj_bbox = ob_bbox;
+            ob_bbox = NULL;   /* ownership moved to the chunk */
         }
 
-        /* Read per-object texture indices from section header at +0x84.
-         * Each uint16 is a global index into the static.dat texture list. */
-        if (obj_count > 0) {
-            chunk->tex_indices = (uint16_t *)malloc(obj_count * sizeof(uint16_t));
-            chunk->tex_index_count = 0;
-            for (uint32_t oi = 0; oi < obj_count; oi++) {
-                uint32_t ti_off = 0x84 + oi * 2;
-                if (ti_off + 2 <= sec_size) {
-                    memcpy(&chunk->tex_indices[oi], sec + ti_off, 2);
-                    chunk->tex_index_count++;
-                }
-            }
-        }
+        free(ob_start);
+        free(ob_len);
+        free(ob_prim);
+        free(ob_bbox);
 
         total_verts += (int)vb_count;
         total_indices += (int)ib_count;
+        total_objects += (int)obj_count;
         chunk_count++;
 
         sec_off += sec_size;
@@ -292,8 +413,10 @@ int track_load(const char *path, TrackData *track)
                 raw_count, cum);
     }
 
-    fprintf(stderr, "[TRACK] Loaded %s: %d sections, %d verts, %d indices\n",
-            path, chunk_count, total_verts, total_indices);
+    fprintf(stderr, "[TRACK] Loaded %s: %d/%d sections, %d objects, %d verts, %d indices"
+                    " (%d LOD sections skipped, %d rejected)\n",
+            path, chunk_count, section_count, total_objects, total_verts, total_indices,
+            lod_skipped, rejected);
     fprintf(stderr, "[TRACK] Center=(%.0f, %.0f, %.0f) Radius=%.0f Spawn=(%.0f, %.0f, %.0f)\n",
             track->center[0], track->center[1], track->center[2], track->radius,
             track->spawn[0], track->spawn[1], track->spawn[2]);
@@ -363,7 +486,10 @@ void track_free(TrackData *track)
         free(track->chunks[i].vertices);
         free(track->chunks[i].indices);
         free(track->chunks[i].strip_breaks);
+        free(track->chunks[i].strip_lens);
+        free(track->chunks[i].strip_prims);
         free(track->chunks[i].tex_indices);
+        free(track->chunks[i].obj_bbox);
     }
     free(track->chunks);
     free(track->spine);

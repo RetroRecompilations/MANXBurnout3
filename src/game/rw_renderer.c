@@ -73,6 +73,10 @@ float g_track_spawn_x = 0.0f;
 float g_track_spawn_y = 0.0f;
 float g_track_spawn_z = 0.0f;
 float g_track_spawn_hdg = 0.0f;
+/* The streamed.dat's own spawn field, exposed for spawn diagnosis. */
+float g_track_authored_spawn[3];
+
+/* Triangle-filter accounting, reported once per track load. */
 int   g_track_mode = 0;  /* 1 = driving on real track geometry */
 
 static void tod_update(float py)
@@ -150,8 +154,10 @@ static RW_Mesh *g_player_mesh = NULL;
 static RW_Mesh *g_traffic_meshes[MAX_TRAFFIC_MESHES];
 static int g_traffic_mesh_count = 0;
 
-/* Track geometry (non-static: accessed by rw_bridge.c for PB injection) */
-#define MAX_TRACK_CHUNKS 2000
+/* Track geometry (non-static: accessed by rw_bridge.c for PB injection).
+ * One mesh per object descriptor: 1744 for US/C1_V1, 4420 for the largest
+ * shipped track (AS/M1), so 2000 was not enough. */
+#define MAX_TRACK_CHUNKS 8192
 TrackData g_track_data;
 static RW_Mesh *g_track_meshes[MAX_TRACK_CHUNKS];
 static BGV_Vertex *g_track_bgv_verts[MAX_TRACK_CHUNKS];  /* CPU-side data (kept alive for mesh) */
@@ -250,9 +256,18 @@ void rw_mesh_destroy(RW_Mesh *mesh)
     free(mesh);
 }
 
-/* Create a mesh from raw vertex/index arrays (for procedural geometry) */
-static RW_Mesh *rw_mesh_create_procedural(BGV_Vertex *verts, uint32_t vc,
-                                           uint16_t *idxs, uint32_t ic)
+/* Create a mesh from raw vertex/index arrays (for procedural geometry).
+ *
+ * `share_vb`, when non-NULL, is an existing vertex buffer holding exactly
+ * these vertices; the mesh takes a reference instead of uploading its own
+ * copy. Track objects need this: every object in a section indexes that
+ * section's whole vertex array, so uploading per object duplicated each
+ * section's vertices ~30 times. On the largest track that meant 4096
+ * vertex buffers — the entire pool — and hundreds of megabytes of
+ * identical data pushed to the GPU at race start. */
+static RW_Mesh *rw_mesh_create_shared(BGV_Vertex *verts, uint32_t vc,
+                                      uint16_t *idxs, uint32_t ic,
+                                      IDirect3DVertexBuffer8 *share_vb)
 {
     if (!verts || !idxs || vc == 0 || ic == 0)
         return NULL;
@@ -271,18 +286,21 @@ static RW_Mesh *rw_mesh_create_procedural(BGV_Vertex *verts, uint32_t vc,
     mesh->bounding_radius = 100.0f;
 
     UINT vb_size = vc * sizeof(BGV_Vertex);
-    HRESULT hr = dev->lpVtbl->CreateVertexBuffer(
-        dev, vb_size, 0, FVF_3D, D3DPOOL_MANAGED, &mesh->vb);
-    if (FAILED(hr)) { free(mesh); return NULL; }
-    {
-        BYTE *data = NULL;
-        hr = mesh->vb->lpVtbl->Lock(mesh->vb, 0, vb_size, &data, 0);
-        if (SUCCEEDED(hr)) {
-            memcpy(data, verts, vb_size);
+    if (share_vb) {
+        share_vb->lpVtbl->AddRef(share_vb);
+        mesh->vb = share_vb;
+    } else {
+        HRESULT vhr = dev->lpVtbl->CreateVertexBuffer(
+            dev, vb_size, 0, FVF_3D, D3DPOOL_MANAGED, &mesh->vb);
+        if (FAILED(vhr)) { free(mesh); return NULL; }
+        BYTE *vdata = NULL;
+        if (SUCCEEDED(mesh->vb->lpVtbl->Lock(mesh->vb, 0, vb_size, &vdata, 0))) {
+            memcpy(vdata, verts, vb_size);
             mesh->vb->lpVtbl->Unlock(mesh->vb);
         }
     }
 
+    HRESULT hr;
     UINT ib_size = ic * sizeof(uint16_t);
     hr = dev->lpVtbl->CreateIndexBuffer(
         dev, ib_size, 0, D3DFMT_INDEX16, D3DPOOL_MANAGED, &mesh->ib);
@@ -301,6 +319,12 @@ static RW_Mesh *rw_mesh_create_procedural(BGV_Vertex *verts, uint32_t vc,
     }
 
     return mesh;
+}
+
+static RW_Mesh *rw_mesh_create_procedural(BGV_Vertex *verts, uint32_t vc,
+                                          uint16_t *idxs, uint32_t ic)
+{
+    return rw_mesh_create_shared(verts, vc, idxs, ic, NULL);
 }
 
 /* ── Scene Management ────────────────────────────────────────── */
@@ -384,7 +408,9 @@ void rw_render_mesh(RW_Mesh *mesh, const float world_matrix[16])
     dev->lpVtbl->SetTransform(dev, D3DTS_WORLD, &wm);
 
     /* Bind texture or use vertex-color-only mode */
-    if (mesh->texture) {
+    static int no_tex = -1;
+    if (no_tex < 0) no_tex = getenv("B3_NO_TEX") ? 1 : 0;
+    if (mesh->texture && !no_tex) {
         dev->lpVtbl->SetTexture(dev, 0, (IDirect3DBaseTexture8 *)mesh->texture);
         /* COLOROP = MODULATE: texture color * vertex color (vertex provides AO/lighting) */
         dev->lpVtbl->SetTextureStageState(dev, 0, 1 /*D3DTSS_COLOROP*/, 4 /*D3DTOP_MODULATE*/);
@@ -631,6 +657,60 @@ static void render_sky_gradient(IDirect3DDevice8 *dev)
 }
 
 /* ── Ground Plane ────────────────────────────────────────────── */
+
+/* Harbour water.
+ *
+ * The waterfront tracks are a road corridor with nothing modelled beyond
+ * the quaysides — the game fills that with water, which is why static.dat
+ * ships 'water'..'water10' (16x16 animation frames) that nothing was
+ * drawing. Without it the harbour reads as flat sky-blue emptiness.
+ * The surface height is taken from the lowest road-facing geometry in
+ * the track rather than hardcoded, so it sits just under the quays. */
+float g_track_water_y = 0.0f;
+int   g_track_has_water = 0;
+
+static void render_water(IDirect3DDevice8 *dev, float cam_x, float cam_z)
+{
+    if (!g_track_has_water) return;
+
+    /* Flat tone rather than the 'water' art: those frames are 16x16
+     * caustic/animation data, not a diffuse tile, and tiling them across
+     * the harbour reads as scattered dark blobs. A still surface is the
+     * honest approximation until the game's own water pass is understood
+     * (B3_WATER_TEX=1 draws the art instead, for anyone revisiting it). */
+    IDirect3DTexture8 *tex = getenv("B3_WATER_TEX")
+        ? static_tex_find(&g_static_textures, "water") : NULL;
+    const float ws = 4000.0f;              /* out to the far plane */
+    const float uv = 700.0f;
+    const DWORD tint = tex ? 0xFF5A7C96 : 0xFF3E5C78;
+    const float wy = g_track_water_y;
+
+    BGV_Vertex w[6] = {
+        {cam_x - ws, wy, cam_z - ws, 0,1,0, tint, 0,  0},
+        {cam_x + ws, wy, cam_z - ws, 0,1,0, tint, uv, 0},
+        {cam_x - ws, wy, cam_z + ws, 0,1,0, tint, 0,  uv},
+        {cam_x + ws, wy, cam_z - ws, 0,1,0, tint, uv, 0},
+        {cam_x + ws, wy, cam_z + ws, 0,1,0, tint, uv, uv},
+        {cam_x - ws, wy, cam_z + ws, 0,1,0, tint, 0,  uv},
+    };
+
+    D3DMATRIX ident;
+    mat4_identity((float *)&ident);
+    dev->lpVtbl->SetTransform(dev, D3DTS_WORLD, &ident);
+    if (tex) {
+        dev->lpVtbl->SetTexture(dev, 0, (IDirect3DBaseTexture8 *)tex);
+        dev->lpVtbl->SetTextureStageState(dev, 0, 1, 4); /* MODULATE */
+        dev->lpVtbl->SetTextureStageState(dev, 0, 2, 2); /* ARG1 = TEXTURE */
+        dev->lpVtbl->SetTextureStageState(dev, 0, 3, 0); /* ARG2 = DIFFUSE */
+    } else {
+        dev->lpVtbl->SetTexture(dev, 0, NULL);
+        dev->lpVtbl->SetTextureStageState(dev, 0, 1, 1); /* DISABLE */
+    }
+    dev->lpVtbl->SetVertexShader(dev, FVF_3D);
+    dev->lpVtbl->SetStreamSource(dev, 0, NULL, 0);
+    dev->lpVtbl->SetIndices(dev, NULL, 0);
+    dev->lpVtbl->DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, w, sizeof(BGV_Vertex));
+}
 
 static void render_ground_plane(IDirect3DDevice8 *dev, float player_x, float player_z)
 {
@@ -1303,6 +1383,130 @@ static char g_track_dir[512] = {0};
 
 const char *rw_get_track_dir(void) { return g_track_dir; }
 
+/* ---------------------------------------------------------------------------
+ * Per-object material assignment.
+ *
+ * A streamed.dat section does NOT carry one material id per object. It carries
+ * a fixed 83-slot material table and, per slot, the head of a linked list of
+ * the objects that use it; the descriptor's +0x8C byte is the link and -1 ends
+ * the run. That is exactly how the retail draw loop walks it (sub_001AD5E0):
+ *
+ *   S    = section image                       ; [obj+0x1C4]
+ *   id   = (int16)[S + 0x84 + slot*2]          ; 0x001AD651
+ *   mat  = static_dat[+0x08] + id*0x28         ; 0x001AD65F..0x001AD665
+ *   o    = (int8)[S + 0x180 + row*0xA9 + slot] ; 0x001AD5FC
+ *   while o >= 0: draw desc[o]; o = (int8)[desc[o] + 0x8C]   ; 0x001AD691
+ *
+ * The 0xA9-byte records start at S+0x12A (sub_0019D100 walks 17 of them for
+ * section visibility) and hold, after three bytes of header, two 83-entry head
+ * arrays: the full one at +0x03 and a reduced one at +0x56 that the LOD pass
+ * uses. Record 0 is the section itself — its first byte is the neighbour delta
+ * and reads 0.
+ *
+ * Reading S+0x84 with the OBJECT index instead of the slot index is what put
+ * the flag frames on the road: for object 0..11 the two happen to coincide,
+ * and after that the ids are simply the wrong entries of the table.
+ *
+ * Verified over all 37 shipped tracks: the head arrays at +0x03 of record 0
+ * partition every accepted section's objects exactly once (58,000 objects, no
+ * repeats, no gaps, no out-of-range material id).
+ *
+ * This runs here rather than in the loader because the mapping needs the
+ * section image, and it rewrites the array the loader already sized per
+ * object. Sections are matched to chunks by walking both in file order and
+ * checking centre and object count; a single mismatch abandons the remap and
+ * leaves the loader's array alone.
+ * ------------------------------------------------------------------------ */
+#define SECMAT_TABLE      0x84    /* uint16[83] material ids */
+#define SECMAT_SLOTS      83
+#define SECMAT_RECORDS    0x12A   /* 0xA9-byte visibility records */
+#define SECMAT_REC_STRIDE 0xA9
+#define SECMAT_HEADS      0x03    /* uint8[83] chain heads, within a record */
+#define SECMAT_DESC_NEXT  0x8C
+
+static int track_remap_materials(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    uint8_t *data = (size > 0x100) ? (uint8_t *)malloc((size_t)size) : NULL;
+    if (!data || fread(data, 1, (size_t)size, f) != (size_t)size) {
+        free(data); fclose(f); return -1;
+    }
+    fclose(f);
+
+    /* Collect the assignments first; only commit once every chunk matched. */
+    uint16_t **out = (uint16_t **)calloc((size_t)g_track_data.chunk_count,
+                                         sizeof(uint16_t *));
+    if (!out) { free(data); return -1; }
+
+    int ci = 0, failed = 0;
+    for (uint32_t off = 0; off + 0x100 <= (uint32_t)size && ci < g_track_data.chunk_count; ) {
+        const uint8_t *sec = data + off;
+        uint32_t version, sec_size;
+        memcpy(&version,  sec + 0x00, 4);
+        memcpy(&sec_size, sec + 0x08, 4);
+        if (version != 1 || sec_size < 0x100 ||
+            (long)off + (long)sec_size > size) break;
+
+        TrackChunk *c = &g_track_data.chunks[ci];
+        uint16_t obj_count = 0;
+        memcpy(&obj_count, sec + 0x60, 2);
+        float centre[3];
+        memcpy(centre, sec + 0x10, 12);
+
+        if ((int)obj_count == c->tex_index_count && c->tex_indices &&
+            centre[0] == c->center[0] && centre[1] == c->center[1] &&
+            centre[2] == c->center[2] &&
+            (long)off + 0x0C90 + (long)obj_count * 0x90 <= size) {
+            uint16_t *ids = (uint16_t *)malloc((size_t)obj_count * sizeof(uint16_t));
+            if (!ids) { failed = 1; break; }
+            for (uint32_t i = 0; i < obj_count; i++) ids[i] = 0xFFFF;
+
+            const uint8_t *heads = sec + SECMAT_RECORDS + SECMAT_HEADS;
+            const uint8_t *desc  = sec + 0x0C90;
+            int assigned = 0;
+            for (int slot = 0; slot < SECMAT_SLOTS && !failed; slot++) {
+                uint16_t id;
+                memcpy(&id, sec + SECMAT_TABLE + slot * 2, 2);
+                int o = (int8_t)heads[slot];
+                for (int guard = 0; o >= 0 && guard <= (int)obj_count; guard++) {
+                    if (o >= (int)obj_count || ids[o] != 0xFFFF) { failed = 1; break; }
+                    ids[o] = id;
+                    assigned++;
+                    o = (int8_t)desc[(uint32_t)o * 0x90 + SECMAT_DESC_NEXT];
+                }
+            }
+            if (failed || assigned != (int)obj_count) { free(ids); failed = 1; break; }
+            out[ci] = ids;
+            ci++;
+        }
+
+        off += sec_size;
+    }
+
+    if (failed || ci != g_track_data.chunk_count) {
+        fprintf(stderr, "[TRACK] material remap abandoned (%d of %d sections "
+                        "matched) — per-object textures left as loaded\n",
+                ci, g_track_data.chunk_count);
+        for (int i = 0; i < g_track_data.chunk_count; i++) free(out[i]);
+        free(out);
+        free(data);
+        return -1;
+    }
+
+    for (int i = 0; i < g_track_data.chunk_count; i++) {
+        memcpy(g_track_data.chunks[i].tex_indices, out[i],
+               (size_t)g_track_data.chunks[i].tex_index_count * sizeof(uint16_t));
+        free(out[i]);
+    }
+    free(out);
+    free(data);
+    return 0;
+}
+
 int rw_load_track(const char *path)
 {
     /* Store track directory for file loading (strip filename from path) */
@@ -1317,6 +1521,11 @@ int rw_load_track(const char *path)
 
     if (track_load(path, &g_track_data) != 0)
         return -1;
+    if (!getenv("B3_NO_MATCHAIN"))
+        track_remap_materials(path);
+    g_track_authored_spawn[0] = g_track_data.spawn[0];
+    g_track_authored_spawn[1] = g_track_data.spawn[1];
+    g_track_authored_spawn[2] = g_track_data.spawn[2];
 
     /* Load textures from static.dat in the same directory */
     {
@@ -1369,8 +1578,12 @@ int rw_load_track(const char *path)
             /* Vertex color = baked AO/shadow modulated by directional light.
              * When textured, this provides shadow/lighting; texture provides color. */
             {
+                /* Baked vertex shade. The track ships these around 0x40,
+                 * not 0x80 — treating 128 as neutral multiplied the whole
+                 * world down to ~40% and made every surface read as murky
+                 * grey. 0x40 is the neutral value here. */
                 uint8_t ao_val = (uint8_t)((tv->color >> 16) & 0xFF);
-                float ao = ao_val / 128.0f;
+                float ao = ao_val / 64.0f;
                 if (ao > 1.0f) ao = 1.0f;
                 float sun_dot = bgv[j].nx * 0.3f + bgv[j].ny * 0.8f + bgv[j].nz * 0.2f;
                 if (sun_dot < 0.0f) sun_dot = 0.0f;
@@ -1385,20 +1598,30 @@ int rw_load_track(const char *path)
         }
 
         /* Create one mesh per object (each has its own strip range and texture) */
+        IDirect3DVertexBuffer8 *chunk_vb = NULL;   /* shared by this section */
         int num_objects = chunk->strip_break_count;
         if (num_objects <= 0) num_objects = 1;
 
         for (int si = 0; si < num_objects && created < MAX_TRACK_CHUNKS; si++) {
             uint32_t strip_start, strip_end;
-            if (chunk->strip_breaks && chunk->strip_break_count > 0) {
+            if (chunk->strip_breaks && chunk->strip_lens &&
+                chunk->strip_break_count > 0) {
+                /* Exact run from the object descriptor. The runs are not
+                 * contiguous, so the end must come from the length, not from
+                 * the next run's start. */
                 strip_start = chunk->strip_breaks[si];
-                strip_end = chunk->strip_breaks[si + 1];
+                strip_end = strip_start + chunk->strip_lens[si];
             } else {
                 strip_start = 0;
                 strip_end = chunk->index_count;
             }
             if (strip_end > chunk->index_count) strip_end = chunk->index_count;
-            if (strip_end - strip_start < 3) continue;
+            if (strip_start >= strip_end || strip_end - strip_start < 3) continue;
+
+            /* Only triangle strips are geometry. The handful of line-list
+             * objects (28 of 3076 in US/C1_V1) would come out as garbage
+             * triangles if fed through the strip walker. */
+            if (chunk->strip_prims && chunk->strip_prims[si] != 6) continue;
 
             /* Convert triangle strip to triangle list */
             uint32_t max_tris = (strip_end - strip_start) * 3;
@@ -1406,27 +1629,39 @@ int rw_load_track(const char *path)
             if (!idxs) continue;
             uint32_t idx_count = 0;
 
+            static int tri_list = -1;
+            if (tri_list < 0) tri_list = getenv("B3_TRILIST") ? 1 : 0;
+
             uint32_t winding = 0;
-            for (uint32_t t = strip_start; t + 2 < strip_end; t++) {
+            uint32_t step = tri_list ? 3u : 1u;
+            for (uint32_t t = strip_start; t + 2 < strip_end; t += step) {
                 uint16_t i0 = chunk->indices[t];
                 uint16_t i1 = chunk->indices[t + 1];
                 uint16_t i2 = chunk->indices[t + 2];
 
-                if (i0 == i1 || i0 == i2 || i1 == i2) { winding = 0; continue; }
-                if (i0 >= vc || i1 >= vc || i2 >= vc) continue;
+                /* Index 0 is a real vertex reference, not a separator.
+                 * Across US/C1_V1 it occurs 169 times and every one of them
+                 * is inside object 0, which is simply the object that owns
+                 * vertex 0; no other object ever references it. It looked
+                 * like a separator only because the old strip starts were
+                 * wrong, so strips ran into each other and produced huge
+                 * triangles at the joins.
+                 *
+                 * Each object is now exactly one strip, so the only thing
+                 * to drop is genuine degenerates — and those are load
+                 * bearing: 51% of the triangles are degenerate, which is
+                 * the signature of individual quads welded into one strip
+                 * (4 vertices + 2 degenerate joins per quad). */
+                if (i0 == i1 || i0 == i2 || i1 == i2) { winding++; continue; }
+                if (i0 >= vc || i1 >= vc || i2 >= vc) { winding++; continue; }
 
-                /* Edge-length filter: skip giant bridging triangles */
-                {
-                    float e1x = bgv[i1].x - bgv[i0].x, e1y = bgv[i1].y - bgv[i0].y, e1z = bgv[i1].z - bgv[i0].z;
-                    float e2x = bgv[i2].x - bgv[i0].x, e2y = bgv[i2].y - bgv[i0].y, e2z = bgv[i2].z - bgv[i0].z;
-                    float e3x = bgv[i2].x - bgv[i1].x, e3y = bgv[i2].y - bgv[i1].y, e3z = bgv[i2].z - bgv[i1].z;
-                    float d1 = e1x*e1x + e1y*e1y + e1z*e1z;
-                    float d2 = e2x*e2x + e2y*e2y + e2z*e2z;
-                    float d3 = e3x*e3x + e3y*e3y + e3z*e3z;
-                    float max_d2 = d1 > d2 ? d1 : d2;
-                    if (d3 > max_d2) max_d2 = d3;
-                    if (max_d2 > 40.0f * 40.0f) { winding++; continue; }
-                }
+                /* No shape or size filtering. The sliver/oversize filters
+                 * that used to live here existed only to hide triangles
+                 * that bridged between mis-cut strips; with the real per
+                 * object runs there is nothing to bridge, and every filter
+                 * cost real geometry (large ground, water and plaza polys
+                 * are single huge triangles). B3_SLIVER_K is gone with
+                 * them. */
 
                 if (winding & 1) {
                     idxs[idx_count++] = i0;
@@ -1442,18 +1677,28 @@ int rw_load_track(const char *path)
 
             if (idx_count < 3) { free(idxs); continue; }
 
-            /* Look up texture for this object */
+            /* Look up the texture for this object.
+             *
+             * The per-object id is a MATERIAL index, not a texture index —
+             * the retail draw loop (sub_001AD050 at 0x001AD0B0) reads it as
+             * static_dat[+0x08] + id*0x28 and the bind reads that material's
+             * own texture list. Using the id as a direct index into the
+             * texture array put the Chgo_Flag animation frames on the road
+             * and the building faces, because material 21 owns 10 of them
+             * and every id past it was off by nine. */
             IDirect3DTexture8 *tex = NULL;
             if (chunk->tex_indices && si < chunk->tex_index_count) {
-                uint16_t tex_idx = chunk->tex_indices[si];
-                if (tex_idx < (uint16_t)g_static_textures.count) {
-                    tex = g_static_textures.entries[tex_idx].texture;
-                }
+                tex = static_tex_for_material(&g_static_textures,
+                                              chunk->tex_indices[si]);
             }
 
-            /* Create GPU mesh - shares the chunk's vertex buffer, own index buffer */
-            RW_Mesh *mesh = rw_mesh_create_procedural(bgv, vc, idxs, idx_count);
+            /* One vertex buffer per section, one index buffer per object.
+             * The first object uploads the section's vertices; the rest
+             * reference that upload. */
+            RW_Mesh *mesh = rw_mesh_create_shared(bgv, vc, idxs, idx_count,
+                                                  chunk_vb);
             if (mesh) {
+                if (!chunk_vb) chunk_vb = mesh->vb;
                 mesh->texture = tex;
                 g_track_meshes[created] = mesh;
                 g_track_bgv_verts[created] = bgv;
@@ -1473,38 +1718,364 @@ int rw_load_track(const char *path)
     g_track_mesh_count = created;
     g_track_loaded = (created > 0) ? 1 : 0;
 
+    /* Say plainly whether the track got its textures. Untextured meshes
+     * fall back to the 1x1 white default, so "white buildings, white car"
+     * is this number being zero — a texture *assignment* failure, which
+     * looks identical on screen to a rendering failure and is not. */
+    {
+        int textured = 0;
+        for (int m = 0; m < created; m++)
+            if (g_track_meshes[m] && g_track_meshes[m]->texture) textured++;
+        fprintf(stderr, "[TRACK] %d of %d meshes textured (%d static.dat "
+                        "textures, %d materials)\n",
+                textured, created, g_static_textures.count,
+                g_static_textures.mat_count);
+    }
+
+    /* B3_ROADTEX=1 names the textures actually bound to the biggest
+     * drivable surfaces. "The road has the wrong texture" is otherwise
+     * only diagnosable by eye, and the material indirection means the id
+     * in the geometry is not the texture number. */
+    if (getenv("B3_ROADTEX")) {
+        typedef struct { double area; int mat; int chunk, obj; } Cand;
+        Cand top[12];
+        int ntop = 0;
+        for (int i = 0; i < g_track_data.chunk_count; i++) {
+            TrackChunk *c = &g_track_data.chunks[i];
+            if (!c->strip_breaks || !c->tex_indices) continue;
+            for (int o = 0; o < c->strip_break_count; o++) {
+                if (c->strip_prims && c->strip_prims[o] != 6) continue;
+                const uint32_t s = c->strip_breaks[o], n = c->strip_lens[o];
+                if (s + n > c->index_count || n < 3) continue;
+                double area = 0.0; int up = 0, tris = 0;
+                for (uint32_t t = 0; t + 2 < n; t++) {
+                    uint16_t a = c->indices[s+t], b = c->indices[s+t+1], d2 = c->indices[s+t+2];
+                    if (a == b || b == d2 || a == d2) continue;
+                    if (a >= c->vertex_count || b >= c->vertex_count ||
+                        d2 >= c->vertex_count) continue;
+                    const TrackVertex *va = &c->vertices[a], *vb = &c->vertices[b],
+                                      *vc = &c->vertices[d2];
+                    const float e0x = vb->x-va->x, e0y = vb->y-va->y, e0z = vb->z-va->z;
+                    const float e1x = vc->x-va->x, e1y = vc->y-va->y, e1z = vc->z-va->z;
+                    const float nx = e0y*e1z - e0z*e1y;
+                    const float ny = e0z*e1x - e0x*e1z;
+                    const float nz = e0x*e1y - e0y*e1x;
+                    const double m = sqrt((double)nx*nx + (double)ny*ny + (double)nz*nz);
+                    if (m < 1e-9) continue;
+                    area += m * 0.5;
+                    if (fabs(ny) / m > 0.85) up++;
+                    tris++;
+                }
+                if (!tris || up * 2 < tris) continue;   /* not a floor */
+                Cand cd = { area, c->tex_indices[o], i, o };
+                int at = ntop;
+                while (at > 0 && top[at-1].area < cd.area) { if (at < 12) top[at] = top[at-1]; at--; }
+                if (at < 12) { top[at] = cd; if (ntop < 12) ntop++; }
+            }
+        }
+        fprintf(stderr, "[ROADTEX] biggest drivable surfaces and their textures:\n");
+        for (int k = 0; k < ntop; k++) {
+            const int mat = top[k].mat;
+            const int ti = (mat >= 0 && mat < g_static_textures.mat_count)
+                         ? g_static_textures.mat_tex[mat] : -1;
+            if (ti >= 0 && ti < g_static_textures.count) {
+                const StaticTexEntry *e = &g_static_textures.entries[ti];
+                fprintf(stderr, "  area %10.0f  material %3d -> tex %3d \"%s\" "
+                                "%ux%u fmt 0x%02X %s\n",
+                        top[k].area, mat, ti, e->name, e->width, e->height,
+                        e->xbox_fmt, e->texture ? "" : "<-- UPLOAD FAILED");
+            } else {
+                fprintf(stderr, "  area %10.0f  material %3d -> (no texture)\n",
+                        top[k].area, mat);
+            }
+        }
+    }
+
+    /* B3_TEXWHERE=<texture name> reports every surface that texture is
+     * bound to: where it is, how big, and how horizontal. A wall texture
+     * on a large flat floor is a material-mapping error; the same texture
+     * on small steep surfaces is just an awning doing its job. */
+    /* B3_TEXAT="x,z" names the textures on whatever covers that spot —
+     * the inverse query, for "what is that surface I am looking at". */
+    if (getenv("B3_TEXAT")) {
+        float qx = 0, qz = 0;
+        sscanf(getenv("B3_TEXAT"), "%f,%f", &qx, &qz);
+        fprintf(stderr, "[TEXAT] surfaces covering (%.0f, %.0f):\n", qx, qz);
+        for (int i = 0; i < g_track_data.chunk_count; i++) {
+            TrackChunk *c = &g_track_data.chunks[i];
+            if (!c->strip_breaks || !c->tex_indices) continue;
+            for (int o = 0; o < c->strip_break_count; o++) {
+                const uint32_t st = c->strip_breaks[o], n = c->strip_lens[o];
+                if (st + n > c->index_count || n < 3) continue;
+                float lo[3] = {1e30f,1e30f,1e30f}, hi[3] = {-1e30f,-1e30f,-1e30f};
+                for (uint32_t t = 0; t < n; t++) {
+                    uint16_t vi = c->indices[st+t];
+                    if (vi >= c->vertex_count) continue;
+                    const TrackVertex *v = &c->vertices[vi];
+                    const float pp[3] = {v->x, v->y, v->z};
+                    for (int ax = 0; ax < 3; ax++) {
+                        if (pp[ax] < lo[ax]) lo[ax] = pp[ax];
+                        if (pp[ax] > hi[ax]) hi[ax] = pp[ax];
+                    }
+                }
+                if (qx < lo[0] || qx > hi[0] || qz < lo[2] || qz > hi[2]) continue;
+                const int mat = c->tex_indices[o];
+                const int ti = (mat >= 0 && mat < g_static_textures.mat_count)
+                             ? g_static_textures.mat_tex[mat] : -1;
+                fprintf(stderr, "  y %6.1f..%-6.1f  mat %3d -> \"%s\"\n",
+                        lo[1], hi[1], mat,
+                        (ti >= 0 && ti < g_static_textures.count)
+                            ? g_static_textures.entries[ti].name : "(none)");
+            }
+        }
+    }
+
+    if (getenv("B3_TEXWHERE")) {
+        const char *want = getenv("B3_TEXWHERE");
+        fprintf(stderr, "[TEXWHERE] surfaces using \"%s\":\n", want);
+        int shown = 0;
+        for (int i = 0; i < g_track_data.chunk_count && shown < 20; i++) {
+            TrackChunk *c = &g_track_data.chunks[i];
+            if (!c->strip_breaks || !c->tex_indices) continue;
+            for (int o = 0; o < c->strip_break_count && shown < 20; o++) {
+                const int mat = c->tex_indices[o];
+                const int ti = (mat >= 0 && mat < g_static_textures.mat_count)
+                             ? g_static_textures.mat_tex[mat] : -1;
+                if (ti < 0 || ti >= g_static_textures.count) continue;
+                if (strcmp(g_static_textures.entries[ti].name, want) != 0) continue;
+                const uint32_t s = c->strip_breaks[o], n = c->strip_lens[o];
+                if (s + n > c->index_count || n < 3) continue;
+                double area = 0.0, upness = 0.0;
+                float lo[3] = {1e30f,1e30f,1e30f}, hi[3] = {-1e30f,-1e30f,-1e30f};
+                int tris = 0;
+                for (uint32_t t = 0; t + 2 < n; t++) {
+                    uint16_t a = c->indices[s+t], b = c->indices[s+t+1], e = c->indices[s+t+2];
+                    if (a == b || b == e || a == e) continue;
+                    if (a >= c->vertex_count || b >= c->vertex_count || e >= c->vertex_count) continue;
+                    const TrackVertex *va=&c->vertices[a], *vb=&c->vertices[b], *vc=&c->vertices[e];
+                    const float e0x=vb->x-va->x, e0y=vb->y-va->y, e0z=vb->z-va->z;
+                    const float e1x=vc->x-va->x, e1y=vc->y-va->y, e1z=vc->z-va->z;
+                    const float nx=e0y*e1z-e0z*e1y, ny=e0z*e1x-e0x*e1z, nz=e0x*e1y-e0y*e1x;
+                    const double m = sqrt((double)nx*nx+(double)ny*ny+(double)nz*nz);
+                    if (m < 1e-9) continue;
+                    area += m*0.5; upness += fabs(ny)/m; tris++;
+                    const TrackVertex *vv[3] = {va, vb, vc};
+                    for (int q = 0; q < 3; q++) {
+                        const float pp[3] = {vv[q]->x, vv[q]->y, vv[q]->z};
+                        for (int ax = 0; ax < 3; ax++) {
+                            if (pp[ax] < lo[ax]) lo[ax] = pp[ax];
+                            if (pp[ax] > hi[ax]) hi[ax] = pp[ax];
+                        }
+                    }
+                }
+                if (!tris) continue;
+                fprintf(stderr, "  area %8.0f  |ny| %.2f  centre (%.0f,%.0f,%.0f) "
+                                "y span %.1f  %s\n",
+                        area, upness/tris,
+                        (lo[0]+hi[0])*0.5f, (lo[1]+hi[1])*0.5f, (lo[2]+hi[2])*0.5f,
+                        hi[1]-lo[1],
+                        (upness/tris > 0.85 && area > 2000.0) ? "<-- large FLAT surface" : "");
+                shown++;
+            }
+        }
+        if (!shown) fprintf(stderr, "  (no surface uses it)\n");
+    }
+
+    if (getenv("B3_TEXIDX_SCAN")) {
+        /* Do the per-object ids stay inside the material array, and what do
+         * they name? */
+        int lo = 1 << 30, hi = -1, n = 0, over = 0, unres = 0;
+        for (int i = 0; i < g_track_data.chunk_count; i++) {
+            TrackChunk *c = &g_track_data.chunks[i];
+            for (int t = 0; t < c->tex_index_count; t++) {
+                int v = c->tex_indices[t];
+                if (v < lo) lo = v;
+                if (v > hi) hi = v;
+                if (v >= g_static_textures.mat_count) over++;
+                else if (g_static_textures.mat_tex[v] < 0) unres++;
+                n++;
+            }
+        }
+        fprintf(stderr, "[TEXIDX] %d ids, range %d..%d, %d >= matcount %d, "
+                        "%d untextured\n",
+                n, lo, hi, over, g_static_textures.mat_count, unres);
+        for (int i = 0; i < 3 && i < g_track_data.chunk_count; i++) {
+            TrackChunk *c = &g_track_data.chunks[i];
+            fprintf(stderr, "[TEXIDX] chunk %d objs=%d:", i, c->tex_index_count);
+            for (int t = 0; t < c->tex_index_count && t < 12; t++) {
+                int v = c->tex_indices[t];
+                int x = (v < g_static_textures.mat_count)
+                      ? g_static_textures.mat_tex[v] : -1;
+                fprintf(stderr, " %u=%s", (unsigned)v,
+                        (x >= 0) ? g_static_textures.entries[x].name : "-");
+            }
+            fprintf(stderr, "\n");
+        }
+    }
+
     if (g_track_loaded) {
         fprintf(stderr, "[TRACK] Created %d GPU meshes for track\n", created);
+
+        /* Water sits just below the lowest road surface in the track. Use
+         * the 2nd-percentile road height rather than the outright minimum,
+         * so one stray vertex under the map cannot sink the whole harbour. */
+        {
+            float lows[64];
+            int nl = 0;
+            for (int i = 0; i < g_track_data.chunk_count; i++) {
+                TrackChunk *c = &g_track_data.chunks[i];
+                float lo = 1e30f;
+                for (uint32_t v = 0; v < c->vertex_count; v += 8) {
+                    int rn = (int)((c->vertices[v].packed_normal >> 11) & 0x7FF);
+                    if (rn & 0x400) rn -= 0x800;
+                    if (rn < 512) continue;              /* road-facing only */
+                    if (c->vertices[v].y < lo) lo = c->vertices[v].y;
+                }
+                if (lo < 1e29f && nl < 64) lows[nl++] = lo;
+            }
+            if (nl > 0) {
+                for (int a = 1; a < nl; a++) {           /* insertion sort */
+                    float k = lows[a];
+                    int b = a - 1;
+                    while (b >= 0 && lows[b] > k) { lows[b + 1] = lows[b]; b--; }
+                    lows[b + 1] = k;
+                }
+                g_track_water_y = lows[nl / 50] - 3.0f;
+                g_track_has_water = 1;
+                fprintf(stderr, "[TRACK] Water surface at Y=%.1f\n", g_track_water_y);
+            }
+        }
+        {   /* Do vertices stay near their own chunk? A decode error in the
+             * vertex block shows up as a small fraction landing far away,
+             * which is what stretches triangles into spikes. */
+            long far_v = 0, tot_v = 0;
+            double worst = 0.0;
+            for (int i = 0; i < g_track_data.chunk_count; i++) {
+                TrackChunk *c = &g_track_data.chunks[i];
+                for (uint32_t v = 0; v < c->vertex_count; v++) {
+                    float dx = c->vertices[v].x - c->center[0];
+                    float dy = c->vertices[v].y - c->center[1];
+                    float dz = c->vertices[v].z - c->center[2];
+                    double d = sqrt((double)(dx*dx + dy*dy + dz*dz));
+                    tot_v++;
+                    if (d > 500.0) far_v++;
+                    if (d > worst) worst = d;
+                }
+            }
+            fprintf(stderr, "[VERTSPREAD] %ld/%ld verts >500u from chunk centre "
+                    "(%.2f%%), worst %.0fu\n",
+                    far_v, tot_v, tot_v ? 100.0 * far_v / tot_v : 0.0, worst);
+        }
         /* Increase far plane for large track geometry */
         g_scene.camera.zfar = 5000.0f;
         g_scene.camera.znear = 1.0f;
 
-        /* Set spawn position from road spine. Use waypoint ~20% along the
-         * road to avoid the first few sections which may be decorative/overhead.
-         * Pick a waypoint with upward-facing road geometry nearby. */
-        if (g_track_data.spine_count > 5) {
-            int sp = g_track_data.spine_count / 5;  /* ~20% along road */
-            g_track_spawn_x = g_track_data.spine[sp].x;
-            g_track_spawn_z = g_track_data.spine[sp].z;
-            g_track_spawn_hdg = atan2f(g_track_data.spine[sp].dx, g_track_data.spine[sp].dz);
-            fprintf(stderr, "  [TRACK] Spawn: spine[%d/%d] pos=(%.1f, %.1f) hdg=%.1f°\n",
-                    sp, g_track_data.spine_count,
-                    g_track_spawn_x, g_track_spawn_z,
-                    g_track_spawn_hdg * 57.2958f);
-        } else if (g_track_data.spine_count > 0) {
-            g_track_spawn_x = g_track_data.spine[0].x;
-            g_track_spawn_z = g_track_data.spine[0].z;
-            g_track_spawn_hdg = atan2f(g_track_data.spine[0].dx, g_track_data.spine[0].dz);
-        } else {
-            g_track_spawn_x = g_track_data.spawn[0];
-            g_track_spawn_z = g_track_data.spawn[2];
+        /* Pick the spawn by measuring actual road density around each
+         * candidate. Spine waypoints can land in empty space (US C1_V1's
+         * 20% waypoint had 67 vertices within 150 units — the authored
+         * spawn had 5671), so trust geometry, not any single source. */
+        {
+            float cx[6], cz[6], chdg[6];
+            int ncand = 0;
+            cx[ncand] = g_track_data.spawn[0];
+            cz[ncand] = g_track_data.spawn[2];
+            chdg[ncand] = 0.0f;  /* refined from nearest spine below */
+            ncand++;
+            const int fractions[] = { 5, 5*2, 5*3, 5*4 };  /* 20..80% */
+            for (unsigned f = 0; f < 4 && g_track_data.spine_count > 5; f++) {
+                int sp = (int)((long)g_track_data.spine_count * (f + 1) / 5);
+                if (sp >= g_track_data.spine_count) sp = g_track_data.spine_count - 1;
+                cx[ncand] = g_track_data.spine[sp].x;
+                cz[ncand] = g_track_data.spine[sp].z;
+                chdg[ncand] = atan2f(g_track_data.spine[sp].dx,
+                                     g_track_data.spine[sp].dz);
+                ncand++;
+            }
+            (void)fractions;
+
+            /* Score = road underfoot MINUS clutter overhead.
+             *
+             * Ranking purely by road-vertex density picked the busiest
+             * geometry on the map — junctions under stacked overpasses —
+             * so the race opened inside a dark enclosed canyon even though
+             * the same track looks fine a few seconds down the road.
+             * Subtracting geometry above the spawn favours open street. */
+            int best = 0;
+            float best_score = -1e30f;
+            for (int ci = 0; ci < ncand; ci++) {
+                int road = 0, overhead = 0;
+                float ground = 1e30f;
+                for (int i = 0; i < g_track_data.chunk_count; i++) {
+                    TrackChunk *chunk = &g_track_data.chunks[i];
+                    float ccx = chunk->center[0] - cx[ci];
+                    float ccz = chunk->center[2] - cz[ci];
+                    if (ccx*ccx + ccz*ccz > 500.0f*500.0f) continue;
+                    for (uint32_t v = 0; v < chunk->vertex_count; v += 4) {
+                        float dx = chunk->vertices[v].x - cx[ci];
+                        float dz = chunk->vertices[v].z - cz[ci];
+                        if (dx*dx + dz*dz > 150.0f*150.0f) continue;
+                        int raw_ny = (int)((chunk->vertices[v].packed_normal >> 11) & 0x7FF);
+                        if (raw_ny & 0x400) raw_ny -= 0x800;
+                        if (raw_ny / 1023.0f >= 0.5f) {
+                            road++;
+                            if (chunk->vertices[v].y < ground)
+                                ground = chunk->vertices[v].y;
+                        }
+                    }
+                }
+                /* Second pass: anything sitting well above the road here. */
+                if (ground < 1e29f) {
+                    for (int i = 0; i < g_track_data.chunk_count; i++) {
+                        TrackChunk *chunk = &g_track_data.chunks[i];
+                        float ccx = chunk->center[0] - cx[ci];
+                        float ccz = chunk->center[2] - cz[ci];
+                        if (ccx*ccx + ccz*ccz > 500.0f*500.0f) continue;
+                        for (uint32_t v = 0; v < chunk->vertex_count; v += 4) {
+                            float dx = chunk->vertices[v].x - cx[ci];
+                            float dz = chunk->vertices[v].z - cz[ci];
+                            if (dx*dx + dz*dz > 60.0f*60.0f) continue;
+                            if (chunk->vertices[v].y > ground + 12.0f) overhead++;
+                        }
+                    }
+                }
+                float score = (float)road - 2.0f * (float)overhead;
+                fprintf(stderr, "  [TRACK] spawn cand %d (%.0f,%.0f): road=%d "
+                        "overhead=%d score=%.0f\n",
+                        ci, cx[ci], cz[ci], road, overhead, score);
+                if (score > best_score) { best_score = score; best = ci; }
+            }
+            int best_n = (int)best_score;
+
+            g_track_spawn_x = cx[best];
+            g_track_spawn_z = cz[best];
+            g_track_spawn_hdg = chdg[best];
+
+            /* Authored spawn has no direction — face the nearest spine
+             * waypoint's direction so the car starts along the road. */
+            if (best == 0 && g_track_data.spine_count > 0) {
+                float nd2 = 1e30f; int ni = 0;
+                for (int i = 0; i < g_track_data.spine_count; i++) {
+                    float dx = g_track_data.spine[i].x - g_track_spawn_x;
+                    float dz = g_track_data.spine[i].z - g_track_spawn_z;
+                    if (dx*dx + dz*dz < nd2) { nd2 = dx*dx + dz*dz; ni = i; }
+                }
+                g_track_spawn_hdg = atan2f(g_track_data.spine[ni].dx,
+                                           g_track_data.spine[ni].dz);
+            }
+            fprintf(stderr, "  [TRACK] Spawn: candidate %d pos=(%.1f, %.1f) "
+                    "hdg=%.1f° (%d road verts nearby)\n",
+                    best, g_track_spawn_x, g_track_spawn_z,
+                    g_track_spawn_hdg * 57.2958f, best_n);
         }
         g_track_mode = 1;
 
-        /* Find actual road surface Y at spawn XZ by scanning upward-facing vertices */
+        /* Find actual road surface Y at spawn XZ by scanning upward-facing
+         * vertices. Scan at the CHOSEN spawn (usually a spine waypoint) —
+         * scanning g_track_data.spawn here paired a Y from one part of the
+         * track with an X/Z from another, dropping the car underground. */
         {
-            float sx = g_track_data.spawn[0];
-            float sz = g_track_data.spawn[2];
+            float sx = g_track_spawn_x;
+            float sz = g_track_spawn_z;
             float road_y = g_track_data.spawn[1]; /* fallback */
             float best_d2 = 1e30f;
             for (int i = 0; i < g_track_data.chunk_count; i++) {
@@ -1667,6 +2238,168 @@ void rw_gameplay_register_models(const BGV_Model *player_model,
     fprintf(stderr, "  [RW3D] Registered %d traffic meshes\n", g_traffic_mesh_count);
 }
 
+/* ── Traffic ─────────────────────────────────────────────────────
+ * Simple ambient traffic for drive mode: cars placed on the road near
+ * the player, greedily steering to stay over road-surface vertices
+ * (there is no usable path network — the "spine" is not world-space).
+ * Same-direction and oncoming cars; respawn when lost or left behind. */
+
+#define RW_TRAFFIC_N 5
+
+typedef struct {
+    float x, z, y;
+    float hdg, spd;
+    int   mesh;       /* index into g_traffic_meshes */
+    int   alive;
+} RWTraffic;
+
+static RWTraffic g_traffic[RW_TRAFFIC_N];
+
+/* Ground height near a point: Y of the nearest upward-facing vertex
+ * within range, or `fallback` when nothing is close enough. */
+static float rw_ground_y_at(float x, float z, float fallback)
+{
+    float best_d2 = 1e30f, y = fallback;
+    for (int i = 0; i < g_track_data.chunk_count; i++) {
+        TrackChunk *chunk = &g_track_data.chunks[i];
+        float cdx = chunk->center[0] - x;
+        float cdz = chunk->center[2] - z;
+        if (cdx*cdx + cdz*cdz > 400.0f*400.0f) continue;
+        for (uint32_t v = 0; v < chunk->vertex_count; v += 2) {
+            int raw_ny = (int)((chunk->vertices[v].packed_normal >> 11) & 0x7FF);
+            if (raw_ny & 0x400) raw_ny -= 0x800;
+            if (raw_ny < 512) continue;
+            float dx = chunk->vertices[v].x - x;
+            float dz = chunk->vertices[v].z - z;
+            float d2 = dx*dx + dz*dz;
+            if (d2 < best_d2) { best_d2 = d2; y = chunk->vertices[v].y; }
+        }
+    }
+    return best_d2 < 60.0f * 60.0f ? y : fallback;
+}
+
+/* Squared XZ distance to the nearest road-surface vertex. */
+static float rw_road_dist2(float x, float z)
+{
+    float best = 1e30f;
+    for (int i = 0; i < g_track_data.chunk_count && best > 4.0f; i++) {
+        TrackChunk *chunk = &g_track_data.chunks[i];
+        float cdx = chunk->center[0] - x;
+        float cdz = chunk->center[2] - z;
+        if (cdx*cdx + cdz*cdz > 400.0f*400.0f) continue;
+        for (uint32_t v = 0; v < chunk->vertex_count; v += 2) {
+            int raw_ny = (int)((chunk->vertices[v].packed_normal >> 11) & 0x7FF);
+            if (raw_ny & 0x400) raw_ny -= 0x800;
+            if (raw_ny < 512) continue;
+            float dx = chunk->vertices[v].x - x;
+            float dz = chunk->vertices[v].z - z;
+            float d2 = dx*dx + dz*dz;
+            if (d2 < best) best = d2;
+            if (best <= 4.0f) break;
+        }
+    }
+    return best;
+}
+
+static void rw_traffic_spawn(RWTraffic *t, const float car[3],
+                             float player_hdg, int idx)
+{
+    int oncoming = (idx >= 3);
+    float dist = 70.0f + (float)idx * 45.0f;
+    float side = (idx & 1) ? 4.5f : -4.5f;
+    float fx = sinf(player_hdg), fz = cosf(player_hdg);
+
+    t->x = car[0] + fx * dist + fz * side;
+    t->z = car[2] + fz * dist - fx * side;
+    t->y = car[1];
+    t->hdg = oncoming ? player_hdg + 3.14159265f : player_hdg;
+    t->spd = oncoming ? 13.0f + (float)idx * 2.0f
+                      : 16.0f + (float)idx * 3.0f;
+    t->mesh = g_traffic_mesh_count > 0 ? idx % g_traffic_mesh_count : 0;
+    /* Only come alive on actual road; otherwise retry next respawn check */
+    t->alive = rw_road_dist2(t->x, t->z) < 45.0f * 45.0f;
+}
+
+static void rw_traffic_update_draw(const float car[3], float player_hdg,
+                                   float dt)
+{
+    if (g_traffic_mesh_count == 0 || !g_track_loaded) return;
+
+    static int frames = 0;
+    if (++frames == 300) {
+        int alive = 0;
+        for (int i = 0; i < RW_TRAFFIC_N; i++) alive += g_traffic[i].alive;
+        fprintf(stderr, "[TRAFFIC] %d/%d alive; car0 rel=(%.0f,%.0f)\n",
+                alive, RW_TRAFFIC_N,
+                g_traffic[0].x - car[0], g_traffic[0].z - car[2]);
+    }
+
+    for (int i = 0; i < RW_TRAFFIC_N; i++) {
+        RWTraffic *t = &g_traffic[i];
+
+        float pdx = t->x - car[0], pdz = t->z - car[2];
+        if (!t->alive || pdx*pdx + pdz*pdz > 350.0f * 350.0f) {
+            rw_traffic_spawn(t, car, player_hdg, i);
+            if (!t->alive) continue;
+        }
+
+        /* Greedy road-following: probe ahead at three headings and take
+         * the one that stays closest to road geometry. */
+        float best_h = t->hdg, best_d2 = 1e30f;
+        for (int c = -1; c <= 1; c++) {
+            float h = t->hdg + (float)c * 0.28f;
+            float lookahead = t->spd * 0.8f + 6.0f;
+            float d2 = rw_road_dist2(t->x + sinf(h) * lookahead,
+                                     t->z + cosf(h) * lookahead);
+            if (d2 < best_d2) { best_d2 = d2; best_h = h; }
+        }
+        if (best_d2 > 45.0f * 45.0f) {   /* road ends every way — reset */
+            t->alive = 0;
+            continue;
+        }
+        t->hdg = best_h;
+        t->x += sinf(t->hdg) * t->spd * dt;
+        t->z += cosf(t->hdg) * t->spd * dt;
+        t->y += (car[1] - t->y) * 0.05f;   /* soft level-follow */
+
+        float rot_m[16], trans_m[16], world_m[16];
+        mat4_rotation_y(rot_m, t->hdg);
+        mat4_translation(trans_m, t->x, t->y - 1.0f, t->z);
+        mat4_multiply(world_m, rot_m, trans_m);   /* v * R * T: local rotate, then place */
+        rw_render_mesh(g_traffic_meshes[t->mesh], world_m);
+    }
+}
+
+/* Debug: report geometry distribution near a point (spawn diagnosis). */
+int rw_debug_scan_spawn(float x, float z, float radius)
+{
+    int total = 0, road = 0;
+    float ymin = 1e30f, ymax = -1e30f, road_ymin = 1e30f, road_ymax = -1e30f;
+    for (int i = 0; i < g_track_data.chunk_count; i++) {
+        TrackChunk *chunk = &g_track_data.chunks[i];
+        for (uint32_t v = 0; v < chunk->vertex_count; v++) {
+            float dx = chunk->vertices[v].x - x;
+            float dz = chunk->vertices[v].z - z;
+            if (dx*dx + dz*dz > radius*radius) continue;
+            float y = chunk->vertices[v].y;
+            total++;
+            if (y < ymin) ymin = y;
+            if (y > ymax) ymax = y;
+            int raw_ny = (int)((chunk->vertices[v].packed_normal >> 11) & 0x7FF);
+            if (raw_ny & 0x400) raw_ny -= 0x800;
+            if (raw_ny / 1023.0f >= 0.5f) {
+                road++;
+                if (y < road_ymin) road_ymin = y;
+                if (y > road_ymax) road_ymax = y;
+            }
+        }
+    }
+    fprintf(stderr, "[SCAN] r=%.0f around (%.0f,%.0f): %d verts y=[%.1f..%.1f], "
+            "%d road-facing y=[%.1f..%.1f]\n",
+            radius, x, z, total, ymin, ymax, road, road_ymin, road_ymax);
+    return total;
+}
+
 int rw_is_3d_mode(void)
 {
     return g_3d_mode;
@@ -1754,7 +2487,15 @@ void rw_gameplay_render(void)
             fly_y = g_track_data.center[1] + 200.0f;
             fly_z = g_track_data.center[2];
             fly_pitch = -0.5f;
-            drive_mode = 0;
+            /* Never kick an active race back to fly mode: this fires on the
+             * first frame after a race's track load, and the fly frame that
+             * follows overwrites the physics body with the fly-camera
+             * position — teleporting the car from the start line to a
+             * hover over the track center. */
+            {
+                extern int fe_menu_is_racing(void);
+                if (!fe_menu_is_racing()) drive_mode = 0;
+            }
         }
     }
 
@@ -1767,32 +2508,46 @@ void rw_gameplay_render(void)
         float hdg = RW_MEMF(PHYS_HDG);
         spd = RW_MEMF(PHYS_SPD);
 
+        /* Ground-follow with level continuity: prefer road vertices near
+         * the car's CURRENT height. Snapping to the plain XZ-nearest
+         * vertex teleports the camera to the street below whenever the
+         * car crosses an elevated section (stacked roads are everywhere
+         * on the waterfront track). */
+        static float drive_y = 0.0f;
+        static int drive_y_init = 0;
+        if (!drive_y_init) { drive_y = g_track_spawn_y; drive_y_init = 1; }
+
         car_pos[0] = px;
-        car_pos[1] = g_track_spawn_y;  /* stay at the Y where we dropped */
         car_pos[2] = py;
 
-        /* Update Y from nearby upward-facing vertices */
         if (g_track_loaded) {
-            float best_d2 = 1e30f;
+            float best_d2 = 1e30f, best_y = drive_y;
+            float best_any_d2 = 1e30f, best_any_y = drive_y;
             for (int i = 0; i < g_track_data.chunk_count; i++) {
                 float cdx = g_track_data.chunks[i].center[0] - px;
                 float cdz = g_track_data.chunks[i].center[2] - py;
                 if (cdx*cdx + cdz*cdz > 300.0f*300.0f) continue;
                 TrackChunk *chunk = &g_track_data.chunks[i];
-                for (uint32_t v = 0; v < chunk->vertex_count; v += 4) {
+                for (uint32_t v = 0; v < chunk->vertex_count; v += 2) {
                     int raw_ny = (int)((chunk->vertices[v].packed_normal >> 11) & 0x7FF);
                     if (raw_ny & 0x400) raw_ny -= 0x800;
                     if (raw_ny < 512) continue; /* ny < 0.5 = not road */
                     float vdx = chunk->vertices[v].x - px;
                     float vdz = chunk->vertices[v].z - py;
                     float d2 = vdx*vdx + vdz*vdz;
-                    if (d2 < best_d2) {
-                        best_d2 = d2;
-                        car_pos[1] = chunk->vertices[v].y + 1.0f;
+                    float vy = chunk->vertices[v].y;
+                    if (d2 < best_any_d2) { best_any_d2 = d2; best_any_y = vy; }
+                    if (vy > drive_y - 8.0f && vy < drive_y + 8.0f && d2 < best_d2) {
+                        best_d2 = d2; best_y = vy;
                     }
                 }
             }
+            /* Same-level surface wins; fall back to any surface only when
+             * the current level has nothing within grazing distance. */
+            float target_y = (best_d2 < 60.0f * 60.0f) ? best_y : best_any_y;
+            drive_y += (target_y - drive_y) * 0.2f;   /* smooth ramps */
         }
+        car_pos[1] = drive_y + 1.0f;
 
         cam_hdg = hdg;
 
@@ -1828,16 +2583,105 @@ void rw_gameplay_render(void)
         spd = fly_speed;
     }
 
-    /* Sky */
-    tod_update(car_pos[2]);
+    /* Sky.
+     *
+     * The time-of-day cycle is keyed to world Z over a 3000-unit period,
+     * which made sense when the world was an endless procedural road and
+     * distance was the only clock. On a real track it means driving north
+     * turns it to night and driving back turns it to day — US/C1_V1 spans
+     * z 318..2157, so a single lap crosses more than half the cycle. The
+     * city's lighting is baked into its vertex colours in daylight, so the
+     * result is a daylit city under a midnight sky, which reads as the
+     * graphics having failed rather than as dusk.
+     *
+     * Real tracks therefore get a fixed daylight sky. B3_TOD=<0..1> pins
+     * any phase for a look, and the cycle still runs for the procedural
+     * bring-up world where it belongs. Per-track skies belong in
+     * enviro.dat (184 KB per track, still undecoded). */
+    if (g_track_loaded) {
+        const char *tod = getenv("B3_TOD");
+        tod_update(tod ? (float)atof(tod) * 3000.0f : 0.375f * 3000.0f);
+    } else {
+        tod_update(car_pos[2]);
+    }
     render_sky_gradient(dev);
 
     /* Camera setup */
     if (drive_mode) {
-        /* Chase camera behind car */
-        float chase_dist = 12.0f + spd * 0.03f;
-        float chase_height = 5.0f + spd * 0.01f;
+        /* Chase camera behind car — a bit higher than the original
+         * bring-up values so grazing angles stop smearing the road. */
+        float chase_dist = 13.0f + spd * 0.04f;
+        float chase_height = 6.5f + spd * 0.02f;
+        /* Diagnostic overrides: pull the camera back/up to inspect the
+         * world from a vantage that cannot be inside anything. */
+        { const char *cd = getenv("B3_CAM_DIST"), *ch = getenv("B3_CAM_HEIGHT");
+          if (cd) chase_dist = (float)atof(cd);
+          if (ch) chase_height = (float)atof(ch); }
+        if (getenv("B3_CAM_BIRD")) {
+            /* Map view straight down. up must not be parallel to the view
+             * direction or the basis degenerates, so use +Z as up here. */
+            float alt = (float)atof(getenv("B3_CAM_BIRD"));
+            if (alt < 10.0f) alt = 300.0f;
+            g_scene.camera.position[0] = car_pos[0];
+            g_scene.camera.position[1] = car_pos[1] + alt;
+            g_scene.camera.position[2] = car_pos[2];
+            g_scene.camera.target[0] = car_pos[0];
+            g_scene.camera.target[1] = car_pos[1];
+            g_scene.camera.target[2] = car_pos[2];
+            g_scene.camera.up[0] = 0.0f;
+            g_scene.camera.up[1] = 0.0f;
+            g_scene.camera.up[2] = 1.0f;
+        } else if (getenv("B3_CAM_FIXED")) {
+            /* Fully controlled camera in world axes — isolates the view
+             * matrix from the chase logic. */
+            g_scene.camera.position[0] = car_pos[0];
+            g_scene.camera.position[1] = car_pos[1] + 25.0f;
+            g_scene.camera.position[2] = car_pos[2] - 50.0f;
+            g_scene.camera.target[0] = car_pos[0];
+            g_scene.camera.target[1] = car_pos[1];
+            g_scene.camera.target[2] = car_pos[2];
+            g_scene.camera.up[0] = 0.0f;
+            g_scene.camera.up[1] = 1.0f;
+            g_scene.camera.up[2] = 0.0f;
+        } else
         rw_camera_set_chase(&g_scene.camera, car_pos, cam_hdg, chase_dist, chase_height);
+        /* Terrain rising behind the car (spawn embankments, ramps) puts
+         * the chase position underground — clamp to ground clearance. */
+        if (g_track_loaded) {
+            float gy = rw_ground_y_at(g_scene.camera.position[0],
+                                      g_scene.camera.position[2],
+                                      g_scene.camera.position[1]);
+            if (g_scene.camera.position[1] < gy + 2.0f)
+                g_scene.camera.position[1] = gy + 2.0f;
+        }
+        if (getenv("B3_CAM_SCAN")) {
+            static int cf = 0;
+            if (cf++ % 120 == 0) {
+                float camx = g_scene.camera.position[0];
+                float camy = g_scene.camera.position[1];
+                float camz = g_scene.camera.position[2];
+                int near5 = 0, road5 = 0;
+                for (int i = 0; i < g_track_data.chunk_count; i++) {
+                    TrackChunk *ch = &g_track_data.chunks[i];
+                    float ccx = ch->center[0] - camx, ccz = ch->center[2] - camz;
+                    if (ccx*ccx + ccz*ccz > 400.0f*400.0f) continue;
+                    for (uint32_t v = 0; v < ch->vertex_count; v++) {
+                        float dx = ch->vertices[v].x - camx;
+                        float dy = ch->vertices[v].y - camy;
+                        float dz = ch->vertices[v].z - camz;
+                        if (dx*dx + dy*dy + dz*dz > 25.0f) continue;
+                        near5++;
+                        int rn = (int)((ch->vertices[v].packed_normal >> 11) & 0x7FF);
+                        if (rn & 0x400) rn -= 0x800;
+                        if (rn >= 512) road5++;
+                    }
+                }
+                fprintf(stderr, "[CAM] car=(%.0f,%.0f,%.0f) cam=(%.0f,%.0f,%.0f) "
+                        "groundY=%.1f verts<5u=%d (road %d)\n",
+                        car_pos[0], car_pos[1], car_pos[2], camx, camy, camz,
+                        rw_ground_y_at(camx, camz, -999.0f), near5, road5);
+            }
+        }
         rw_camera_update_matrices(&g_scene.camera);
     } else {
         /* Free-fly camera with pitch */
@@ -1870,6 +2714,10 @@ void rw_gameplay_render(void)
     dev->lpVtbl->SetRenderState(dev, D3DRS_ALPHABLENDENABLE, FALSE);
 
     /* ── Track geometry (replaces procedural road when loaded) ── */
+    /* Water first: it is the backdrop the quaysides sit in. */
+    if (g_track_loaded)
+        render_water(dev, g_scene.camera.position[0], g_scene.camera.position[2]);
+
     if (g_track_loaded && g_track_visible) {
         /* Render all track chunks with identity world matrix
          * (track vertices are already in world space) */
@@ -1892,14 +2740,26 @@ void rw_gameplay_render(void)
         }
 
         /* No ground plane on real tracks — track geometry IS the ground */
-    } else {
-        /* Procedural road + ground + mountains (no track loaded) */
+    } else if (getenv("B3_PROCEDURAL")) {
+        /* Procedural road + ground + mountains — the pre-track-loader
+         * bring-up world. Off by default: drawing it when the real track
+         * failed to load disguises a load failure as a rendering
+         * regression. It looks like an older build of the port, which is
+         * exactly how it gets reported, and it sent this session chasing
+         * texture bugs that were not there. A track that does not load
+         * should look broken, not old. */
         float rc = RW_MEMF(ROAD_CURVE_ADDR);
         render_ground_plane(dev, fly_x, fly_z);
         render_road(dev, fly_x, fly_z);
         render_mountains(dev, fly_x, fly_z);
         render_roadside_objects(dev, fly_x, fly_z, rc);
         render_tunnel(dev, fly_x, fly_z, rc);
+    } else {
+        static int said = 0;
+        if (!said++)
+            fprintf(stderr, "[TRACK] No track resident — drawing nothing. "
+                            "Set B3_PROCEDURAL=1 for the old bring-up "
+                            "scenery.\n");
     }
 
     /* ── Player car (only in drive mode) ── */
@@ -1907,9 +2767,16 @@ void rw_gameplay_render(void)
         float rot_m[16], trans_m[16], world_m[16];
         mat4_rotation_y(rot_m, cam_hdg);
         mat4_translation(trans_m, car_pos[0], car_pos[1], car_pos[2]);
-        mat4_multiply(world_m, trans_m, rot_m);
+        /* Row-vector convention: v * R * T — rotate the model locally,
+         * THEN place it. T*R rotated the placed position around the world
+         * origin, which flung the car offscreen as the heading changed. */
+        mat4_multiply(world_m, rot_m, trans_m);
         rw_render_mesh(g_player_mesh, world_m);
     }
+
+    /* ── Ambient traffic ── */
+    if (drive_mode)
+        rw_traffic_update_draw(car_pos, cam_hdg, 1.0f / 60.0f);
 
     /* ── HUD overlay ── */
     render_3d_hud(dev);

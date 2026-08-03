@@ -3,12 +3,21 @@
  *
  * Parses Criterion's custom TXD format and creates D3D8 textures.
  * See docs/asset-formats.md for full format specification.
+ *
+ * Only the container walk lives here; the pixels go through the shared
+ * NV2A decoder (include/manx_xbox_texture.h). Global.txd and
+ * Frontend.txd between them use three format codes — P8 (0x0B, Morton
+ * swizzled), DXT1 (0x0C) and DXT5 (0x0F) — and unlike a track's
+ * static.dat their DXT5 blocks are in the ordinary alpha-first BC3
+ * order, so no colour-first option is passed here.
  */
 
 #include "txd_loader.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "manx_xbox_texture.h"
 
 /* ── TXD file format constants ──────────────────────────────── */
 
@@ -17,19 +26,8 @@
 #define TXD_TOC_ENTRY_SIZE  16
 #define TXD_TEX_HEADER_SIZE 128  /* 0x80 */
 
-/* Xbox NV2A D3DFORMAT codes used in TXD files */
-#define XBOX_FMT_L8         0x00
-#define XBOX_FMT_A1R5G5B5   0x02
-#define XBOX_FMT_A4R4G4B4   0x04
-#define XBOX_FMT_R5G6B5     0x05
-#define XBOX_FMT_A8R8G8B8   0x06
-#define XBOX_FMT_X8R8G8B8   0x07
-#define XBOX_FMT_P8         0x0B
-#define XBOX_FMT_DXT1       0x0C
-#define XBOX_FMT_DXT3       0x0E
-#define XBOX_FMT_DXT5       0x0F
-#define XBOX_FMT_LIN_A8R8G8B8 0x12
-#define XBOX_FMT_LIN_X8R8G8B8 0x1E
+/* Padding between a paletted texture's index plane and its palette. */
+#define TXD_PALETTE_PAD     64
 
 /* ── Helpers ────────────────────────────────────────────────── */
 
@@ -59,151 +57,31 @@ static uint16_t read_u16(const uint8_t *p)
     return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
 }
 
-/** Map Xbox NV2A format code to D3D8 D3DFORMAT enum. */
-static D3DFORMAT xbox_fmt_to_d3d(uint32_t xbox_fmt)
+/** Locate a paletted texture's palette within its entry.
+ *
+ *  A TXD entry holds w*h index bytes, then normally 64 bytes of padding,
+ *  then BGRA palette entries. Some entries omit the padding and carry a
+ *  compact 16-entry (64-byte) palette instead of a full 256-entry one,
+ *  so try the padded offset first and fall back. Whatever is short the
+ *  decoder leaves transparent black.
+ *
+ *  Returns 0 when there is no palette to be had. */
+static int txd_find_palette(const uint8_t *entry_data, uint32_t data_avail,
+                            uint32_t index_bytes,
+                            const uint8_t **out_palette, size_t *out_size)
 {
-    switch (xbox_fmt) {
-    case XBOX_FMT_DXT1:       return D3DFMT_DXT1;
-    case XBOX_FMT_DXT3:       return D3DFMT_DXT3;
-    case XBOX_FMT_DXT5:       return D3DFMT_DXT5;
-    case XBOX_FMT_A8R8G8B8:   return D3DFMT_A8R8G8B8;
-    case XBOX_FMT_X8R8G8B8:   return D3DFMT_X8R8G8B8;
-    case XBOX_FMT_R5G6B5:     return D3DFMT_R5G6B5;
-    case XBOX_FMT_A1R5G5B5:   return D3DFMT_A1R5G5B5;
-    case XBOX_FMT_A4R4G4B4:   return D3DFMT_A4R4G4B4;
-    case XBOX_FMT_L8:         return D3DFMT_L8;
-    case XBOX_FMT_P8:         return D3DFMT_P8;
-    case XBOX_FMT_LIN_A8R8G8B8: return D3DFMT_LIN_A8R8G8B8;
-    case XBOX_FMT_LIN_X8R8G8B8: return D3DFMT_LIN_X8R8G8B8;
-    default:                   return D3DFMT_UNKNOWN;
-    }
-}
+    uint32_t offset = index_bytes + TXD_PALETTE_PAD;
+    uint32_t avail  = (data_avail > offset) ? data_avail - offset : 0;
 
-/** Calculate texture data size in bytes for a single mip level. */
-static uint32_t calc_texture_size(uint32_t width, uint32_t height, uint32_t xbox_fmt)
-{
-    switch (xbox_fmt) {
-    case XBOX_FMT_DXT1: {
-        uint32_t bw = (width + 3) / 4;
-        uint32_t bh = (height + 3) / 4;
-        return bw * bh * 8;
-    }
-    case XBOX_FMT_DXT3:
-    case XBOX_FMT_DXT5: {
-        uint32_t bw = (width + 3) / 4;
-        uint32_t bh = (height + 3) / 4;
-        return bw * bh * 16;
-    }
-    case XBOX_FMT_A8R8G8B8:
-    case XBOX_FMT_X8R8G8B8:
-    case XBOX_FMT_LIN_A8R8G8B8:
-    case XBOX_FMT_LIN_X8R8G8B8:
-        return width * height * 4;
-    case XBOX_FMT_R5G6B5:
-    case XBOX_FMT_A1R5G5B5:
-    case XBOX_FMT_A4R4G4B4:
-        return width * height * 2;
-    case XBOX_FMT_L8:
-    case XBOX_FMT_P8:
-        return width * height;
-    default:
-        return 0;
-    }
-}
-
-/** Xbox NV2A texture unswizzle.
- *  For square textures, this is pure Morton (Z-order) decoding.
- *  For non-square textures (e.g. 256x64), the NV2A interleaves bits
- *  up to the smaller dimension, then appends the remaining bits of
- *  the larger dimension sequentially. */
-static void nv2a_unswizzle_coords(uint32_t index, uint32_t width, uint32_t height,
-                                   uint32_t *out_x, uint32_t *out_y)
-{
-    /* Count bits needed for each dimension */
-    uint32_t xbits = 0, ybits = 0;
-    { uint32_t w = width;  while (w > 1) { xbits++; w >>= 1; } }
-    { uint32_t h = height; while (h > 1) { ybits++; h >>= 1; } }
-
-    uint32_t xi = 0, yi = 0;
-    uint32_t min_bits = xbits < ybits ? xbits : ybits;
-    uint32_t bit = 0, src_bit = 0;
-
-    /* Interleaved region: alternate x,y bits up to the smaller dimension */
-    for (bit = 0; bit < min_bits; bit++) {
-        xi |= ((index >> src_bit) & 1) << bit; src_bit++;
-        yi |= ((index >> src_bit) & 1) << bit; src_bit++;
+    if (avail < 4) {
+        offset = index_bytes;
+        avail  = (data_avail > offset) ? data_avail - offset : 0;
+        if (avail < 4) return 0;
     }
 
-    /* Remaining bits go to the larger dimension */
-    if (xbits > ybits) {
-        for (; bit < xbits; bit++) {
-            xi |= ((index >> src_bit) & 1) << bit; src_bit++;
-        }
-    } else if (ybits > xbits) {
-        for (; bit < ybits; bit++) {
-            yi |= ((index >> src_bit) & 1) << bit; src_bit++;
-        }
-    }
-
-    *out_x = xi;
-    *out_y = yi;
-}
-
-/** Generic unswizzle for any bytes-per-pixel.
- *  Works for 8-bit, 16-bit, and 32-bit textures. */
-static void unswizzle_generic(const uint8_t *src, uint8_t *dst,
-                               uint32_t width, uint32_t height, uint32_t bpp)
-{
-    uint32_t total = width * height;
-    uint32_t i;
-    for (i = 0; i < total; i++) {
-        uint32_t x, y;
-        nv2a_unswizzle_coords(i, width, height, &x, &y);
-        if (x < width && y < height) {
-            memcpy(dst + (y * width + x) * bpp, src + i * bpp, bpp);
-        }
-    }
-}
-
-/** Convert P8 (palettized) texture to A8R8G8B8.
- *  P8 layout: w*h index bytes, 64 bytes padding, 1024 bytes BGRA palette. */
-static uint8_t *convert_p8_to_argb(const uint8_t *tex_data, uint32_t data_avail,
-                                    uint32_t width, uint32_t height)
-{
-    uint32_t idx_size = width * height;
-    uint32_t palette_offset = idx_size + 64;
-    uint32_t needed = palette_offset + 1024;
-
-    if (data_avail < needed) {
-        fprintf(stderr, "  TXD: P8 data too small (need %u, have %u)\n", needed, data_avail);
-        return NULL;
-    }
-
-    /* Unswizzle index data */
-    uint8_t *unswizzled = (uint8_t *)malloc(idx_size);
-    if (!unswizzled) return NULL;
-    unswizzle_generic(tex_data, unswizzled, width, height, 1);
-
-    /* Palette is 256 BGRA entries */
-    const uint8_t *palette = tex_data + palette_offset;
-
-    /* Convert to A8R8G8B8 */
-    uint8_t *argb = (uint8_t *)malloc(width * height * 4);
-    if (!argb) { free(unswizzled); return NULL; }
-
-    uint32_t i;
-    for (i = 0; i < idx_size; i++) {
-        uint8_t idx = unswizzled[i];
-        const uint8_t *pe = palette + idx * 4;
-        /* Palette is BGRA, D3D8 A8R8G8B8 is also BGRA in memory */
-        argb[i * 4 + 0] = pe[0]; /* B */
-        argb[i * 4 + 1] = pe[1]; /* G */
-        argb[i * 4 + 2] = pe[2]; /* R */
-        argb[i * 4 + 3] = pe[3]; /* A */
-    }
-
-    free(unswizzled);
-    return argb;
+    *out_palette = entry_data + offset;
+    *out_size    = avail > 1024 ? 1024 : avail;
+    return 1;
 }
 
 /* ── Main loader ────────────────────────────────────────────── */
@@ -317,13 +195,16 @@ int txd_load(const char *path, IDirect3DDevice8 *device, TXD_Dict *out_dict)
             continue;
         }
 
-        /* Calculate pixel data size */
-        uint32_t data_size = calc_texture_size(width, height, fmt_code);
-        if (data_size == 0) {
+        manx_xbox_texture_info info;
+        if (!manx_xbox_texture_describe(fmt_code, &info)) {
             fprintf(stderr, "  TXD: [%d] '%s' %ux%u fmt=0x%02X - unsupported format\n",
                     ti, name, width, height, fmt_code);
             continue;
         }
+
+        /* Calculate pixel data size */
+        uint32_t data_size =
+            (uint32_t)manx_xbox_texture_source_bytes(fmt_code, width, height);
 
         /* Determine how much data is available after the header */
         uint32_t data_offset = off + TXD_TEX_HEADER_SIZE;
@@ -340,54 +221,36 @@ int txd_load(const char *path, IDirect3DDevice8 *device, TXD_Dict *out_dict)
             continue;
         }
 
-        /* Map to D3D8 format */
-        D3DFORMAT d3d_fmt = xbox_fmt_to_d3d(fmt_code);
-        const uint8_t *pixel_data = data + data_offset;
-        uint8_t *converted = NULL;  /* for P8 conversion */
-        uint32_t upload_size = data_size;
-
-        /* Handle P8: convert to A8R8G8B8 since D3D11 doesn't support palettized */
-        if (fmt_code == XBOX_FMT_P8) {
-            converted = convert_p8_to_argb(pixel_data, data_avail, width, height);
-            if (!converted) {
-                fprintf(stderr, "  TXD: [%d] '%s' P8 conversion failed\n", ti, name);
-                continue;
-            }
-            pixel_data = converted;
-            d3d_fmt = D3DFMT_A8R8G8B8;
-            upload_size = width * height * 4;
-        }
-
-        /* Unswizzle non-DXT, non-linear, non-P8 textures (Morton/Z-order → linear) */
-        if (!converted && fmt_code != XBOX_FMT_DXT1 && fmt_code != XBOX_FMT_DXT3 &&
-            fmt_code != XBOX_FMT_DXT5 && fmt_code != XBOX_FMT_LIN_A8R8G8B8 &&
-            fmt_code != XBOX_FMT_LIN_X8R8G8B8 && fmt_code != XBOX_FMT_P8) {
-            uint32_t bpp = 0;
-            if (fmt_code == XBOX_FMT_A1R5G5B5 || fmt_code == XBOX_FMT_R5G6B5 ||
-                fmt_code == XBOX_FMT_A4R4G4B4)
-                bpp = 2;
-            else if (fmt_code == XBOX_FMT_A8R8G8B8 || fmt_code == XBOX_FMT_X8R8G8B8)
-                bpp = 4;
-            else if (fmt_code == XBOX_FMT_L8)
-                bpp = 1;
-
-            if (bpp > 0) {
-                converted = (uint8_t *)malloc(upload_size);
-                if (converted) {
-                    unswizzle_generic(pixel_data, converted, width, height, bpp);
-                    pixel_data = converted;
-                }
-            }
-        }
-
-        if (d3d_fmt == D3DFMT_UNKNOWN) {
-            fprintf(stderr, "  TXD: [%d] '%s' %ux%u fmt=0x%02X - no D3D mapping\n",
-                    ti, name, width, height, fmt_code);
-            if (converted) free(converted);
+        /* A paletted entry carries its palette after the index plane. */
+        const uint8_t *palette = NULL;
+        size_t palette_size = 0;
+        if (info.paletted &&
+            !txd_find_palette(data + data_offset, data_avail, data_size,
+                              &palette, &palette_size)) {
+            fprintf(stderr, "  TXD: [%d] '%s' P8 entry has no palette\n", ti, name);
             continue;
         }
 
-        /* Create D3D8 texture */
+        manx_xbox_texture_source level = {0};
+        level.format       = fmt_code;
+        level.width        = width;
+        level.height       = height;
+        level.pixels       = data + data_offset;
+        level.pixels_size  = data_size;
+        level.palette      = palette;
+        level.palette_size = palette_size;
+
+        /* The D3D8 shim's D3DFORMAT values are the Xbox format codes, so
+         * a block-compressed code passes straight through. Everything
+         * else — P8 included — the decoder expands to BGRA, which the
+         * shim calls A8R8G8B8. */
+        D3DFORMAT d3d_fmt = info.block_compressed ? (D3DFORMAT)fmt_code
+                                                  : D3DFMT_A8R8G8B8;
+        uint32_t upload_size =
+            (uint32_t)manx_xbox_texture_upload_bytes(fmt_code, width, height);
+
+        /* Create D3D8 texture. Menu art is drawn at its authored size, so
+         * only level 0 is uploaded even where the entry ships a chain. */
         IDirect3DTexture8 *tex = NULL;
         HRESULT hr = device->lpVtbl->CreateTexture(
             device, width, height, 1, 0, d3d_fmt, 0 /* D3DPOOL_DEFAULT */, &tex);
@@ -395,24 +258,25 @@ int txd_load(const char *path, IDirect3DDevice8 *device, TXD_Dict *out_dict)
         if (FAILED(hr) || !tex) {
             fprintf(stderr, "  TXD: [%d] '%s' CreateTexture failed (hr=0x%08lX)\n",
                     ti, name, hr);
-            if (converted) free(converted);
             continue;
         }
 
-        /* Upload pixel data */
+        /* Decode straight into the staging buffer */
         D3DLOCKED_RECT lr;
         hr = tex->lpVtbl->LockRect(tex, 0, &lr, NULL, 0);
-        if (SUCCEEDED(hr)) {
-            memcpy(lr.pBits, pixel_data, upload_size);
-            tex->lpVtbl->UnlockRect(tex, 0);
-        } else {
+        if (FAILED(hr)) {
             fprintf(stderr, "  TXD: [%d] '%s' LockRect failed\n", ti, name);
             tex->lpVtbl->Release(tex);
-            if (converted) free(converted);
             continue;
         }
-
-        if (converted) free(converted);
+        if (!manx_xbox_texture_decode(&level, lr.pBits, upload_size)) {
+            fprintf(stderr, "  TXD: [%d] '%s' %ux%u %s decode failed\n",
+                    ti, name, width, height, info.name);
+            tex->lpVtbl->UnlockRect(tex, 0);
+            tex->lpVtbl->Release(tex);
+            continue;
+        }
+        tex->lpVtbl->UnlockRect(tex, 0);
 
         /* Store in dictionary */
         TXD_Entry *entry = &out_dict->entries[loaded];

@@ -38,7 +38,12 @@ static inline void mat4_lookat(float m[16],
     float fl = sqrtf(fx*fx + fy*fy + fz*fz);
     if (fl > 0) { fx /= fl; fy /= fl; fz /= fl; }
 
-    /* right = forward x up */
+    /* NOTE: this builds the basis right-handed (right = forward x up)
+     * while mat4_perspective is left-handed. Swapping to the LH order
+     * mirrors the image; which one matches the original game has not
+     * been established, so it is left as-is — every verified-good frame
+     * so far was rendered with this convention. It does NOT cause roll:
+     * with up = (0,1,0) the right vector is horizontal either way. */
     float rx = fy*uz - fz*uy, ry = fz*ux - fx*uz, rz = fx*uy - fy*ux;
     float rl = sqrtf(rx*rx + ry*ry + rz*rz);
     if (rl > 0) { rx /= rl; ry /= rl; rz /= rl; }

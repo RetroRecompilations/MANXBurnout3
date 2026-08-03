@@ -108,6 +108,12 @@ void recomp_icall_fail_log(uint32_t va);
  *  right underlying data. */
 static __forceinline uintptr_t xbox_ptr_resolve(uint32_t addr)
 {
+    /* Xbox physical RAM is aliased at 0x80000000 (cached) and
+     * 0xF0000000 (uncached).  The game ORs heap pointers with
+     * 0x80000000 to create cached virtual addresses.  Strip the
+     * alias bits so the VA maps into our 64 MB host region. */
+    addr &= 0x03FFFFFFu;
+
     /* Fast path: most addresses are Xbox VAs below the mapping base.
      * The mapped native region spans [offset, offset + 29*64MB).
      * Any address in this range is already a native pointer and
@@ -162,6 +168,18 @@ static __forceinline uint32_t native_to_xbox_va(uint32_t val)
 }
 
 /** Read N bytes from a flat memory address. */
+/* An xmm register, all 16 bytes of it. The generated code used to declare
+ * these as plain `float`, so a 128-bit movaps was lowered to a single
+ * 4-byte copy and three quarters of every matrix, position and colour was
+ * silently dropped. Scalar SSE ops address .f[0] / .d[0]; wide moves
+ * memcpy .b. */
+typedef union {
+    float    f[4];
+    double   d[2];
+    uint32_t u[4];
+    uint8_t  b[16];
+} recomp_xmm_t;
+
 #define MEM8(addr)   (*(volatile uint8_t  *)XBOX_PTR(addr))
 #define MEM16(addr)  (*(volatile uint16_t *)XBOX_PTR(addr))
 #define MEM32(addr)  (*(volatile uint32_t *)XBOX_PTR(addr))

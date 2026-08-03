@@ -6,7 +6,7 @@
 Burnout 3 Takedown/
 
 # Build artifacts
-build/
+/build*/
 out/
 bin/
 obj/

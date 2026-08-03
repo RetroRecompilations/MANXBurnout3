@@ -1,3 +1,32 @@
+# MANX Burnout 3
+
+This repository is the Burnout 3 application built on the independent
+MANXFramework runtime. It contains the title-specific
+Xbox kernel bridge, transformed game functions, RenderWare loaders, and
+D3D8/Vulkan backend. It does not compile or reach into MANX Arcade.
+
+The default developer layout is:
+
+```text
+MANXFramework/
+MANXBurnout3/
+```
+
+Build and test on Linux with:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j4
+ctest --test-dir build --output-on-failure
+```
+
+Run `./build/MANXBurnout3 /path/to/extracted/game`. The directory must contain
+`default.xbe` and the data extracted from a legally owned Xbox disc. No game
+data is included or accepted into this repository. Set `BURNOUT3_WINDOWED=1`
+for a development window instead of fullscreen.
+
+The original Windows recompilation research and documentation follows.
+
 # Burnout 3: Takedown - Static Recompilation for Windows 11
 
 > **The first known static recompilation of an original Xbox game into a native PC executable.**

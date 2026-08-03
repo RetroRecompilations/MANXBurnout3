@@ -36,6 +36,24 @@ set(NV2A_SOURCES
     ${NV2A_DIR}/nv2a_pb_replay.c
 )
 
+# ── Shared NV2A texture decoding ───────────────────────────────
+# txd_loader.c and static_textures.c keep only their container walks;
+# the pixels go through the MANX framework module. It needs
+# <vulkan/vulkan.h> for VkFormat alone — no device, no linkage — so the
+# Vulkan headers are required even on this D3D11 build.
+if(NOT TARGET MANXFramework::XboxTexture)
+    set(MANX_FRAMEWORK_SOURCE_DIR
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../../MANXFramework" CACHE PATH
+        "Path to a MANXFramework source checkout")
+    if(EXISTS "${MANX_FRAMEWORK_SOURCE_DIR}/CMakeLists.txt")
+        set(MANX_FRAMEWORK_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+        add_subdirectory("${MANX_FRAMEWORK_SOURCE_DIR}"
+            "${CMAKE_BINARY_DIR}/_deps/manx-framework" EXCLUDE_FROM_ALL)
+    else()
+        find_package(MANXFramework CONFIG REQUIRED)
+    endif()
+endif()
+
 # Game executable sources
 set(GAME_SOURCES
     main.c
@@ -66,6 +84,7 @@ target_link_libraries(burnout3 PRIVATE
     dsound_compat
     input_compat
     apu_emu
+    MANXFramework::XboxTexture
 )
 
 # System libraries
@@ -92,6 +111,7 @@ target_include_directories(burnout3 PRIVATE
     ${NV2A_DIR}
     ${IMGUI_DIR}
     ${IMGUI_DIR}/backends
+    ${Vulkan_INCLUDE_DIRS}
 )
 
 # Compiler options

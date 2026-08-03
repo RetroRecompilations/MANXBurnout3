@@ -19,6 +19,84 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+/* Linux build compatibility declarations for APIs missing from DXVK native headers. */
+typedef unsigned long long DWORDLONG;
+typedef struct _MEMORY_BASIC_INFORMATION { PVOID BaseAddress; PVOID AllocationBase; DWORD AllocationProtect; SIZE_T RegionSize; DWORD State; DWORD Protect; DWORD Type; } MEMORY_BASIC_INFORMATION, *PMEMORY_BASIC_INFORMATION;
+typedef struct _MEMORYSTATUSEX { DWORD dwLength; DWORD dwMemoryLoad; DWORDLONG ullTotalPhys; DWORDLONG ullAvailPhys; DWORDLONG ullTotalPageFile; DWORDLONG ullAvailPageFile; DWORDLONG ullTotalVirtual; DWORDLONG ullAvailVirtual; DWORDLONG ullAvailExtendedVirtual; } MEMORYSTATUSEX, *LPMEMORYSTATUSEX;
+typedef union _ULARGE_INTEGER { struct { DWORD LowPart; DWORD HighPart; }; DWORDLONG QuadPart; } ULARGE_INTEGER, *PULARGE_INTEGER;
+
+
+#include <ctype.h>
+LONG InterlockedDecrement(LONG volatile *Addend);
+BOOL WriteFile(HANDLE hFile, LPCVOID lpBuffer, DWORD nBytes, PDWORD lpWritten, void *lpOverlapped);
+BOOL SetFilePointerEx(HANDLE hFile, LARGE_INTEGER liDist, PLARGE_INTEGER lpNew, DWORD dwMethod);
+BOOL SetEndOfFile(HANDLE hFile);
+BOOL SetFileTime(HANDLE hFile, const FILETIME *lpCreate, const FILETIME *lpAccess, const FILETIME *lpWrite);
+SIZE_T VirtualQuery(LPCVOID lpAddr, PMEMORY_BASIC_INFORMATION lpBuf, SIZE_T dwLen);
+BOOL FlushFileBuffers(HANDLE hFile);
+VOID SecureZeroMemory(PVOID ptr, SIZE_T cnt);
+BOOL GlobalMemoryStatusEx(LPMEMORYSTATUSEX lpBuf);
+BOOL GetDiskFreeSpaceExW(LPCWSTR dir, PULARGE_INTEGER freeCaller, PULARGE_INTEGER total, PULARGE_INTEGER freeTotal);
+BOOL GetFileInformationByHandleEx(HANDLE hFile, int cls, LPVOID info, DWORD sz);
+int swprintf_s(wchar_t *s, size_t n, const wchar_t *fmt, ...);
+
+DWORD WaitForMultipleObjectsEx(DWORD nCount, const HANDLE *lpHandles, BOOL bWaitAll, DWORD dwMilliseconds, BOOL bAlertable);
+BOOL ReleaseSemaphore(HANDLE hSemaphore, LONG lReleaseCount, PLONG lpPreviousCount);
+#define WAIT_IO_COMPLETION 0x000000C0L
+#define THREAD_PRIORITY_ABOVE_NORMAL 1
+#define THREAD_PRIORITY_HIGHEST 2
+#define THREAD_PRIORITY_TIME_CRITICAL 15
+#define WAIT_ABANDONED_0 0x00000080L
+#define WAIT_FAILED 0xFFFFFFFF
+int GetThreadPriority(HANDLE hThread);
+BOOL SetThreadPriority(HANDLE hThread, int nPriority);
+DWORD WaitForSingleObjectEx(HANDLE hHandle, DWORD dwMilliseconds, BOOL bAlertable);
+DWORD QueueUserAPC(void *pfnAPC, HANDLE hThread, ULONG_PTR dwData);
+HANDLE CreateTimerQueue(void);
+BOOL CreateTimerQueueTimer(PHANDLE phNewTimer, HANDLE TimerQueue, void *Callback, PVOID Parameter, DWORD DueTime, DWORD Period, ULONG Flags);
+BOOL DeleteTimerQueueTimer(HANDLE TimerQueue, HANDLE Timer, HANDLE CompletionEvent);
+BOOL DeleteTimerQueueEx(HANDLE TimerQueue, HANDLE CompletionEvent);
+SIZE_T HeapSize(HANDLE hHeap, DWORD dwFlags, LPCVOID lpMem);
+#define DUPLICATE_CLOSE_SOURCE 1
+typedef struct _FILE_NAME_INFO { DWORD FileNameLength; WCHAR FileName[1]; } FILE_NAME_INFO, *PFILE_NAME_INFO;
+#define FileNameInfo 2
+BOOL DuplicateHandle(HANDLE hSourceProcessHandle, HANDLE hSourceHandle, HANDLE hTargetProcessHandle, PHANDLE lpTargetHandle, DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwOptions);
+#define WT_EXECUTEONLYONCE 8
+#ifndef ERROR_INVALID_PARAMETER
+#define ERROR_INVALID_PARAMETER 87L
+#endif
+#ifndef ERROR_NOT_ENOUGH_MEMORY
+#define ERROR_NOT_ENOUGH_MEMORY 8L
+#endif
+#ifndef ERROR_NO_SYSTEM_RESOURCES
+#define ERROR_NO_SYSTEM_RESOURCES 1450L
+#endif
+typedef void *PTP_CALLBACK_INSTANCE;
+BOOL TrySubmitThreadpoolCallback(void *pfns, PVOID pv, PTP_CALLBACK_INSTANCE pcbe);
+#define ERROR_INVALID_HANDLE 6L
+#define THREAD_PRIORITY_IDLE (-15)
+#define THREAD_PRIORITY_LOWEST (-2)
+#define ERROR_IO_PENDING 997L
+#define ERROR_MORE_DATA 234L
+#define ERROR_NO_MORE_FILES 18L
+#define ERROR_NOT_SUPPORTED 50L
+#define ERROR_CALL_NOT_IMPLEMENTED 120L
+#define ERROR_GEN_FAILURE 31L
+#define ERROR_CANCELLED 1223L
+#define ERROR_COMMITMENT_LIMIT 1455L
+#define ERROR_MR_MID_NOT_FOUND 317L
+
+/* Win32 API declarations missing from DXVK native headers */
+BOOL SystemTimeToFileTime(const SYSTEMTIME *lpSystemTime, LPFILETIME lpFileTime);
+BOOL FileTimeToSystemTime(const FILETIME *lpFileTime, LPSYSTEMTIME lpSystemTime);
+VOID RtlUnwind(PVOID TargetFrame, PVOID TargetIp, void *ExceptionRecord, PVOID ReturnValue);
+VOID RaiseException(DWORD dwExceptionCode, DWORD dwExceptionFlags, DWORD nNumberOfArguments, const ULONG_PTR *lpArguments);
+
+#define THREAD_PRIORITY_BELOW_NORMAL (-1)
+#define DELETE XBOX_DELETE
+
+#include <stdio.h>
+#include <wchar.h>
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -35,9 +113,11 @@ typedef UCHAR KIRQL, *PKIRQL;
 typedef CCHAR KPROCESSOR_MODE;
 typedef LONG KPRIORITY;
 
-/* Processor modes */
+/* Processor modes - already defined as enum in winnt.h on both MinGW and MSVC */
+#if !defined(_MODE_DEFINED) && !defined(__MINGW32__)
 #define KernelMode  0
 #define UserMode    1
+#endif
 
 /* IRQL levels (Xbox uses same NT IRQL model) */
 #define PASSIVE_LEVEL   0
@@ -375,6 +455,127 @@ typedef VOID (__stdcall *PXBOX_SYSTEM_ROUTINE)(PVOID StartContext);
 #define XBOX_GENERIC_WRITE          0x40000000
 #define XBOX_GENERIC_ALL            0x10000000
 #define XBOX_DELETE                  0x00010000
+
+/* Compatibility aliases for code that uses bare Win32 names */
+#define FILE_READ_DATA         XBOX_FILE_READ_DATA
+#define FILE_WRITE_DATA        XBOX_FILE_WRITE_DATA
+#define FILE_APPEND_DATA       XBOX_FILE_APPEND_DATA
+#define FILE_READ_ATTRIBUTES   XBOX_FILE_READ_ATTRIBUTES
+#define FILE_WRITE_ATTRIBUTES  XBOX_FILE_WRITE_ATTRIBUTES
+#define SYNCHRONIZE            XBOX_SYNCHRONIZE
+
+/* Memory protection constants (from winnt.h, guarded for Linux) */
+#ifndef PAGE_WRITECOPY
+#define PAGE_WRITECOPY          0x0008
+#endif
+#ifndef PAGE_EXECUTE
+#define PAGE_EXECUTE            0x0010
+#endif
+#ifndef PAGE_EXECUTE_READ
+#define PAGE_EXECUTE_READ       0x0020
+#endif
+#ifndef PAGE_EXECUTE_READWRITE
+#define PAGE_EXECUTE_READWRITE  0x0040
+#endif
+#ifndef PAGE_GUARD
+#define PAGE_GUARD              0x0100
+#endif
+#ifndef PAGE_NOACCESS
+#define PAGE_NOACCESS           0x0001
+#endif
+#ifndef PAGE_READONLY
+#define PAGE_READONLY           0x0002
+#endif
+#ifndef PAGE_READWRITE
+#define PAGE_READWRITE          0x0004
+#endif
+#ifndef MEM_COMMIT
+#define MEM_COMMIT              0x00001000
+#endif
+#ifndef MEM_RESERVE
+#define MEM_RESERVE             0x00002000
+#endif
+#ifndef MEM_RELEASE
+#define MEM_RELEASE             0x00008000
+#endif
+
+/* Memory management structs (from winnt.h) */
+#ifndef _MEMORY_BASIC_INFORMATION_DEFINED
+typedef struct _MEMORY_BASIC_INFORMATION {
+    PVOID  BaseAddress;
+    PVOID  AllocationBase;
+    DWORD  AllocationProtect;
+    SIZE_T RegionSize;
+    DWORD  State;
+    DWORD  Protect;
+    DWORD  Type;
+} MEMORY_BASIC_INFORMATION, *PMEMORY_BASIC_INFORMATION;
+#define _MEMORY_BASIC_INFORMATION_DEFINED
+#endif
+
+/* DWORDLONG — provided by basetsd.h on Windows. */
+#ifndef _DWORDLONG_
+typedef unsigned long long DWORDLONG, *PDWORDLONG;
+#define _DWORDLONG_
+#endif
+
+typedef struct _MEMORYSTATUSEX {
+    DWORD     dwLength;
+    DWORD     dwMemoryLoad;
+    DWORDLONG ullTotalPhys;
+    DWORDLONG ullAvailPhys;
+    DWORDLONG ullTotalPageFile;
+    DWORDLONG ullAvailPageFile;
+    DWORDLONG ullTotalVirtual;
+    DWORDLONG ullAvailVirtual;
+    DWORDLONG ullAvailExtendedVirtual;
+} MEMORYSTATUSEX, *LPMEMORYSTATUSEX;
+
+/* Win32 error codes (guarded — DXVK windows.h may not define these) */
+#ifndef ERROR_FILE_NOT_FOUND
+#define ERROR_FILE_NOT_FOUND    2L
+#endif
+#ifndef ERROR_PATH_NOT_FOUND
+#define ERROR_PATH_NOT_FOUND    3L
+#endif
+#ifndef ERROR_ACCESS_DENIED
+#define ERROR_ACCESS_DENIED     5L
+#endif
+#ifndef ERROR_ALREADY_EXISTS
+#define ERROR_ALREADY_EXISTS    183L
+#endif
+
+/* Empty stub headers for intrin.h / bcrypt.h that kernel_hal.c
+ * and kernel_crypto.c include but the Linux build does not use. */
+/* (Resolved by creating empty files in the kernel include dir.) */
+
+/* Missing Windows API declarations the DXVK native headers don't cover.
+ * The kernel layer calls these directly; declare them so compilation
+ * succeeds.  The linker resolves them from the real system libraries or
+ * the DXVK native stubs at link time. */
+BOOL QueryPerformanceCounter(LARGE_INTEGER *lpPerformanceCount);
+BOOL QueryPerformanceFrequency(LARGE_INTEGER *lpFrequency);
+BOOL SwitchToThread(void);
+DWORD SleepEx(DWORD dwMilliseconds, BOOL bAlertable);
+VOID ExitProcess(UINT uExitCode);
+HRESULT SHGetFolderPathW(HWND hwnd, int csidl, HANDLE hToken, DWORD dwFlags, LPWSTR pszPath);
+HANDLE CreateSemaphoreW(void *lpSemaphoreAttributes, LONG lInitialCount, LONG lMaximumCount, LPCWSTR lpName);
+LONG InterlockedIncrement(LONG volatile *Addend);
+
+/* DELETE alias — XBOX_DELETE is defined above, but kernel_file.c uses bare DELETE */
+#define DELETE XBOX_DELETE
+
+/* Windows exception record — stub for Linux builds.  The recompiled
+ * game code does not actually raise SEH exceptions; the Rtl* wrappers
+ * exist to satisfy linker references from the regenerated C. */
+typedef struct _EXCEPTION_RECORD {
+    DWORD ExceptionCode;
+    DWORD ExceptionFlags;
+    struct _EXCEPTION_RECORD *ExceptionRecord;
+    PVOID ExceptionAddress;
+    DWORD NumberParameters;
+    ULONG_PTR ExceptionInformation[15];
+} EXCEPTION_RECORD, *PEXCEPTION_RECORD;
 
 /* File create disposition */
 #define XBOX_FILE_SUPERSEDE         0x00000000

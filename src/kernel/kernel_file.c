@@ -693,9 +693,9 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
             WCHAR pattern_wide[MAX_PATH];
             MultiByteToWideChar(CP_ACP, 0, FileName->Buffer, FileName->Length, pattern_wide, MAX_PATH);
             pattern_wide[FileName->Length] = L'\0';
-            swprintf_s(search_path, MAX_PATH, L"%s\\%s", clean_path, pattern_wide);
+            swprintf(search_path, MAX_PATH, L"%s\\%s", clean_path, pattern_wide);
         } else {
-            swprintf_s(search_path, MAX_PATH, L"%s\\*", clean_path);
+            swprintf(search_path, MAX_PATH, L"%s\\*", clean_path);
         }
 
         ctx->find_handle = FindFirstFileW(search_path, &ctx->find_data);

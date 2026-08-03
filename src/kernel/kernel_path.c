@@ -12,6 +12,7 @@
 #include "kernel.h"
 #include <stdio.h>
 #include <string.h>
+#include <ctype.h>
 #include <shlobj.h>
 
 /* Base directories - set at init */
@@ -28,7 +29,7 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
     } else {
         /* Default: current directory + "Burnout 3 Takedown" */
         GetCurrentDirectoryW(MAX_PATH, s_game_dir);
-        wcscat_s(s_game_dir, MAX_PATH, L"\\Burnout 3 Takedown");
+        wcscat(s_game_dir, L"\\Burnout 3 Takedown");
     }
 
     if (save_dir) {
@@ -36,10 +37,10 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
     } else {
         /* Default: AppData\Local\Burnout3 */
         if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, save_base))) {
-            swprintf_s(s_save_dir, MAX_PATH, L"%s\\Burnout3", save_base);
+            swprintf(s_save_dir, MAX_PATH, L"%s\\Burnout3", save_base);
         } else {
             GetCurrentDirectoryW(MAX_PATH, s_save_dir);
-            wcscat_s(s_save_dir, MAX_PATH, L"\\SaveData");
+            wcscat(s_save_dir, L"\\SaveData");
         }
     }
 
@@ -180,15 +181,15 @@ translate:
         }
 
         if (sub_dir) {
-            swprintf_s(win_path_buf, buf_size, L"%s%s\\%s", base_dir, sub_dir, remainder_wide);
+            swprintf(win_path_buf, buf_size, L"%s%s\\%s", base_dir, sub_dir, remainder_wide);
         } else {
-            swprintf_s(win_path_buf, buf_size, L"%s\\%s", base_dir, remainder_wide);
+            swprintf(win_path_buf, buf_size, L"%s\\%s", base_dir, remainder_wide);
         }
 
         /* Ensure save directories exist */
         if (sub_dir) {
             WCHAR dir_path[MAX_PATH];
-            swprintf_s(dir_path, MAX_PATH, L"%s%s", base_dir, sub_dir);
+            swprintf(dir_path, MAX_PATH, L"%s%s", base_dir, sub_dir);
             CreateDirectoryW(s_save_dir, NULL);
             CreateDirectoryW(dir_path, NULL);
         }

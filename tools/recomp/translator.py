@@ -303,7 +303,8 @@ class FunctionTranslator:
             mmx_regs = sorted([r for r in used_xmm if r.startswith("mm")
                                and not r.startswith("xmm")])
             if xmm_regs:
-                lines.append(f"    float {', '.join(xmm_regs)};")
+                # 16-byte registers: a movaps must move all of it.
+                lines.append(f"    recomp_xmm_t {', '.join(xmm_regs)};")
             if mmx_regs:
                 lines.append(f"    uint64_t {', '.join(mmx_regs)};")
 

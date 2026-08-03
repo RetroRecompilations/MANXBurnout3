@@ -321,6 +321,10 @@ def _make_condition(jcc, flag_setter, flag_ops):
     if flag_setter in ("comiss", "comisd", "ucomiss", "ucomisd"):
         def _sse_op(op):
             if op.type == "reg":
+                # comiss compares the scalar in element 0; xmm registers are
+                # 16-byte unions, so name the element.
+                if op.reg.startswith("xmm"):
+                    return f"{op.reg}.d[0]" if flag_setter.endswith("sd") else f"{op.reg}.f[0]"
                 return op.reg
             elif op.type == "mem":
                 if op.mem_size == 8:
@@ -1271,32 +1275,84 @@ class Lifter:
         if nops < 1:
             return [f"/* {m}: no operands */"]
 
-        # SSE register names (xmm0-xmm7) are used as float locals
-        def _sse_read(op):
+        # xmm registers are recomp_xmm_t (16 bytes). Scalar SSE ops address
+        # element 0; wide moves copy the whole register. Lowering a 128-bit
+        # movaps through the scalar path silently dropped 12 of every 16
+        # bytes, which is wrong for every matrix and vector the game moves.
+        def _sse_read(op, sz=4):
             if op.type == "reg":
-                return op.reg  # xmm0, xmm1, etc.
+                if op.reg.startswith("xmm"):
+                    return f"{op.reg}.d[0]" if sz == 8 else f"{op.reg}.f[0]"
+                return op.reg
             elif op.type == "mem":
-                if op.mem_size == 8:
+                if op.mem_size == 8 or sz == 8:
                     return f"MEMD({_fmt_mem(op)})"
                 return f"MEMF({_fmt_mem(op)})"
             elif op.type == "imm":
                 return _fmt_imm(op.imm)
             return f"/* sse_read? */"
 
-        def _sse_write(op, val):
+        def _sse_write(op, val, sz=4):
             if op.type == "reg":
+                if op.reg.startswith("xmm"):
+                    return f"{op.reg}.d[0] = {val};" if sz == 8 else f"{op.reg}.f[0] = {val};"
                 return f"{op.reg} = {val};"
             elif op.type == "mem":
-                if op.mem_size == 8:
+                if op.mem_size == 8 or sz == 8:
                     return f"MEMD({_fmt_mem(op)}) = {val};"
                 return f"MEMF({_fmt_mem(op)}) = {val};"
             return f"/* sse_write? */;"
 
-        # ── Moves ──
-        if m in ("movss", "movsd", "movaps", "movups", "movlps", "movhps"):
+        # Address of an operand as raw bytes, for whole-register moves.
+        def _sse_bytes(op):
+            if op.type == "reg" and op.reg.startswith("xmm"):
+                return f"{op.reg}.b"
+            if op.type == "mem":
+                return f"(void *)XBOX_PTR({_fmt_mem(op)})"
+            return None
+
+        def _sse_lane(op, lane, kind="f"):
+            """Read one 32-bit lane without collapsing packed SSE to lane 0."""
+            if op.type == "reg" and op.reg.startswith("xmm"):
+                return f"{op.reg}.{kind}[{lane}]"
+            if op.type == "mem":
+                accessor = "MEM32" if kind == "u" else "MEMF"
+                return f"{accessor}(({_fmt_mem(op)}) + {lane * 4})"
+            return "0"
+
+        def _packed_float_block(dst, src, expressions, comment):
+            if not (dst.type == "reg" and dst.reg.startswith("xmm")):
+                return [f"/* unsupported packed destination: {insn.op_str} */"]
+            d = dst.reg
+            lines = ["{"]
+            for lane in range(4):
+                lines.append(f"float _d{lane} = {d}.f[{lane}];")
+                lines.append(f"float _s{lane} = {_sse_lane(src, lane)};")
+            for lane, expr in enumerate(expressions):
+                lines.append(f"{d}.f[{lane}] = {expr};")
+            lines.append(f"}} /* {comment} */")
+            return lines
+
+        # ── Wide moves: copy the whole register, not one float ──
+        if m in ("movaps", "movups", "movdqa", "movdqu", "movlps", "movhps"):
             if nops >= 2:
-                src = _sse_read(ops[1])
-                return [_sse_write(ops[0], src) + f" /* {m} */"]
+                nbytes = 8 if m in ("movlps", "movhps") else 16
+                dst_b, src_b = _sse_bytes(ops[0]), _sse_bytes(ops[1])
+                if dst_b and src_b:
+                    # movhps addresses the upper half of the register
+                    d_off = ".b + 8" if (m == "movhps" and ops[0].type == "reg") else ""
+                    s_off = ".b + 8" if (m == "movhps" and ops[1].type == "reg") else ""
+                    dst = dst_b.replace(".b", d_off) if d_off else dst_b
+                    src = src_b.replace(".b", s_off) if s_off else src_b
+                    return [f"memcpy({dst}, {src}, {nbytes}); /* {m} */"]
+            return [f"/* {m} {insn.op_str} */"]
+
+        # ── Scalar moves ──
+        if m in ("movss", "movsd"):
+            if nops >= 2:
+                sz = 8 if m == "movsd" else 4
+                src = _sse_read(ops[1], sz)
+                return [_sse_write(ops[0], src, sz) + f" /* {m} */"]
             return [f"/* {m} {insn.op_str} */"]
 
         if m == "movd":
@@ -1337,8 +1393,8 @@ class Lifter:
         if m in ("addps", "subps", "mulps", "divps"):
             if nops >= 2:
                 c_op = {"addps": "+", "subps": "-", "mulps": "*", "divps": "/"}[m]
-                d, s = _sse_read(ops[0]), _sse_read(ops[1])
-                return [f"/* {m}: {d} {c_op}= {s} (packed 4xfloat) */"]
+                exprs = [f"_d{i} {c_op} _s{i}" for i in range(4)]
+                return _packed_float_block(ops[0], ops[1], exprs, m)
 
         # ── Conversions ──
         if m == "cvtsi2ss":
@@ -1370,7 +1426,7 @@ class Lifter:
         # ── Bitwise ──
         if m in ("xorps", "xorpd"):
             if nops >= 2 and ops[0].type == "reg" and ops[1].type == "reg" and ops[0].reg == ops[1].reg:
-                return [_sse_write(ops[0], "0.0f") + f" /* {m} self = zero */"]
+                return [f"memset({ops[0].reg}.b, 0, 16); /* {m} self = zero */"]
             if nops >= 2:
                 return [f"/* {m} {_sse_read(ops[0])}, {_sse_read(ops[1])} */"]
         if m in ("andps", "orps"):
@@ -1380,7 +1436,9 @@ class Lifter:
         # ── Packed min/max ──
         if m in ("minps", "maxps"):
             if nops >= 2:
-                return [f"/* {m} {_sse_read(ops[0])}, {_sse_read(ops[1])} (packed 4xfloat) */"]
+                op = "<" if m == "minps" else ">"
+                exprs = [f"(_d{i} {op} _s{i} ? _d{i} : _s{i})" for i in range(4)]
+                return _packed_float_block(ops[0], ops[1], exprs, m)
 
         # ── Reciprocal / rsqrt ──
         if m == "rsqrtss":
@@ -1406,8 +1464,17 @@ class Lifter:
                 return [f"/* {m} {insn.op_str} (MMX/SIMD integer) */"]
 
         # ── Shuffle/unpack ──
-        if m in ("shufps", "unpcklps", "unpckhps"):
-            return [f"/* {m} {insn.op_str} */"]
+        if m == "shufps" and nops >= 3:
+            imm = ops[2].imm & 0xFF
+            exprs = [
+                f"_d{(imm >> 0) & 3}", f"_d{(imm >> 2) & 3}",
+                f"_s{(imm >> 4) & 3}", f"_s{(imm >> 6) & 3}",
+            ]
+            return _packed_float_block(ops[0], ops[1], exprs, m)
+        if m in ("unpcklps", "unpckhps") and nops >= 2:
+            exprs = (["_d0", "_s0", "_d1", "_s1"] if m == "unpcklps"
+                     else ["_d2", "_s2", "_d3", "_s3"])
+            return _packed_float_block(ops[0], ops[1], exprs, m)
 
         return [f"/* SSE: {m} {insn.op_str} */"]
 

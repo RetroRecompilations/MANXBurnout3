@@ -16,9 +16,15 @@
 #include "rw_bridge.h"
 #include "awd_loader.h"
 #include "../d3d/d3d8_xbox.h"
+#ifdef B3_HAVE_FFMPEG
+#include "manx_fmv.h"
+#endif
 
 #include <windows.h>
+#include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <math.h>
 
 /* ── Xbox memory access ──────────────────────────────────────── */
@@ -77,6 +83,7 @@ typedef struct {
 #define FE_SCREEN_ROAD_RAGE        7
 #define FE_SCREEN_CRASH_SELECT     8
 #define FE_SCREEN_DRIVER_DETAILS   9
+#define FE_SCREEN_INTRO          100   /* boot FMVs before the frontend */
 
 /* Main menu: 5 items matching the PB capture */
 #define FE_MAIN_ITEMS        5
@@ -90,6 +97,21 @@ static const char *g_single_menu_labels[FE_SINGLE_ITEMS] = {
     "RACE", "TIME ATTACK", "ROAD RAGE", "CRASH"
 };
 
+/* Content catalogues, owned by the port's frame pump. 36 loadable tracks
+ * and 67 cars ship; without a way to choose, all but one of each was
+ * unreachable. */
+extern int         b3_track_count(void);
+extern int         b3_car_count(void);
+extern const char *b3_track_name(int i);
+extern const char *b3_car_name(int i);
+extern void        b3_select_track(int i);
+extern void        b3_select_car(int i);
+extern int         b3_selected_track(void);
+extern int         b3_selected_car(void);
+
+#define FE_SETUP_ROWS 3   /* track, car, start */
+static int g_fe_setup_row = 0;
+
 static int g_fe_screen = FE_SCREEN_MAIN;  /* Skip title, start on main menu */
 int g_fe_cursor = 0;  /* exported for PB replay cursor overlay */
 static int g_race_active = 0;
@@ -99,6 +121,7 @@ static void fe_start_race(int screen);
 static float g_fe_timer = 0.0f;
 static float g_fe_flash = 0.0f;   /* "Press Start" blink timer */
 static int g_fe_initialized = 0;
+static int g_fe_rendered_once = 0;  /* set true after first successful render */
 static int g_fe_prev_up = 0;      /* edge detection for key repeat */
 static int g_fe_prev_down = 0;
 static int g_fe_prev_enter = 0;
@@ -110,6 +133,175 @@ static IDirect3DTexture8 *g_tex_arrow = NULL;
 static IDirect3DTexture8 *g_tex_bg = NULL;
 static IDirect3DTexture8 *g_tex_ramp = NULL;
 static IDirect3DTexture8 *g_tex_fe = NULL;
+
+/* ── Boot intro FMVs ─────────────────────────────────────────── */
+/* The retail boot flow: Criterion/RenderWare badge reel, the localized
+ * EA intro, then the title attract movie. All video-only XMVs; their
+ * audio lives in ovid/movie.xwb and is not wired yet. */
+static char g_fe_game_dir[1024];
+
+void fe_menu_set_game_dir(const char *dir)
+{
+    if (!dir) return;
+    strncpy(g_fe_game_dir, dir, sizeof(g_fe_game_dir) - 1);
+    g_fe_game_dir[sizeof(g_fe_game_dir) - 1] = '\0';
+}
+
+#ifdef B3_HAVE_FFMPEG
+static const char *g_intro_files[] = {
+    "cri_rw30.xmv",   /* Criterion + RenderWare badges */
+    "englis30.xmv",   /* EA intro (English) */
+    "Titles30.xmv",   /* title attract movie */
+};
+static const char *g_intro_portable_files[] = {
+    "cri_rw30.mp4",
+    "englis30.mp4",
+    "Titles30.mp4",
+};
+#define FE_INTRO_COUNT ((int)(sizeof(g_intro_files) / sizeof(g_intro_files[0])))
+static int g_intro_index = 0;
+static manx_fmv *g_intro_player = NULL;
+static atomic_flag g_intro_player_lock = ATOMIC_FLAG_INIT;
+static IDirect3DTexture8 *g_tex_video = NULL;
+static int g_intro_video_valid = 0;   /* g_tex_video holds a decoded frame */
+
+/* Open playlist entry g_intro_index, skipping any that fail. Leaves
+ * g_intro_player NULL when the playlist is exhausted. */
+static int fe_file_exists(const char *path)
+{
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return 0;
+    fclose(fp);
+    return 1;
+}
+
+static void fe_intro_player_close(void)
+{
+    while (atomic_flag_test_and_set_explicit(&g_intro_player_lock,
+                                              memory_order_acquire)) {}
+    manx_fmv *old = g_intro_player;
+    g_intro_player = NULL;
+    atomic_flag_clear_explicit(&g_intro_player_lock, memory_order_release);
+    if (old) manx_fmv_close(old);
+}
+
+static void fe_intro_open_current(void)
+{
+    while (g_intro_index < FE_INTRO_COUNT) {
+        char path[1200];
+        const char *portable_root = getenv("B3_PORTABLE_MEDIA");
+        if (portable_root && *portable_root) {
+            snprintf(path, sizeof(path), "%s/movies/%s", portable_root,
+                     g_intro_portable_files[g_intro_index]);
+        } else {
+            snprintf(path, sizeof(path), "%s/portable/movies/%s",
+                     g_fe_game_dir, g_intro_portable_files[g_intro_index]);
+        }
+        if (!fe_file_exists(path)) {
+            snprintf(path, sizeof(path), "%s/ovid/%s",
+                     g_fe_game_dir, g_intro_files[g_intro_index]);
+        }
+        /* BGRA to match the D3D8 A8R8G8B8 texture staging layout. */
+        manx_fmv *opened = manx_fmv_open(path, 640, 480,
+                                              manx_fmv_format_bgra);
+        while (atomic_flag_test_and_set_explicit(&g_intro_player_lock,
+                                                  memory_order_acquire)) {}
+        g_intro_player = opened;
+        atomic_flag_clear_explicit(&g_intro_player_lock, memory_order_release);
+        if (opened) {
+            fprintf(stderr, "[XMV] playing %s\n", path);
+            return;
+        }
+        g_intro_index++;
+    }
+    g_intro_player = NULL;
+}
+
+static void fe_intro_finish(void)
+{
+    fe_intro_player_close();
+    g_intro_video_valid = 0;
+    g_fe_screen = FE_SCREEN_TITLE;
+    g_fe_timer = 0;
+    fprintf(stderr, "[FE-MENU] Intro done -> title screen\n");
+}
+
+static void fe_intro_advance(void)
+{
+    fe_intro_player_close();
+    g_intro_video_valid = 0;
+    g_intro_index++;
+    fe_intro_open_current();
+    if (!g_intro_player) fe_intro_finish();
+}
+
+/* Per-frame intro drive: decode paced by wall clock, upload new frames
+ * into the video texture. Runs from fe_menu_update — outside the D3D
+ * scene, so the texture upload never lands mid-render-pass. */
+static void fe_intro_update(int skip_edge)
+{
+    IDirect3DDevice8 *dev = xbox_GetD3DDevice();
+
+    /* The boot pump (600 frames in burnout3_init) calls this at an
+     * uncontrolled cadence while Present blocks on vsync.  Opening an
+     * FMV here starts its wall clock; by the time the pump finishes
+     * and normal 60 Hz pumping resumes, enough real time has passed
+     * that short intros (cri_rw30.xmv at ~8 s, englis30.xmv at ~4 s)
+     * have already expired and are skipped.  Waiting for g_game_ready
+     * — set after the pump — means the first decoded frame lands when
+     * the clock is fresh and the 60 Hz cadence keeps it accurate. */
+    extern int g_game_ready;
+    if (!g_game_ready) return;
+
+    if (!g_intro_player) {
+        fe_intro_open_current();
+        if (!g_intro_player) { fe_intro_finish(); return; }
+    }
+
+    if (skip_edge) {
+        fprintf(stderr, "[FE-MENU] Intro video %d skipped\n", g_intro_index);
+        fe_intro_advance();
+        return;
+    }
+
+    int new_frame = 0;
+    int playing = manx_fmv_update(g_intro_player, &new_frame);
+
+    if (new_frame && dev) {
+        if (!g_tex_video) {
+            if (dev->lpVtbl->CreateTexture(dev, 640, 480, 1, 0,
+                    D3DFMT_A8R8G8B8, 0, &g_tex_video) != S_OK)
+                g_tex_video = NULL;
+        }
+        if (g_tex_video) {
+            D3DLOCKED_RECT lr;
+            if (g_tex_video->lpVtbl->LockRect(g_tex_video, 0, &lr, NULL, 0) == S_OK) {
+                memcpy(lr.pBits, manx_fmv_frame(g_intro_player), (size_t)640 * 480 * 4);
+                g_tex_video->lpVtbl->UnlockRect(g_tex_video, 0);
+                g_intro_video_valid = 1;
+            }
+        }
+    }
+
+    if (!playing) fe_intro_advance();
+}
+#endif /* B3_HAVE_FFMPEG */
+
+int fe_menu_audio_callback(int16_t *stereo, int max_frames)
+{
+    if (!stereo || max_frames <= 0) return 0;
+#ifdef B3_HAVE_FFMPEG
+    if (atomic_flag_test_and_set_explicit(&g_intro_player_lock,
+                                          memory_order_acquire))
+        return 0;
+    int frames = g_intro_player
+        ? manx_fmv_read_audio(g_intro_player, stereo, max_frames) : 0;
+    atomic_flag_clear_explicit(&g_intro_player_lock, memory_order_release);
+    return frames;
+#else
+    return 0;
+#endif
+}
 
 /* ── Color helpers ───────────────────────────────────────────── */
 static DWORD color_rgba(uint8_t r, uint8_t g, uint8_t b, uint8_t a)
@@ -260,6 +452,19 @@ static void fe_draw_char_bitmap(IDirect3DDevice8 *dev, char ch,
         fe_draw_rect(dev, x + scale * 2, y + scale * 6, scale, scale, color);
         return;
     }
+    /* The race setup screen needs these: without the chevrons nothing on
+     * screen says the row responds to left/right, and "1/36" read as
+     * "1 36". Underscore matters too — the track names are C1_V1. */
+    static const uint8_t font_sym[4][7] = {
+        {0x02,0x04,0x08,0x10,0x08,0x04,0x02},   /* < */
+        {0x08,0x04,0x02,0x01,0x02,0x04,0x08},   /* > */
+        {0x01,0x02,0x02,0x04,0x08,0x08,0x10},   /* / */
+        {0x00,0x00,0x00,0x00,0x00,0x00,0x1F},   /* _ */
+    };
+    if      (ch == '<') bmp = font_sym[0];
+    else if (ch == '>') bmp = font_sym[1];
+    else if (ch == '/') bmp = font_sym[2];
+    else if (ch == '_') bmp = font_sym[3];
 
     if (!bmp) return;
 
@@ -334,9 +539,21 @@ void fe_menu_init(void)
     g_tex_fe    = txd_find(&g_global_txd, "FE");
 
     g_fe_initialized = 1;
-    g_fe_screen = FE_SCREEN_TITLE;
+    /* Library/test users keep the quick main-menu start unless the host
+     * explicitly asks for the retail intro flow. */
+    const char *intro_env = getenv("B3_INTRO");
+    int play_intro = intro_env && intro_env[0] && strcmp(intro_env, "0") != 0;
+    if (getenv("B3_SKIP_INTRO")) play_intro = 0;
+    g_fe_screen = play_intro ? FE_SCREEN_TITLE : FE_SCREEN_MAIN;
     g_fe_cursor = 0;
     g_fe_timer = 0;
+
+#ifdef B3_HAVE_FFMPEG
+    if (g_fe_game_dir[0] && play_intro) {
+        g_fe_screen = FE_SCREEN_INTRO;
+        g_intro_index = 0;
+    }
+#endif
 
     fprintf(stderr, "[FE-MENU] Initialized: logo=%p arrow=%p bg=%p ramp=%p fe=%p\n",
             g_tex_logo, g_tex_arrow, g_tex_bg, g_tex_ramp, g_tex_fe);
@@ -407,9 +624,12 @@ void fe_menu_update(float dt)
             }
         }
 
-        /* ESC returns to menus */
+        /* ESC (or pad B) returns to menus */
         static int esc_prev_race = 0;
-        int esc_now_race = (GetAsyncKeyState(VK_ESCAPE) & 0x8000);
+        XINPUT_STATE race_xi;
+        int esc_now_race = (GetAsyncKeyState(VK_ESCAPE) & 0x8000)
+            || ((XInputGetState(0, &race_xi) == 0) &&
+                (race_xi.wButtons & XINPUT_GAMEPAD_B));
         if (esc_now_race && !esc_prev_race) {
             fe_menu_stop_race();
         }
@@ -417,23 +637,55 @@ void fe_menu_update(float dt)
         return;
     }
 
-    /* Edge-detected input — arrow keys + WASD + Enter/Esc */
-    int up_now    = (GetAsyncKeyState(VK_UP)     & 0x8000) || (GetAsyncKeyState('W') & 0x8000);
-    int down_now  = (GetAsyncKeyState(VK_DOWN)   & 0x8000) || (GetAsyncKeyState('S') & 0x8000);
-    int enter_now = (GetAsyncKeyState(VK_RETURN) & 0x8000) || (GetAsyncKeyState(VK_SPACE) & 0x8000);
-    int esc_now   = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) || (GetAsyncKeyState(VK_BACK) & 0x8000);
+    /* Edge-detected input — arrow keys + WASD + Enter/Esc, merged with
+     * gamepad d-pad/stick + A/B/START (from the session's pad injection). */
+    XINPUT_STATE fe_xi;
+    int fe_pad = (XInputGetState(0, &fe_xi) == 0);
+    int up_now    = (GetAsyncKeyState(VK_UP)     & 0x8000) || (GetAsyncKeyState('W') & 0x8000)
+                 || (fe_pad && (fe_xi.wButtons & XINPUT_GAMEPAD_DPAD_UP));
+    int down_now  = (GetAsyncKeyState(VK_DOWN)   & 0x8000) || (GetAsyncKeyState('S') & 0x8000)
+                 || (fe_pad && (fe_xi.wButtons & XINPUT_GAMEPAD_DPAD_DOWN));
+    int enter_now = (GetAsyncKeyState(VK_RETURN) & 0x8000) || (GetAsyncKeyState(VK_SPACE) & 0x8000)
+                 || (fe_pad && (fe_xi.wButtons & (XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_START)));
+    int esc_now   = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) || (GetAsyncKeyState(VK_BACK) & 0x8000)
+                 || (fe_pad && (fe_xi.wButtons & XINPUT_GAMEPAD_B));
+    int left_now  = (GetAsyncKeyState(VK_LEFT)   & 0x8000) || (GetAsyncKeyState('A') & 0x8000)
+                 || (fe_pad && (fe_xi.wButtons & XINPUT_GAMEPAD_DPAD_LEFT));
+    int right_now = (GetAsyncKeyState(VK_RIGHT)  & 0x8000) || (GetAsyncKeyState('D') & 0x8000)
+                 || (fe_pad && (fe_xi.wButtons & XINPUT_GAMEPAD_DPAD_RIGHT));
+
+    static int g_fe_prev_left = 0, g_fe_prev_right = 0;
 
     int up_edge    = up_now && !g_fe_prev_up;
     int down_edge  = down_now && !g_fe_prev_down;
     int enter_edge = enter_now && !g_fe_prev_enter;
     int esc_edge   = esc_now && !g_fe_prev_esc;
+    int left_edge  = left_now && !g_fe_prev_left;
+    int right_edge = right_now && !g_fe_prev_right;
 
     g_fe_prev_up    = up_now;
     g_fe_prev_down  = down_now;
     g_fe_prev_enter = enter_now;
     g_fe_prev_esc   = esc_now;
+    g_fe_prev_left  = left_now;
+    g_fe_prev_right = right_now;
 
     switch (g_fe_screen) {
+#ifdef B3_HAVE_FFMPEG
+    case FE_SCREEN_INTRO: {
+        /* Pad START/A also skips the current video. */
+        XINPUT_STATE xi;
+        int pad_now = (XInputGetState(0, &xi) == 0) &&
+            (xi.wButtons & (XINPUT_GAMEPAD_START | XINPUT_GAMEPAD_A));
+        static int pad_prev = 0;
+        int pad_edge = pad_now && !pad_prev;
+        pad_prev = pad_now;
+
+        fe_intro_update(enter_edge || esc_edge || pad_edge);
+        break;
+    }
+#endif
+
     case FE_SCREEN_TITLE:
         if (enter_edge) {
             g_fe_screen = FE_SCREEN_MAIN;
@@ -447,7 +699,12 @@ void fe_menu_update(float dt)
         if (enter_edge) {
             int prev_cursor = g_fe_cursor;
             switch (g_fe_cursor) {
-            case 0: g_fe_screen = FE_SCREEN_WORLD_TOUR;   g_fe_cursor = 0; break;
+            case 0:
+                /* Straight into the race — the old confirmation screen
+                 * rendered nothing and read as a frozen menu. */
+                fprintf(stderr, "[FE-MENU] Main -> WORLD TOUR (launch)\n");
+                fe_start_race(FE_SCREEN_WORLD_TOUR);
+                return;
             case 1: g_fe_screen = FE_SCREEN_SINGLE;       g_fe_cursor = 0; break;
             case 2: /* MULTIPLAYER — no PB capture, stay */ break;
             case 3: /* XBOX LIVE — no PB capture, stay */   break;
@@ -465,20 +722,50 @@ void fe_menu_update(float dt)
         if (up_edge)   g_fe_cursor = (g_fe_cursor + FE_SINGLE_ITEMS - 1) % FE_SINGLE_ITEMS;
         if (down_edge) g_fe_cursor = (g_fe_cursor + 1) % FE_SINGLE_ITEMS;
         if (enter_edge) {
-            int prev_cursor = g_fe_cursor;
-            switch (g_fe_cursor) {
-            case 0: g_fe_screen = FE_SCREEN_RACE_SETUP;   g_fe_cursor = 0; break;
-            case 1: g_fe_screen = FE_SCREEN_TIME_ATTACK;  g_fe_cursor = 0; break;
-            case 2: g_fe_screen = FE_SCREEN_ROAD_RAGE;    g_fe_cursor = 0; break;
-            case 3: g_fe_screen = FE_SCREEN_CRASH_SELECT; g_fe_cursor = 0; break;
+            /* RACE goes through the setup screen so the track and car are
+             * chooseable; the other three launch straight into a session. */
+            if (g_fe_cursor == 0) {
+                g_fe_screen = FE_SCREEN_TRACK;
+                g_fe_setup_row = 0;
+                break;
             }
-            fprintf(stderr, "[FE-MENU] Single Event -> %s\n", g_single_menu_labels[prev_cursor]);
+            static const int single_screens[FE_SINGLE_ITEMS] = {
+                FE_SCREEN_RACE_SETUP, FE_SCREEN_TIME_ATTACK,
+                FE_SCREEN_ROAD_RAGE, FE_SCREEN_CRASH_SELECT,
+            };
+            fprintf(stderr, "[FE-MENU] Single Event -> %s (launch)\n",
+                    g_single_menu_labels[g_fe_cursor]);
+            fe_start_race(single_screens[g_fe_cursor]);
+            return;
         }
         if (esc_edge) {
             g_fe_screen = FE_SCREEN_MAIN;
             g_fe_cursor = 1; /* Return to SINGLE EVENT highlighted */
         }
         break;
+
+    case FE_SCREEN_TRACK: {
+        int tracks = b3_track_count(), cars = b3_car_count();
+        if (up_edge)   g_fe_setup_row = (g_fe_setup_row + FE_SETUP_ROWS - 1) % FE_SETUP_ROWS;
+        if (down_edge) g_fe_setup_row = (g_fe_setup_row + 1) % FE_SETUP_ROWS;
+        int step = (right_edge ? 1 : 0) - (left_edge ? 1 : 0);
+        if (step && g_fe_setup_row == 0 && tracks > 0)
+            b3_select_track((b3_selected_track() + step + tracks) % tracks);
+        if (step && g_fe_setup_row == 1 && cars > 0)
+            b3_select_car((b3_selected_car() + step + cars) % cars);
+        if (enter_edge) {
+            fprintf(stderr, "[FE-MENU] Race setup -> track %s, car %s\n",
+                    b3_track_name(b3_selected_track()),
+                    b3_car_name(b3_selected_car()));
+            fe_start_race(FE_SCREEN_RACE_SETUP);
+            return;
+        }
+        if (esc_edge) {
+            g_fe_screen = FE_SCREEN_SINGLE;
+            g_fe_cursor = 0;
+        }
+        break;
+    }
 
     case FE_SCREEN_CRASH_SELECT:
         /* Crash select: Enter launches crash mode */
@@ -539,6 +826,20 @@ int fe_menu_render_frame(void)
     /* Begin scene */
     dev->lpVtbl->BeginScene(dev);
     fe_set_2d_state(dev);
+
+#ifdef B3_HAVE_FFMPEG
+    if (g_fe_screen == FE_SCREEN_INTRO) {
+        /* Black backdrop; the decoded FMV frame fills the screen once the
+         * first frame has been uploaded. */
+        fe_draw_rect(dev, 0, 0, 640, 480, color_rgba(0, 0, 0, 255));
+        if (g_intro_video_valid && g_tex_video)
+            fe_draw_textured(dev, g_tex_video, 0, 0, 640, 480,
+                             color_rgba(255, 255, 255, 255));
+        dev->lpVtbl->EndScene(dev);
+        g_fe_rendered_once = 1;
+        return 1;
+    }
+#endif
 
     /* Burnout 3 brand colors */
     DWORD col_bg_top  = color_rgba(10, 10, 30, 255);     /* Dark navy */
@@ -640,6 +941,60 @@ int fe_menu_render_frame(void)
                                 320, 440, 1.2f, col_dim);
         break;
     }
+
+    case FE_SCREEN_TRACK: {
+        fe_draw_string_centered(dev, "RACE SETUP", 320, 170, 2.0f, col_orange);
+
+        int tracks = b3_track_count(), cars = b3_car_count();
+        char line[96];
+        for (int row = 0; row < FE_SETUP_ROWS; row++) {
+            float y = 240 + row * 50;
+            int selected = (row == g_fe_setup_row);
+            if (selected) {
+                float pulse = sinf(g_fe_timer * 4.0f) * 0.15f + 0.85f;
+                fe_draw_rect(dev, 100, y - 6, 440, 36,
+                             color_rgba(255, 140, 0, (uint8_t)(pulse * 80)));
+            }
+            DWORD col = selected ? col_white : col_dim;
+            switch (row) {
+            case 0:
+                snprintf(line, sizeof line, "< TRACK  %s  %d/%d >",
+                         tracks ? b3_track_name(b3_selected_track()) : "NONE",
+                         tracks ? b3_selected_track() + 1 : 0, tracks);
+                break;
+            case 1:
+                snprintf(line, sizeof line, "< CAR  %s  %d/%d >",
+                         cars ? b3_car_name(b3_selected_car()) : "NONE",
+                         cars ? b3_selected_car() + 1 : 0, cars);
+                break;
+            default:
+                snprintf(line, sizeof line, "START RACE");
+                break;
+            }
+            fe_draw_string_centered(dev, line, 320, y, selected ? 2.2f : 1.9f, col);
+        }
+
+        fe_draw_string_centered(dev, "UP DOWN TO MOVE  LEFT RIGHT TO CHANGE  ENTER TO RACE",
+                                320, 440, 1.2f, col_dim);
+        break;
+    }
+
+    case FE_SCREEN_WORLD_TOUR:
+    case FE_SCREEN_RACE_SETUP:
+    case FE_SCREEN_TIME_ATTACK:
+    case FE_SCREEN_ROAD_RAGE:
+    case FE_SCREEN_CRASH_SELECT:
+        /* Selection now launches directly, but if one of these screens is
+         * ever shown, say what it wants instead of rendering nothing —
+         * the blank version read as a frozen menu. */
+        fe_draw_string_centered(dev, "PRESS ENTER TO START", 320, 260, 3.0f, col_orange);
+        fe_draw_string_centered(dev, "ESC TO GO BACK", 320, 310, 1.8f, col_dim);
+        break;
+
+    case FE_SCREEN_DRIVER_DETAILS:
+        fe_draw_string_centered(dev, "DRIVER DETAILS", 320, 220, 2.5f, col_orange);
+        fe_draw_string_centered(dev, "NOTHING HERE YET  ESC TO GO BACK", 320, 280, 1.5f, col_dim);
+        break;
     }
 
     /* Debug: game state overlay */
@@ -652,14 +1007,25 @@ int fe_menu_render_frame(void)
 
     dev->lpVtbl->EndScene(dev);
 
+    g_fe_rendered_once = 1;
     return 1;
 }
+
+/** Returns 1 once fe_menu_render_frame has produced a frame at least once. */
+int fe_menu_rendered_once(void) { return g_fe_rendered_once; }
 
 /*
  * Start a race — disable PB replay, load track, switch to gameplay rendering.
  */
+/* Bumped by every race launch. The frame pump polls the racing flag once a
+ * frame, so a stop followed by a start between two frames is invisible to it
+ * and the new race would keep the old race's track and car. */
+static unsigned g_fe_race_generation = 0;
+unsigned fe_race_generation(void) { return g_fe_race_generation; }
+
 static void fe_start_race(int screen)
 {
+    g_fe_race_generation++;
     /* Disable PB replay — this lets the bridge render gameplay instead */
     extern void nv2a_pb_replay_set_active(int active);
     nv2a_pb_replay_set_active(0);
@@ -767,6 +1133,15 @@ static void fe_start_race(int screen)
 int fe_menu_is_racing(void)
 {
     return g_race_active;
+}
+
+/* Jump straight to the race setup screen (test hook — reaching it normally
+ * takes a menu walk, and a screen that renders nothing looks identical to a
+ * frozen frontend). */
+void fe_menu_show_setup(int row)
+{
+    g_fe_screen = FE_SCREEN_TRACK;
+    g_fe_setup_row = row;
 }
 
 void fe_menu_force_race(void)

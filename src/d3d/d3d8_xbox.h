@@ -19,7 +19,16 @@
 #define BURNOUT3_D3D8_XBOX_H
 
 #include <stdint.h>
+
+// When building for the framebuffer backend (no GPU, cross-platform),
+// use portable type definitions instead of the Windows SDK.
+// Define D3D8_USE_PORTABLE before including this header.
+#ifdef D3D8_USE_PORTABLE
+#include "d3d8_portable.h"
+#define __stdcall STDCALL
+#else
 #include <windows.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {

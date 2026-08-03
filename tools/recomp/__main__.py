@@ -126,7 +126,22 @@ def main():
         addr = int(args.function, 16)
         code = translator.translate_single(addr)
         if code:
-            print(code)
+            if args.output_dir:
+                os.makedirs(args.output_dir, exist_ok=True)
+                output_path = os.path.join(
+                    args.output_dir, f"f_0x{addr:06x}.c")
+                with open(output_path, "w", encoding="utf-8") as output_file:
+                    output_file.write(
+                        '#define RECOMP_GENERATED_CODE\n'
+                        '#include "recomp_funcs.h"\n'
+                        '#include <math.h>\n'
+                        '#include <stdio.h>\n'
+                        '#include <string.h>\n')
+                    output_file.write(code)
+                    output_file.write("\n")
+                print(f"Generated function: {output_path}", file=sys.stderr)
+            else:
+                print(code)
         else:
             print(f"ERROR: Could not translate function at 0x{addr:08X}",
                   file=sys.stderr)
